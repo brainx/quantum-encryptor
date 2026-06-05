@@ -5,6 +5,20 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 ![Quantum Encryption](https://img.shields.io/badge/Encryption-Post--Quantum-blue)
 ![Python Version](https://img.shields.io/badge/Python-3.10--3.13-green)
 
+<p align="center">
+  <a href="docs/SCREENSHOTS.md">
+    <img
+      src="docs/screenshots/generate-keys-backend-warning.jpg"
+      alt="Quantum Encryptor Streamlit app showing the generate keys workflow and backend readiness warning"
+      width="900"
+    >
+  </a>
+</p>
+
+<p align="center">
+  <strong>Dark Streamlit interface for ML-KEM-768 key generation, file encryption, decryption, and PEM key inspection.</strong>
+</p>
+
 ## Features
 
 - **Post-Quantum Security**: Uses ML-KEM-768, with Kyber768 retained as a legacy compatibility alias
@@ -15,15 +29,25 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 
 ## Screenshots
 
-The repository includes representative screenshots of the main workflows. The backend readiness warning shown here is expected when native `liboqs` is not installed in the local environment.
+The backend readiness warning shown here is expected when native `liboqs` is not installed in the local environment. Click any image to open the full screenshot page.
 
-| Generate Keys | Encrypt File |
-| --- | --- |
-| ![Generate keys workflow with backend readiness warning](docs/screenshots/generate-keys-backend-warning.jpg) | ![Encrypt file workflow](docs/screenshots/encrypt-file-workflow.jpg) |
+<p>
+  <a href="docs/SCREENSHOTS.md#generate-keys">
+    <img src="docs/screenshots/generate-keys-backend-warning.jpg" alt="Generate keys workflow" width="49%">
+  </a>
+  <a href="docs/SCREENSHOTS.md#encrypt-file">
+    <img src="docs/screenshots/encrypt-file-workflow.jpg" alt="Encrypt file workflow" width="49%">
+  </a>
+</p>
 
-| Decrypt File | Key Utilities |
-| --- | --- |
-| ![Decrypt file workflow](docs/screenshots/decrypt-file-workflow.jpg) | ![Key utilities workflow](docs/screenshots/key-utilities-workflow.jpg) |
+<p>
+  <a href="docs/SCREENSHOTS.md#decrypt-file">
+    <img src="docs/screenshots/decrypt-file-workflow.jpg" alt="Decrypt file workflow" width="49%">
+  </a>
+  <a href="docs/SCREENSHOTS.md#key-utilities">
+    <img src="docs/screenshots/key-utilities-workflow.jpg" alt="Key utilities workflow" width="49%">
+  </a>
+</p>
 
 See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page.
 
