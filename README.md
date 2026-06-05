@@ -71,6 +71,10 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
    - Decrypt files using your private key
    - Access key utilities
 
+## Screenshots
+
+Representative UI screenshots are available in [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
+
 ### Key Generation
 
 1. Select "Generate Keys" from the sidebar
