@@ -8,19 +8,25 @@ To run the tests, execute the following from the project root:
 
 ```bash
 # Run all tests
-pytest
+./test.sh
 
 # Run with coverage report
-pytest --cov=. tests/
+PYTHON=.venv/bin/python ./test.sh --cov=. tests/
 
 # Run a specific test file
-pytest tests/test_crypto_core.py
+./test.sh tests/test_crypto_core.py
 
 # Run a specific test class
-pytest tests/test_crypto_core.py::TestKeyGeneration
+./test.sh tests/test_crypto_core.py::TestKeyGeneration
 
 # Run a specific test
-pytest tests/test_crypto_core.py::TestKeyGeneration::test_generate_oqs_keys
+./test.sh tests/test_crypto_core.py::TestKeyGeneration::test_generate_oqs_keys
+```
+
+Set `PYTHON` to force a specific Python 3.10-3.13 interpreter or virtualenv:
+
+```bash
+PYTHON=.venv/bin/python ./test.sh
 ```
 
 ## Test Structure
@@ -52,8 +58,10 @@ Test dependencies:
 
 Install these with:
 ```bash
-pip install pytest pytest-cov
+pip install -r requirements-dev.txt
 ```
+
+Native `liboqs` is required for the key generation and end-to-end file encryption tests. When native `liboqs` is unavailable, those tests skip and the non-backend validation still runs.
 
 ## Continuous Integration
 
@@ -62,4 +70,4 @@ The tests are automatically run as part of the CI/CD pipeline when changes are p
 ## Coverage Goals
 
 - Aim for at least 80% test coverage on core modules
-- Prioritize coverage of security-critical functionality 
+- Prioritize coverage of security-critical functionality

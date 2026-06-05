@@ -3,20 +3,21 @@
 A post-quantum cryptography tool for file encryption using quantum-resistant algorithms. This application combines post-quantum Key Encapsulation Mechanisms (KEM) with classical symmetric encryption to protect files against future quantum computer threats.
 
 ![Quantum Encryption](https://img.shields.io/badge/Encryption-Post--Quantum-blue)
-![Python Version](https://img.shields.io/badge/Python-3.8%2B-green)
+![Python Version](https://img.shields.io/badge/Python-3.10--3.13-green)
 
 ## Features
 
-- **Post-Quantum Security**: Uses Kyber768 (ML-KEM-768), a NIST-approved post-quantum KEM algorithm
+- **Post-Quantum Security**: Uses ML-KEM-768, with Kyber768 retained as a legacy compatibility alias
 - **Hybrid Encryption**: Combines quantum-resistant key exchange with AES-256-GCM symmetric encryption
 - **Password-Protected Keys**: Optional password encryption for private keys
 - **User-Friendly Interface**: Simple web-based UI built with Streamlit
-- **PEM Key Format**: Keys stored in standard PEM format with quantum algorithm extensions
+- **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Requirements
 
-- Python 3.8 or higher
-- liboqs (Open Quantum Safe library)
+- Python 3.10 through 3.13
+- Open Quantum Safe native `liboqs` shared library
+- Open Quantum Safe `liboqs-python` wrapper, which imports as `oqs`
 - Dependencies listed in `requirements.txt`
 
 ## Installation
@@ -38,38 +39,33 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
    pip install -r requirements.txt
    ```
 
-4. Install liboqs (if not already installed):
-   - On Ubuntu/Debian:
-     ```bash
-     sudo apt-get install cmake ninja-build
-     git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git
-     cd liboqs
-     mkdir build && cd build
-     cmake -GNinja ..
-     ninja
-     sudo ninja install
-     ```
-   - On macOS:
-     ```bash
-     brew install cmake ninja
-     git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git
-     cd liboqs
-     mkdir build && cd build
-     cmake -GNinja ..
-     ninja
-     sudo ninja install
-     ```
-   - On Windows:
-     Follow the instructions at [Open Quantum Safe liboqs Windows build](https://github.com/open-quantum-safe/liboqs/wiki/Windows-Build).
+4. Install or expose native `liboqs`.
+
+   The app checks for a native `liboqs` shared library before importing `liboqs-python`, so startup and tests do not trigger wrapper auto-install side effects. If `liboqs` is not installed in a standard library path, set `OQS_INSTALL_PATH` to the install prefix that contains `lib/`, `lib64/`, or `bin/`.
+
+   ```bash
+   export OQS_INSTALL_PATH=/path/to/liboqs/install
+   ```
 
 ## Usage
 
 1. Start the application:
    ```bash
-   streamlit run pqc_app.py
+   ./start.sh
    ```
 
-2. The web interface will open in your browser. You can:
+   The app listens on `127.0.0.1:4000` by default. Set `PORT` to override the local development port:
+   ```bash
+   PORT=4001 ./start.sh
+   ```
+
+   Set `PYTHON` if you want the wrapper scripts to use a specific interpreter:
+   ```bash
+   PYTHON=.venv/bin/python ./start.sh
+   PYTHON=.venv/bin/python ./test.sh
+   ```
+
+2. Open the web interface in your browser. You can:
    - Generate a new post-quantum key pair
    - Encrypt files using a recipient's public key
    - Decrypt files using your private key
@@ -100,27 +96,26 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 
 ## Security Considerations
 
-- This implementation provides post-quantum security based on the strength of the Kyber KEM algorithm
-- The hybrid encryption approach ensures compatibility with today's security needs
-- Password protection for private keys adds an additional layer of security
-- **Disclaimer**: While developed with security best practices, this software should undergo security audit before use in production environments
+- Encrypted files use KEM-derived AES-256-GCM keys and authenticate file header metadata as associated data in format version 3
+- Private key password protection uses PBKDF2-HMAC-SHA256 and AES-256-GCM
+- The web UI enforces a 100 MiB per-file processing limit because files are handled in memory
+- Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
+- **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
 
 ## Project Structure
 
 - `crypto_config.py` - Configuration parameters for cryptographic operations
 - `crypto_core.py` - Core cryptographic functions (key generation, encryption, decryption)
 - `pqc_app.py` - Streamlit web application interface
+- `start.sh` - Local application startup script
+- `test.sh` - Test runner
+- `pyproject.toml` / `setup.py` - Packaging metadata
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Author
-
-[Your Name]  
-[Your Contact Information or Website]
-
 ## Acknowledgments
 
 - [Open Quantum Safe](https://openquantumsafe.org/) for liboqs implementation
-- [NIST](https://www.nist.gov/pqcrypto) for leading the post-quantum cryptography standardization effort 
+- [NIST](https://www.nist.gov/pqcrypto) for leading the post-quantum cryptography standardization effort

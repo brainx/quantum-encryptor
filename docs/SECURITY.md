@@ -6,15 +6,16 @@ This document outlines the security considerations for the Quantum Encryptor app
 
 The application uses a hybrid cryptographic approach, combining post-quantum key encapsulation with classical symmetric encryption:
 
-1. **Key Encapsulation Mechanism (KEM)**: Kyber768 (ML-KEM-768)
+1. **Key Encapsulation Mechanism (KEM)**: ML-KEM-768
    - NIST-selected post-quantum cryptographic algorithm
+   - `Kyber768` is accepted as a legacy compatibility alias for older OQS builds
    - Designed to resist attacks from both classical and quantum computers
-   - Provides ~140 bits of security against quantum attacks
 
 2. **Data Encryption Mechanism (DEM)**: AES-256-GCM
    - Authenticated encryption with associated data (AEAD)
    - Provides confidentiality, integrity, and authenticity
    - 256-bit key length provides sufficient security margin
+   - Encrypted-file format version 3 authenticates the file header as associated data
 
 3. **Key Derivation Function (KDF)**: HKDF-SHA256
    - Derives symmetric encryption keys from KEM shared secrets
@@ -44,6 +45,18 @@ The application is designed to protect against the following threats:
 4. **Implementation Vulnerabilities**
    - Memory leaks exposing sensitive information
    - Improper key management
+   - Malformed or tampered encrypted-file headers
+   - Unexpected native backend failures during import/startup
+
+## Current Mitigations
+
+- Native `liboqs` is loaded lazily and missing backend support is treated as an unavailable dependency, not a process exit during import.
+- Encrypted-file headers include magic bytes, version, KEM name length, KEM ciphertext length, and nonce validation.
+- Format version 3 uses the complete header as AES-GCM associated data, so header tampering fails authentication.
+- PEM parsing uses strict base64 decoding and validates encrypted private-key salt and nonce lengths.
+- The UI and core encryption path enforce a 100 MiB in-memory file limit.
+- Download filenames are reduced to local filenames before being passed to Streamlit.
+- Private-key password protection requires at least 16 characters in the UI.
 
 ## Security Best Practices
 
@@ -83,7 +96,7 @@ To maximize the security of the application, follow these best practices:
 The application has the following security limitations:
 
 1. **Cryptographic Algorithm Status**
-   - Kyber is relatively new, and cryptanalysis is ongoing
+   - ML-KEM is relatively new, and cryptanalysis is ongoing
    - Future discoveries might reveal weaknesses
 
 2. **Implementation Considerations**
@@ -94,12 +107,16 @@ The application has the following security limitations:
    - The implementation does not provide explicit protections against timing attacks or other side channels
    - Hardware-level attacks (cache timing, power analysis) are not mitigated
 
+4. **In-Memory Processing**
+   - Files are processed in memory, so very large-file streaming is not supported
+   - Sensitive data may remain in Python-managed memory until garbage collection
+
 ## Reporting Security Issues
 
-If you discover a security vulnerability in the application, please report it responsibly. Contact [security email] with details of the vulnerability, and allow time for the issue to be addressed before public disclosure.
+If you discover a security vulnerability in the application, report it privately through the maintainer's configured security contact or repository security advisory flow. Include reproduction steps, affected versions, and impact details.
 
 ## References
 
 1. NIST Post-Quantum Cryptography Standardization: https://csrc.nist.gov/Projects/post-quantum-cryptography
 2. Kyber Algorithm Specification: https://pq-crystals.org/kyber/
-3. OWASP Cryptographic Storage Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html 
+3. OWASP Cryptographic Storage Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html

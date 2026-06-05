@@ -1,6 +1,6 @@
 # API Documentation
 
-This document provides detailed API documentation for the core cryptographic functions in the Quantum Encryptor application.
+This document provides API notes for the core cryptographic functions in the Quantum Encryptor application.
 
 ## crypto_core Module
 
@@ -18,6 +18,24 @@ def generate_oqs_keys(kem_alg: str = cfg.KEM_ALG) -> Tuple[Optional[bytes], Opti
         
     Returns:
         Tuple containing (public_key, secret_key) as raw bytes, or (None, None) on error.
+    """
+```
+
+The backend is loaded lazily. If native `liboqs` is unavailable, this returns `(None, None)` instead of terminating the process.
+
+### Backend Availability
+
+```python
+def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
+    """
+    Validates the requested KEM and resolves it to an enabled OQS backend mechanism.
+    """
+```
+
+```python
+def is_kem_available(kem_alg: Optional[str] = None) -> bool:
+    """
+    Returns whether the requested KEM is available in the native OQS backend.
     """
 ```
 
@@ -128,22 +146,24 @@ def load_key_pem(
 
 ```python
 def encrypt_file_pro(
-    file_data: bytes,
-    recipient_public_key: bytes,
-    kem_alg: str
+    input_data: bytes,
+    public_key_bytes: bytes,
+    kem_alg: str = cfg.KEM_ALG
 ) -> Optional[bytes]:
     """
     Encrypts file data using KEM+DEM hybrid encryption.
     
     Args:
-        file_data: Raw file bytes to encrypt.
-        recipient_public_key: Recipient's public key bytes.
+        input_data: Raw file bytes to encrypt.
+        public_key_bytes: Recipient's public key bytes.
         kem_alg: The KEM algorithm to use.
         
     Returns:
         Encrypted file bytes, or None on error.
     """
 ```
+
+`encrypt_file_pro` rejects inputs larger than `cfg.MAX_FILE_BYTES`. Format version 3 authenticates the full encrypted-file header as AES-GCM associated data.
 
 ```python
 def decrypt_file_pro(
@@ -169,9 +189,11 @@ The `crypto_config` module provides configuration constants used by the cryptogr
 ### Important Constants
 
 - `KEM_ALG`: The post-quantum KEM algorithm used (default: "Kyber768")
+- `ALLOWED_KEM_ALGS`: Accepted KEM identifiers (`ML-KEM-768` and legacy `Kyber768`)
 - `AES_KEY_BYTES`: Size of AES key in bytes (32 for AES-256)
 - `PBKDF2_ITERATIONS`: Number of iterations for password-based key derivation (390,000)
 - `FORMAT_VERSION`: File format version for encrypted files
+- `MAX_FILE_BYTES`: Maximum in-memory file size accepted by the UI and core encryption path
 
 ## Example Usage
 
@@ -182,11 +204,12 @@ from crypto_config import cfg
 import crypto_core as core
 
 # Generate key pair
-public_key, private_key = core.generate_oqs_keys(cfg.KEM_ALG)
+kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
+public_key, private_key = core.generate_oqs_keys(kem_alg)
 
 # Save keys in PEM format
-public_pem = core.save_key_pem(public_key, cfg.KEM_ALG, "public")
-private_pem = core.save_key_pem(private_key, cfg.KEM_ALG, "private", password="secure_password")
+public_pem = core.save_key_pem(public_key, kem_alg, "public")
+private_pem = core.save_key_pem(private_key, kem_alg, "private", password="long-secure-password")
 
 # Write PEM files
 with open("public_key.pem", "w") as f:
@@ -221,7 +244,7 @@ with open("encrypted_document.pqc", "wb") as f:
 with open("private_key.pem", "r") as f:
     priv_pem = f.read()
     
-priv_key, _, _ = core.load_key_pem(priv_pem, password="secure_password")
+priv_key, _, _ = core.load_key_pem(priv_pem, password="long-secure-password")
 
 # Decrypt the file
 with open("encrypted_document.pqc", "rb") as f:
@@ -231,4 +254,4 @@ decrypted_data, _ = core.decrypt_file_pro(encrypted_data, priv_key)
 
 with open("decrypted_document.pdf", "wb") as f:
     f.write(decrypted_data)
-``` 
+```

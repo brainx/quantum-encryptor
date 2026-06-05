@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantum-encryptor"
+version = "1.0.1"
+description = "Post-quantum cryptography tool for file encryption"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "MIT"
+authors = [
+  { name = "brainx", email = "brainx@posteo.de" }
+]
+dependencies = [
+  "liboqs-python>=0.14.1,<1.0",
+  "cryptography>=42.0.0",
+  "streamlit>=1.32.0"
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Topic :: Security :: Cryptography"
+]
+
+[project.urls]
+Homepage = "https://github.com/brainx/quantum-encryptor"
+
+[tool.setuptools]
+py-modules = ["crypto_config", "crypto_core", "pqc_app"]
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312", "py313"]

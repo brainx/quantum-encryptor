@@ -1,153 +1,118 @@
 # Detailed Installation Guide
 
-This guide provides comprehensive instructions for installing the Quantum Encryptor application on different operating systems.
+This guide covers local installation for the Quantum Encryptor application.
 
 ## Prerequisites
 
-- Python 3.8 or higher
-- pip (Python package manager)
-- Git (for cloning the repository)
-- C/C++ compiler (for liboqs)
-- CMake (for building liboqs)
+- Python 3.10 through 3.13
+- pip
+- Native Open Quantum Safe `liboqs`
+- `liboqs-python`, installed from `requirements.txt`
+- C/C++ build tools and CMake if you build `liboqs` from source
 
-## Installing Dependencies
+The application checks for a native `liboqs` shared library before importing the Python wrapper. This prevents startup, tests, and imports from unexpectedly cloning or building native code.
 
-### 1. Install liboqs (Open Quantum Safe Library)
+## Python Environment
 
-liboqs is the core library that provides implementations of quantum-resistant cryptographic algorithms.
-
-#### Ubuntu/Debian
+Create and activate a virtual environment from the project root:
 
 ```bash
-# Install build tools
-sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build
-
-# Clone liboqs repository
-git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git
-cd liboqs
-
-# Create build directory
-mkdir build && cd build
-
-# Configure and build
-cmake -GNinja ..
-ninja
-
-# Install system-wide
-sudo ninja install
-
-# Update dynamic linker
-sudo ldconfig
+python3.13 -m venv .venv
+. .venv/bin/activate
 ```
 
-#### macOS
-
-```bash
-# Install Homebrew if not already installed
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Install build tools
-brew install cmake ninja
-
-# Clone liboqs repository
-git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git
-cd liboqs
-
-# Create build directory
-mkdir build && cd build
-
-# Configure and build
-cmake -GNinja ..
-ninja
-
-# Install system-wide
-sudo ninja install
-```
-
-#### Windows
-
-1. Install Visual Studio 2019 or later with C++ development tools.
-2. Install CMake from https://cmake.org/download/
-3. Open a Developer Command Prompt for VS and run:
-
-```cmd
-git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git
-cd liboqs
-mkdir build
-cd build
-cmake -A x64 ..
-cmake --build . --config Release
-cmake --install . --config Release
-```
-
-### 2. Install Python Dependencies
-
-After installing liboqs, you need to install the Python dependencies.
+Install runtime dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Or install the package in development mode:
+For development and verification:
 
 ```bash
-pip install -e .
+pip install -r requirements-dev.txt
 ```
 
-## Troubleshooting
+## Native liboqs
 
-### Common Issues
+Install `liboqs` separately and make sure the shared library is visible to the dynamic linker. If it is not installed in a standard library path, set `OQS_INSTALL_PATH` to the install prefix:
 
-#### Library Not Found Error
-
-If you see an error like `ImportError: Library not found: 'liboqs'`, this means the dynamic linker cannot find the liboqs library.
-
-**Solution:**
-
-On Linux:
 ```bash
-sudo ldconfig
-# Or export the library path manually
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export OQS_INSTALL_PATH=/path/to/liboqs/install
 ```
 
-On macOS:
+The prefix should contain one of these shared-library locations:
+
+- `lib/liboqs.so` or `lib/liboqs.dylib`
+- `lib64/liboqs.so`
+- `bin/oqs.dll` or `bin/liboqs.dll`
+
+### Build From Source
+
+Use the current Open Quantum Safe `liboqs` build instructions for your platform. A typical Unix-like source build is:
+
 ```bash
-export DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:/usr/local/lib
+git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git
+cd liboqs
+cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX=/path/to/liboqs/install
+cmake --build build --parallel
+cmake --install build
 ```
 
-On Windows, ensure the liboqs DLL is in your PATH or in the same directory as your Python script.
+Then return to the project root and export `OQS_INSTALL_PATH` as shown above.
 
-#### Unsupported Algorithm Error
+## Start The App
 
-If you see `KeyError: The requested KEM algorithm is not supported`, verify that the algorithm is enabled in your liboqs build.
+Use the project wrapper:
 
-**Solution:**
+```bash
+./start.sh
+```
 
-Rebuild liboqs with your required algorithms enabled by modifying the CMake configuration.
+The default local address is `127.0.0.1:4000`. Override the port with:
 
-### Verifying Installation
+```bash
+PORT=4001 ./start.sh
+```
 
-Run the following Python code to verify that liboqs is correctly installed:
+Use `PYTHON` to force a specific interpreter:
+
+```bash
+PYTHON=.venv/bin/python ./start.sh
+```
+
+## Verify Installation
+
+Run the test wrapper:
+
+```bash
+PYTHON=.venv/bin/python ./test.sh
+```
+
+When native `liboqs` is not available, backend-dependent tests are skipped and non-backend validation still runs. With native `liboqs` available, the key generation and file encryption/decryption tests exercise the real OQS path.
+
+You can also check the available KEM mechanisms directly:
 
 ```python
 import oqs
 
-# Print available KEM mechanisms
-print("Enabled KEM mechanisms:")
-for alg in oqs.get_enabled_KEM_mechanisms():
-    print(f" - {alg}")
+getter = getattr(oqs, "get_enabled_kem_mechanisms", None)
+if getter is None:
+    getter = oqs.get_enabled_KEM_mechanisms
 
-# Verify that Kyber768 is available
-assert "Kyber768" in oqs.get_enabled_KEM_mechanisms(), "Kyber768 is not available"
-print("Kyber768 is available!")
+print("ML-KEM-768" in getter() or "Kyber768" in getter())
 ```
 
-## Next Steps
+## Troubleshooting
 
-After successful installation, you can:
+### Native liboqs Not Found
 
-1. Run the application: `streamlit run pqc_app.py`
-2. Generate your first key pair
-3. Start encrypting and decrypting files 
+If the app reports that the post-quantum backend is not ready:
+
+1. Confirm `liboqs` was built with shared libraries enabled.
+2. Confirm `OQS_INSTALL_PATH` points to the install prefix, not directly to `lib/`.
+3. Re-run `PYTHON=.venv/bin/python ./test.sh`.
+
+### Unsupported Algorithm
+
+The application accepts `ML-KEM-768` and the legacy compatibility alias `Kyber768`. If neither is enabled in your `liboqs` build, rebuild or install a `liboqs` version that includes ML-KEM/Kyber KEM support.
