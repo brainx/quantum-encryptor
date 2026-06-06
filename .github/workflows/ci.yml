@@ -107,6 +107,11 @@ jobs:
             --input agent-input.txt \
             --public-key agent-public.pem \
             --output agent-input.pqc
+          python -m pqc_agent_tools inspect-file --input agent-input.pqc
+          PQC_PRIVATE_KEY_PASSWORD='correct horse battery staple' \
+            python -m pqc_agent_tools verify-file \
+              --input agent-input.pqc \
+              --private-key agent-private.pem
           PQC_PRIVATE_KEY_PASSWORD='correct horse battery staple' \
             python -m pqc_agent_tools decrypt \
               --input agent-input.pqc \

@@ -21,11 +21,13 @@ class CryptoConfig:
     HKDF_SALT = b"pqc-file-enc-hkdf-salt"  # Optional salt for HKDF
     HKDF_INFO_AES = b"pqc-file-enc-aes-key-derivation"  # Context for AES key derivation
 
-    # For deriving key from password for private key encryption
-    PBKDF2_SALT_BYTES = 16  # Recommended salt size
-    PBKDF2_ITERATIONS = 390000  # OWASP recommendation (adjust based on performance needs)
-    # Use SHA256 for PBKDF2 HMAC
-    PBKDF2_HASH_ALG = "sha256"
+    # For deriving keys from passwords for private key encryption
+    PRIVATE_KEY_MIN_PASSWORD_CHARS = 16
+    PRIVATE_KEY_KDF_ALG = "scrypt"
+    SCRYPT_SALT_BYTES = 16
+    SCRYPT_N = 32768
+    SCRYPT_R = 8
+    SCRYPT_P = 1
     # Context info for deriving private key encryption key
     HKDF_INFO_PRIVATE_KEY = b"pqc-private-key-encryption"
 
@@ -44,6 +46,7 @@ class CryptoConfig:
     PEM_PRIVATE_HEADER = "-----BEGIN PQC PRIVATE KEY-----"
     PEM_PRIVATE_FOOTER = "-----END PQC PRIVATE KEY-----"
     PEM_ALGORITHM_HEADER = "Algorithm: "
+    PEM_KDF_HEADER = "KDF: "
     # Headers for encrypted private keys
     PEM_PROC_TYPE_HEADER = "Proc-Type: 4,ENCRYPTED"
     PEM_DEK_INFO_HEADER = "DEK-Info: AES-256-GCM,"  # Followed by salt_b64,nonce_b64
@@ -52,6 +55,17 @@ class CryptoConfig:
     MAX_FILE_BYTES = 100 * 1024 * 1024
     MAX_KEM_ALG_NAME_BYTES = 64
     MAX_KEM_CIPHERTEXT_BYTES = 1024 * 1024
+    MAX_ENCRYPTED_FILE_BYTES = (
+        MAX_FILE_BYTES
+        + len(MAGIC_BYTES)
+        + 2  # Format version
+        + 2  # KEM algorithm name length
+        + MAX_KEM_ALG_NAME_BYTES
+        + 4  # KEM ciphertext length
+        + MAX_KEM_CIPHERTEXT_BYTES
+        + AES_NONCE_BYTES
+        + AES_TAG_BYTES
+    )
 
 
 # Instantiate the config for easy import

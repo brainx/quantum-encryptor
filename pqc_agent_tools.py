@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NoReturn, Optional, Sequence
@@ -133,6 +134,51 @@ def _resolve_output_path(path_text: str, workspace: Path, overwrite: bool) -> Pa
     return resolved
 
 
+def _current_umask() -> int:
+    current = os.umask(0)
+    os.umask(current)
+    return current
+
+
+def _target_file_mode(path: Path, private_file: bool) -> int:
+    if private_file:
+        return 0o600
+    try:
+        return path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return 0o666 & ~_current_umask()
+
+
+def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: bool, operation: str) -> None:
+    mode = _target_file_mode(path, private_file)
+    tmp_path: Optional[Path] = None
+    fd: Optional[int] = None
+    try:
+        raw_fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        fd = raw_fd
+        tmp_path = Path(tmp_name)
+        with os.fdopen(raw_fd, "wb") as tmp_file:
+            fd = None
+            tmp_file.write(data)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, mode)
+        if not overwrite and path.exists():
+            raise AgentCommandError(
+                "output_exists",
+                "Output file already exists. Pass --overwrite to replace it.",
+                EXIT_INVALID_INPUT,
+                operation,
+            )
+        os.replace(tmp_path, path)
+        os.chmod(path, mode)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
 def _read_workspace_file(path_text: str, workspace: Path) -> tuple[Path, bytes]:
     path = _resolve_input_path(path_text, workspace)
     data = path.read_bytes()
@@ -147,21 +193,48 @@ def _read_workspace_text(path_text: str, workspace: Path) -> tuple[Path, str]:
         raise AgentCommandError("invalid_input", "File must be valid UTF-8 text.", EXIT_INVALID_INPUT) from exc
 
 
-def _write_workspace_file(path_text: str, workspace: Path, data: bytes, overwrite: bool) -> Path:
+def _write_workspace_file(
+    path_text: str,
+    workspace: Path,
+    data: bytes,
+    overwrite: bool,
+    operation: str,
+    private_file: bool = False,
+) -> Path:
     path = _resolve_output_path(path_text, workspace, overwrite)
-    path.write_bytes(data)
+    try:
+        _atomic_write_file(path, data, overwrite, private_file, operation)
+    except AgentCommandError:
+        raise
+    except OSError as exc:
+        raise AgentCommandError("write_failed", "Could not write output file.", EXIT_INVALID_INPUT, operation) from exc
     return path
 
 
-def _write_workspace_text(path_text: str, workspace: Path, data: str, overwrite: bool) -> Path:
-    path = _resolve_output_path(path_text, workspace, overwrite)
-    path.write_text(data, encoding="ascii")
-    return path
+def _write_workspace_text(
+    path_text: str,
+    workspace: Path,
+    data: str,
+    overwrite: bool,
+    operation: str,
+    private_file: bool = False,
+) -> Path:
+    return _write_workspace_file(path_text, workspace, data.encode("ascii"), overwrite, operation, private_file)
 
 
 def _password_from_env(env_name: str, operation: str, required: bool) -> Optional[str]:
     password = os.environ.get(env_name)
     if password:
+        if len(password) < cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS:
+            raise AgentCommandError(
+                "weak_password",
+                (
+                    f"Set {env_name} to a private-key password with at least "
+                    f"{cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters."
+                ),
+                EXIT_CRYPTO_FAILURE,
+                operation,
+            )
         return password
     if required:
         raise AgentCommandError(
@@ -171,6 +244,54 @@ def _password_from_env(env_name: str, operation: str, required: bool) -> Optiona
             operation,
         )
     return None
+
+
+def _agent_error_from_core(operation: str, exc: Exception) -> AgentCommandError:
+    if isinstance(exc, core.PasswordRequiredError):
+        return AgentCommandError(
+            "password_required", "Private-key password is required.", EXIT_CRYPTO_FAILURE, operation
+        )
+    if isinstance(exc, core.WeakPasswordError):
+        return AgentCommandError(
+            "weak_password",
+            f"Private-key password must be at least {cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters.",
+            EXIT_CRYPTO_FAILURE,
+            operation,
+        )
+    if isinstance(exc, core.UnencryptedPrivateKeyError):
+        return AgentCommandError(
+            "unencrypted_private_key",
+            "Unencrypted private keys are rejected.",
+            EXIT_CRYPTO_FAILURE,
+            operation,
+        )
+    if isinstance(exc, core.UnsupportedKDFError):
+        return AgentCommandError(
+            "unsupported_kdf",
+            "Private key uses missing, malformed, or unsupported KDF metadata.",
+            EXIT_INVALID_INPUT,
+            operation,
+        )
+    if isinstance(exc, core.InvalidKeyFormatError):
+        return AgentCommandError(
+            "invalid_key", "Key file is not a supported PQC PEM key.", EXIT_INVALID_INPUT, operation
+        )
+    if isinstance(exc, core.UnsupportedAlgorithmError):
+        return AgentCommandError("unsupported_algorithm", str(exc), EXIT_INVALID_INPUT, operation)
+    if isinstance(exc, core.SizeLimitError):
+        return AgentCommandError(
+            "file_too_large", "Input file exceeds the configured size limit.", EXIT_INVALID_INPUT, operation
+        )
+    if isinstance(exc, core.FileFormatError):
+        return AgentCommandError(
+            "invalid_file_format",
+            "Input file is not a supported authenticated encrypted container.",
+            EXIT_INVALID_INPUT,
+            operation,
+        )
+    if isinstance(exc, core.CryptoDependencyError):
+        return AgentCommandError("backend_unavailable", str(exc), EXIT_BACKEND_UNAVAILABLE, operation)
+    return AgentCommandError("crypto_error", "Cryptographic operation failed.", EXIT_CRYPTO_FAILURE, operation)
 
 
 def _resolve_backend(operation: str, kem_alg: str = cfg.KEM_ALG) -> str:
@@ -214,26 +335,19 @@ def handle_health(_args: argparse.Namespace, workspace: Path) -> int:
 def handle_inspect_key(args: argparse.Namespace, workspace: Path) -> int:
     operation = "inspect-key"
     key_path, pem_content = _read_workspace_text(args.key, workspace)
-    algo, key_type, is_encrypted = core.get_key_info_pem(pem_content)
-    if not algo or not key_type:
-        raise AgentCommandError(
-            "invalid_key", "Key file is not a supported PQC PEM key.", EXIT_INVALID_INPUT, operation
-        )
+    try:
+        payload = core.inspect_key_pem_strict(pem_content)
+    except Exception as exc:
+        raise _agent_error_from_core(operation, exc) from exc
 
-    payload: dict[str, Any] = {
-        "key": _relative_to_workspace(key_path, workspace),
-        "key_type": key_type.lower(),
-        "kem": algo,
-    }
-    if key_type == "Private":
-        payload["private_key_encrypted"] = is_encrypted
+    payload["key"] = _relative_to_workspace(key_path, workspace)
     return _success(operation, **payload)
 
 
 def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
     operation = "generate-keys"
     kem = _resolve_backend(operation)
-    password = _password_from_env(args.password_env, operation, required=False)
+    password = _password_from_env(args.password_env, operation, required=True)
 
     public_out = _resolve_output_path(args.public_out, workspace, args.overwrite)
     private_out = _resolve_output_path(args.private_out, workspace, args.overwrite)
@@ -255,14 +369,22 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
     if not public_pem or not private_pem:
         raise AgentCommandError("key_format_failed", "Could not format generated keys.", EXIT_CRYPTO_FAILURE, operation)
 
-    public_path = _write_workspace_text(args.public_out, workspace, public_pem, args.overwrite)
-    private_path = _write_workspace_text(args.private_out, workspace, private_pem, args.overwrite)
+    public_path = _write_workspace_text(args.public_out, workspace, public_pem, args.overwrite, operation)
+    private_path = _write_workspace_text(
+        args.private_out,
+        workspace,
+        private_pem,
+        args.overwrite,
+        operation,
+        private_file=True,
+    )
     return _success(
         operation,
         kem=kem,
         public_key=_relative_to_workspace(public_path, workspace),
         private_key=_relative_to_workspace(private_path, workspace),
-        private_key_encrypted=bool(password),
+        private_key_encrypted=True,
+        private_key_kdf=cfg.PRIVATE_KEY_KDF_ALG,
     )
 
 
@@ -292,7 +414,7 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     if encrypted_blob is None:
         raise AgentCommandError("encryption_failed", "Encryption failed.", EXIT_CRYPTO_FAILURE, operation)
 
-    _write_workspace_file(args.output, workspace, encrypted_blob, args.overwrite)
+    _write_workspace_file(args.output, workspace, encrypted_blob, args.overwrite, operation)
     return _success(
         operation,
         kem=kem,
@@ -303,37 +425,72 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     )
 
 
+def handle_inspect_file(args: argparse.Namespace, workspace: Path) -> int:
+    operation = "inspect-file"
+    input_path, encrypted_blob = _read_workspace_file(args.input, workspace)
+    try:
+        metadata = core.inspect_encrypted_file_strict(encrypted_blob)
+    except Exception as exc:
+        raise _agent_error_from_core(operation, exc) from exc
+
+    return _success(
+        operation,
+        input=_relative_to_workspace(input_path, workspace),
+        encrypted_format_version=metadata.version,
+        kem=metadata.kem_alg,
+        header_bytes=metadata.header_bytes,
+        kem_ciphertext_bytes=metadata.kem_ciphertext_bytes,
+        encrypted_payload_bytes=metadata.encrypted_payload_bytes,
+        total_bytes=metadata.total_bytes,
+    )
+
+
+def _load_required_private_key(
+    private_key_path_text: str,
+    password_env: str,
+    workspace: Path,
+    operation: str,
+) -> tuple[Path, bytes, str]:
+    private_key_path, private_key_pem = _read_workspace_text(private_key_path_text, workspace)
+    try:
+        key_info = core.inspect_key_pem_strict(private_key_pem)
+    except Exception as exc:
+        raise _agent_error_from_core(operation, exc) from exc
+
+    if key_info["key_type"] != "private":
+        raise AgentCommandError("invalid_key", "Private key is required.", EXIT_INVALID_INPUT, operation)
+
+    password = _password_from_env(password_env, operation, required=True)
+    private_key, kem_alg, loaded_key_type = core.load_key_pem(private_key_pem, password=password)
+    if not private_key or not kem_alg or loaded_key_type != "private":
+        raise AgentCommandError(
+            "private_key_load_failed", "Could not load private key.", EXIT_CRYPTO_FAILURE, operation
+        )
+    return private_key_path, private_key, kem_alg
+
+
 def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
     operation = "decrypt"
     encrypted_path, encrypted_blob = _read_workspace_file(args.input, workspace)
     if not encrypted_blob:
         raise AgentCommandError("invalid_input", "Encrypted input file is empty.", EXIT_INVALID_INPUT, operation)
-    if len(encrypted_blob) > cfg.MAX_FILE_BYTES:
+    if len(encrypted_blob) > cfg.MAX_ENCRYPTED_FILE_BYTES:
         raise AgentCommandError(
             "file_too_large",
-            "Encrypted input file exceeds the configured size limit.",
+            "Encrypted input file exceeds the configured encrypted-file size limit.",
             EXIT_INVALID_INPUT,
             operation,
         )
 
-    private_key_path, private_key_pem = _read_workspace_text(args.private_key, workspace)
     output_path = _resolve_output_path(args.output, workspace, args.overwrite)
-    key_alg, key_type, is_encrypted = core.get_key_info_pem(private_key_pem)
-    if key_type == "Public":
-        raise AgentCommandError("invalid_key", "Private key is required for decryption.", EXIT_INVALID_INPUT, operation)
-    if not key_alg or key_type != "Private":
-        raise AgentCommandError("invalid_key", "Private key file is invalid.", EXIT_INVALID_INPUT, operation)
-
-    password = _password_from_env(args.password_env, operation, required=is_encrypted)
-    private_key, kem_alg, loaded_key_type = core.load_key_pem(
-        private_key_pem, password=password if is_encrypted else None
+    private_key_path, private_key, kem_alg = _load_required_private_key(
+        args.private_key,
+        args.password_env,
+        workspace,
+        operation,
     )
-    if not private_key or loaded_key_type != "private":
-        raise AgentCommandError(
-            "private_key_load_failed", "Could not load private key.", EXIT_CRYPTO_FAILURE, operation
-        )
 
-    _resolve_backend(operation, kem_alg or key_alg)
+    _resolve_backend(operation, kem_alg)
     with _suppress_library_output():
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key)
     del encrypted_blob
@@ -347,16 +504,56 @@ def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
             operation,
         )
 
-    _write_workspace_file(args.output, workspace, decrypted_data, args.overwrite)
+    _write_workspace_file(args.output, workspace, decrypted_data, args.overwrite, operation, private_file=True)
     bytes_written = len(decrypted_data)
     del decrypted_data
     return _success(
         operation,
-        kem=detected_alg or kem_alg or key_alg,
+        kem=detected_alg or kem_alg,
         input=_relative_to_workspace(encrypted_path, workspace),
         private_key=_relative_to_workspace(private_key_path, workspace),
         output=_relative_to_workspace(output_path, workspace),
         bytes_written=bytes_written,
+    )
+
+
+def handle_verify_file(args: argparse.Namespace, workspace: Path) -> int:
+    operation = "verify-file"
+    encrypted_path, encrypted_blob = _read_workspace_file(args.input, workspace)
+    try:
+        metadata = core.inspect_encrypted_file_strict(encrypted_blob)
+    except Exception as exc:
+        raise _agent_error_from_core(operation, exc) from exc
+
+    private_key_path, private_key, kem_alg = _load_required_private_key(
+        args.private_key,
+        args.password_env,
+        workspace,
+        operation,
+    )
+
+    _resolve_backend(operation, kem_alg)
+    with _suppress_library_output():
+        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key)
+    del encrypted_blob
+    del private_key
+
+    if decrypted_data is None:
+        raise AgentCommandError(
+            "verification_failed",
+            "Verification failed. Check private key, password, and ciphertext integrity.",
+            EXIT_CRYPTO_FAILURE,
+            operation,
+        )
+
+    bytes_verified = len(decrypted_data)
+    del decrypted_data
+    return _success(
+        operation,
+        kem=detected_alg or metadata.kem_alg,
+        input=_relative_to_workspace(encrypted_path, workspace),
+        private_key=_relative_to_workspace(private_key_path, workspace),
+        bytes_verified=bytes_verified,
     )
 
 
@@ -393,6 +590,10 @@ def build_parser() -> argparse.ArgumentParser:
     encrypt.add_argument("--overwrite", action="store_true")
     encrypt.set_defaults(handler=handle_encrypt)
 
+    inspect_file = subparsers.add_parser("inspect-file", help="Inspect an encrypted workspace file.")
+    inspect_file.add_argument("--input", required=True)
+    inspect_file.set_defaults(handler=handle_inspect_file)
+
     decrypt = subparsers.add_parser("decrypt", help="Decrypt a workspace file.")
     decrypt.add_argument("--input", required=True)
     decrypt.add_argument("--private-key", required=True)
@@ -400,6 +601,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_password_env_argument(decrypt)
     decrypt.add_argument("--overwrite", action="store_true")
     decrypt.set_defaults(handler=handle_decrypt)
+
+    verify_file = subparsers.add_parser("verify-file", help="Authenticate an encrypted workspace file without output.")
+    verify_file.add_argument("--input", required=True)
+    verify_file.add_argument("--private-key", required=True)
+    _add_password_env_argument(verify_file)
+    verify_file.set_defaults(handler=handle_verify_file)
 
     inspect_key = subparsers.add_parser("inspect-key", help="Inspect a PQC PEM key.")
     inspect_key.add_argument("--key", required=True)

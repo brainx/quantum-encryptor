@@ -7,6 +7,7 @@ import io
 import binascii
 import ctypes.util
 import importlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
@@ -17,7 +18,7 @@ from crypto_config import cfg
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.exceptions import InvalidTag, InvalidKey  # For password decryption
 from cryptography.hazmat.backends import default_backend
 
@@ -42,6 +43,57 @@ class UnsupportedAlgorithmError(ValueError):
 
 class FileFormatError(ValueError):
     """Raised when an encrypted file header or payload format is invalid."""
+
+
+class PasswordRequiredError(CryptoCoreError):
+    """Raised when a required private-key password is missing."""
+
+
+class WeakPasswordError(ValueError):
+    """Raised when a private-key password does not meet the security policy."""
+
+
+class UnencryptedPrivateKeyError(ValueError):
+    """Raised when an unencrypted private key is provided."""
+
+
+class UnsupportedKDFError(ValueError):
+    """Raised when private-key PEM metadata declares an unsupported KDF."""
+
+
+class AuthenticationFailedError(CryptoCoreError):
+    """Raised when authenticated decryption fails."""
+
+
+class SizeLimitError(ValueError):
+    """Raised when an input exceeds a configured in-memory size limit."""
+
+
+class InvalidKeyFormatError(ValueError):
+    """Raised when a key file is malformed or semantically invalid."""
+
+
+@dataclass(frozen=True)
+class EncryptedFileMetadata:
+    """Non-secret encrypted-container metadata."""
+
+    version: int
+    kem_alg: str
+    header_bytes: int
+    kem_ciphertext_bytes: int
+    encrypted_payload_bytes: int
+    total_bytes: int
+
+
+@dataclass(frozen=True)
+class EncryptedFileParts:
+    """Parsed encrypted-container parts used for decryption."""
+
+    metadata: EncryptedFileMetadata
+    header_aad: bytes
+    ciphertext_kem: bytes
+    nonce: bytes
+    encrypted_data_aes: bytes
 
 
 def _native_oqs_library_available() -> bool:
@@ -237,15 +289,65 @@ def derive_symmetric_key_hkdf(shared_secret: bytes) -> bytes:
     return derived_key
 
 
-def derive_key_from_password(password: str, salt: bytes) -> bytes:
-    """Derives an encryption key from a password using PBKDF2-HMAC-SHA256."""
+def validate_private_key_password(password: Optional[str]) -> str:
+    """Return a private-key password after enforcing the project security policy."""
     if not password:
-        raise ValueError("Password cannot be empty for key derivation.")
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=cfg.AES_KEY_BYTES,  # Derive key suitable for AES-256
+        raise PasswordRequiredError("Private-key password is required.")
+    if len(password) < cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS:
+        raise WeakPasswordError(
+            f"Private-key password must be at least {cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters."
+        )
+    return password
+
+
+def _current_private_key_kdf_metadata() -> Dict[str, int | str]:
+    return {
+        "name": cfg.PRIVATE_KEY_KDF_ALG,
+        "n": cfg.SCRYPT_N,
+        "r": cfg.SCRYPT_R,
+        "p": cfg.SCRYPT_P,
+    }
+
+
+def _current_private_key_kdf_line() -> str:
+    return f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG}," f"n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}"
+
+
+def _parse_private_key_kdf_line(line: str) -> Dict[str, int | str]:
+    if not line.startswith(cfg.PEM_KDF_HEADER):
+        raise UnsupportedKDFError("Encrypted private-key PEM is missing KDF metadata.")
+
+    parts = line[len(cfg.PEM_KDF_HEADER) :].split(",")
+    if not parts or parts[0] != cfg.PRIVATE_KEY_KDF_ALG:
+        raise UnsupportedKDFError("Private-key PEM uses an unsupported KDF.")
+
+    parsed: Dict[str, int | str] = {"name": parts[0]}
+    for part in parts[1:]:
+        if "=" not in part:
+            raise UnsupportedKDFError("Private-key PEM has malformed KDF metadata.")
+        name, value = part.split("=", 1)
+        if name not in {"n", "r", "p"}:
+            raise UnsupportedKDFError("Private-key PEM has unsupported KDF parameters.")
+        try:
+            parsed[name] = int(value)
+        except ValueError as exc:
+            raise UnsupportedKDFError("Private-key PEM has non-numeric KDF parameters.") from exc
+
+    expected = _current_private_key_kdf_metadata()
+    if parsed != expected:
+        raise UnsupportedKDFError("Private-key PEM KDF parameters do not match the required policy.")
+    return parsed
+
+
+def derive_key_from_password(password: str, salt: bytes) -> bytes:
+    """Derives a private-key encryption key from a password using scrypt."""
+    validate_private_key_password(password)
+    kdf = Scrypt(
         salt=salt,
-        iterations=cfg.PBKDF2_ITERATIONS,
+        length=cfg.AES_KEY_BYTES,  # Derive key suitable for AES-256
+        n=cfg.SCRYPT_N,
+        r=cfg.SCRYPT_R,
+        p=cfg.SCRYPT_P,
         backend=default_backend(),
     )
     password_bytes = password.encode("utf-8")
@@ -263,11 +365,13 @@ def encrypt_private_key(
     raw_private_key: bytes, password: str
 ) -> Tuple[Optional[bytes], Optional[bytes], Optional[bytes]]:
     """Encrypts raw private key bytes using AES-GCM with a key derived from password."""
-    if not password:
-        # If no password, return None for encrypted data (indicates not encrypted)
+    try:
+        validate_private_key_password(password)
+    except (PasswordRequiredError, WeakPasswordError) as exc:
+        logger.error(str(exc))
         return None, None, None
 
-    salt = os.urandom(cfg.PBKDF2_SALT_BYTES)
+    salt = os.urandom(cfg.SCRYPT_SALT_BYTES)
     try:
         derived_key = derive_key_from_password(password, salt)
         nonce = os.urandom(cfg.AES_NONCE_BYTES)
@@ -284,7 +388,7 @@ def encrypt_private_key(
             del derived_key
 
 
-def decrypt_private_key(encrypted_key_data: Dict[str, bytes], password: str) -> Optional[bytes]:
+def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Optional[bytes]:
     """Decrypts private key bytes using AES-GCM with a key derived from password."""
     if not password:
         logger.error("Password required for decrypting the private key, but none provided.")
@@ -296,6 +400,20 @@ def decrypt_private_key(encrypted_key_data: Dict[str, bytes], password: str) -> 
 
     if not salt or not nonce or not encrypted_key:
         logger.error("Missing salt, nonce, or encrypted data for private key decryption.")
+        return None
+
+    try:
+        validate_private_key_password(password)
+    except (PasswordRequiredError, WeakPasswordError) as exc:
+        logger.error(str(exc))
+        return None
+
+    kdf_name = encrypted_key_data.get("kdf")
+    kdf_n = encrypted_key_data.get("kdf_n")
+    kdf_r = encrypted_key_data.get("kdf_r")
+    kdf_p = encrypted_key_data.get("kdf_p")
+    if kdf_name != cfg.PRIVATE_KEY_KDF_ALG or kdf_n != cfg.SCRYPT_N or kdf_r != cfg.SCRYPT_R or kdf_p != cfg.SCRYPT_P:
+        logger.error("Encrypted private key uses unsupported KDF metadata.")
         return None
 
     derived_key = None  # Ensure cleanup
@@ -334,7 +452,6 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
         return None
 
     pem_data_lines = []
-    is_encrypted = False
     dek_info = ""
     encoded_key_b64 = ""
 
@@ -349,26 +466,24 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
 
     elif key_type == "private":
         pem_data_lines.append(cfg.PEM_PRIVATE_HEADER)
-        if password:
-            salt, nonce, encrypted_key = encrypt_private_key(key_bytes, password)
-            if salt and nonce and encrypted_key:
-                is_encrypted = True
-                salt_b64 = base64.b64encode(salt).decode("ascii")
-                nonce_b64 = base64.b64encode(nonce).decode("ascii")
-                encoded_key_b64 = base64.b64encode(encrypted_key).decode("ascii")
-                dek_info = f"{cfg.PEM_DEK_INFO_HEADER}{salt_b64},{nonce_b64}"
-                pem_data_lines.append(cfg.PEM_PROC_TYPE_HEADER)
-                pem_data_lines.append(dek_info)
-                pem_data_lines.append(f"{cfg.PEM_ALGORITHM_HEADER}{kem_alg}")  # Store algo even if encrypted
-                logger.info("Saving encrypted private key to PEM.")
-            else:
-                logger.error("Failed to encrypt private key for PEM saving.")
-                return None  # Encryption failed
+        if not password:
+            logger.error("Private keys must be password protected.")
+            return None
+
+        salt, nonce, encrypted_key = encrypt_private_key(key_bytes, password)
+        if salt and nonce and encrypted_key:
+            salt_b64 = base64.b64encode(salt).decode("ascii")
+            nonce_b64 = base64.b64encode(nonce).decode("ascii")
+            encoded_key_b64 = base64.b64encode(encrypted_key).decode("ascii")
+            dek_info = f"{cfg.PEM_DEK_INFO_HEADER}{salt_b64},{nonce_b64}"
+            pem_data_lines.append(cfg.PEM_PROC_TYPE_HEADER)
+            pem_data_lines.append(dek_info)
+            pem_data_lines.append(_current_private_key_kdf_line())
+            pem_data_lines.append(f"{cfg.PEM_ALGORITHM_HEADER}{kem_alg}")  # Store algo even if encrypted
+            logger.info("Saving encrypted private key to PEM.")
         else:
-            # Save unencrypted private key
-            pem_data_lines.append(f"{cfg.PEM_ALGORITHM_HEADER}{kem_alg}")
-            encoded_key_b64 = base64.b64encode(key_bytes).decode("ascii")
-            logger.info("Saving unencrypted private key to PEM.")
+            logger.error("Failed to encrypt private key for PEM saving.")
+            return None  # Encryption failed
 
     # Add base64 key data, formatted to 64 chars per line
     pem_data_lines.extend([encoded_key_b64[i : i + 64] for i in range(0, len(encoded_key_b64), 64)])
@@ -406,7 +521,8 @@ def load_key_pem(
     key_type = None
     is_encrypted = False
     kem_alg = None
-    dek_parts = {}
+    dek_parts: Dict[str, Any] = {}
+    kdf_parts: Dict[str, int | str] = {}
     key_b64_lines = []
 
     # Determine key type and check basic structure
@@ -442,7 +558,7 @@ def load_key_pem(
                     nonce = _b64decode_strict(nonce_b64, "private-key nonce")
                     if salt is None or nonce is None:
                         return None, None, None
-                    if len(salt) != cfg.PBKDF2_SALT_BYTES or len(nonce) != cfg.AES_NONCE_BYTES:
+                    if len(salt) != cfg.SCRYPT_SALT_BYTES or len(nonce) != cfg.AES_NONCE_BYTES:
                         logger.error("Encrypted private key PEM has invalid salt or nonce length.")
                         return None, None, None
                     dek_parts["salt"] = salt
@@ -452,6 +568,15 @@ def load_key_pem(
                     return None, None, None
             else:
                 logger.warning("Found DEK-Info header unexpectedly. Ignoring.")
+        elif line.startswith(cfg.PEM_KDF_HEADER):
+            if key_type == "private" and is_encrypted:
+                try:
+                    kdf_parts = _parse_private_key_kdf_line(line)
+                except UnsupportedKDFError as exc:
+                    logger.error(str(exc))
+                    return None, None, None
+            else:
+                logger.warning("Found KDF header unexpectedly. Ignoring.")
         else:
             # Assume it's base64 key data
             key_b64_lines.append(line)
@@ -480,8 +605,15 @@ def load_key_pem(
         if "salt" not in dek_parts or "nonce" not in dek_parts:
             logger.error("Encrypted private key PEM is missing DEK-Info details (salt/nonce).")
             return None, None, None
+        if not kdf_parts:
+            logger.error("Encrypted private key PEM is missing required KDF metadata.")
+            return None, None, None
 
         dek_parts["encrypted_key"] = raw_or_encrypted_bytes
+        dek_parts["kdf"] = kdf_parts.get("name")
+        dek_parts["kdf_n"] = kdf_parts.get("n")
+        dek_parts["kdf_r"] = kdf_parts.get("r")
+        dek_parts["kdf_p"] = kdf_parts.get("p")
         raw_key_bytes = decrypt_private_key(dek_parts, password)
 
         if raw_key_bytes is None:
@@ -497,8 +629,8 @@ def load_key_pem(
             return raw_key_bytes, kem_alg, key_type
 
     elif key_type == "private":  # Unencrypted private key
-        logger.info(f"Successfully loaded unencrypted private key for algorithm {kem_alg}.")
-        return raw_or_encrypted_bytes, kem_alg, key_type
+        logger.error("Unencrypted private keys are rejected by the current security policy.")
+        return None, None, None
     else:  # Public key
         logger.info(f"Successfully loaded public key for algorithm {kem_alg}.")
         return raw_or_encrypted_bytes, kem_alg, key_type
@@ -544,6 +676,130 @@ def get_key_info_pem(pem_content: str) -> Tuple[Optional[str], Optional[str], bo
         return None, key_type, is_encrypted
 
     return kem_alg, key_type, is_encrypted
+
+
+def inspect_key_pem_strict(pem_content: str) -> Dict[str, Any]:
+    """Inspect key PEM metadata and enforce private-key security policy."""
+    kem_alg, key_type, is_encrypted = get_key_info_pem(pem_content)
+    if not kem_alg or not key_type:
+        raise InvalidKeyFormatError("Key file is not a supported PQC PEM key.")
+
+    result: Dict[str, Any] = {
+        "kem": kem_alg,
+        "key_type": key_type.lower(),
+    }
+    if key_type == "Private":
+        if not is_encrypted:
+            raise UnencryptedPrivateKeyError("Unencrypted private keys are rejected.")
+        kdf_line = None
+        for line in pem_content.strip().splitlines()[1:-1]:
+            stripped = line.strip()
+            if stripped.startswith(cfg.PEM_KDF_HEADER):
+                kdf_line = stripped
+                break
+        if kdf_line is None:
+            raise UnsupportedKDFError("Encrypted private-key PEM is missing KDF metadata.")
+        kdf_parts = _parse_private_key_kdf_line(kdf_line)
+        result["private_key_encrypted"] = True
+        result["private_key_kdf"] = kdf_parts["name"]
+    return result
+
+
+def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
+    if not encrypted_blob:
+        raise FileFormatError("Encrypted input is empty.")
+    if len(encrypted_blob) > cfg.MAX_ENCRYPTED_FILE_BYTES:
+        raise SizeLimitError("Encrypted input exceeds maximum supported size.")
+
+    input_buffer = io.BytesIO(encrypted_blob)
+    try:
+        header_fixed_size = struct.calcsize(cfg.HEADER_BASE_FORMAT)
+        header_fixed_part = input_buffer.read(header_fixed_size)
+        if len(header_fixed_part) < header_fixed_size:
+            raise FileFormatError("File too short - truncated fixed header.")
+
+        magic, version = struct.unpack(cfg.HEADER_BASE_FORMAT, header_fixed_part)
+        if magic != cfg.MAGIC_BYTES:
+            raise FileFormatError("Invalid magic bytes.")
+        if version != cfg.FORMAT_VERSION:
+            raise FileFormatError("Unsupported encrypted-file format version.")
+
+        kem_alg_len_bytes = input_buffer.read(struct.calcsize(">H"))
+        if len(kem_alg_len_bytes) < struct.calcsize(">H"):
+            raise FileFormatError("Truncated header (KEM algo len).")
+        kem_alg_len = struct.unpack(">H", kem_alg_len_bytes)[0]
+        if kem_alg_len == 0 or kem_alg_len > cfg.MAX_KEM_ALG_NAME_BYTES:
+            raise FileFormatError("Implausible KEM algorithm length in header.")
+
+        kem_alg_bytes = input_buffer.read(kem_alg_len)
+        if len(kem_alg_bytes) < kem_alg_len:
+            raise FileFormatError("Truncated header (KEM algo name).")
+        try:
+            kem_alg_from_file = kem_alg_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise FileFormatError("KEM algorithm name is not valid UTF-8.") from exc
+        if not is_allowed_kem_algorithm(kem_alg_from_file):
+            raise UnsupportedAlgorithmError("Unsupported KEM algorithm in encrypted file.")
+
+        kem_ct_len_bytes = input_buffer.read(struct.calcsize(">I"))
+        if len(kem_ct_len_bytes) < struct.calcsize(">I"):
+            raise FileFormatError("Truncated header (KEM CT len).")
+        kem_ct_len = struct.unpack(">I", kem_ct_len_bytes)[0]
+        if kem_ct_len == 0 or kem_ct_len > cfg.MAX_KEM_CIPHERTEXT_BYTES:
+            raise FileFormatError("Implausible KEM ciphertext length.")
+
+        ciphertext_kem = input_buffer.read(kem_ct_len)
+        if len(ciphertext_kem) < kem_ct_len:
+            raise FileFormatError("Truncated header (KEM CT).")
+
+        nonce = input_buffer.read(cfg.AES_NONCE_BYTES)
+        if len(nonce) < cfg.AES_NONCE_BYTES:
+            raise FileFormatError("Truncated header (Nonce).")
+
+        header_aad = encrypted_blob[: input_buffer.tell()]
+        encrypted_data_aes = input_buffer.read()
+        if not encrypted_data_aes:
+            raise FileFormatError("Missing AES-GCM ciphertext and authentication tag.")
+
+        metadata = EncryptedFileMetadata(
+            version=version,
+            kem_alg=kem_alg_from_file,
+            header_bytes=len(header_aad),
+            kem_ciphertext_bytes=len(ciphertext_kem),
+            encrypted_payload_bytes=len(encrypted_data_aes),
+            total_bytes=len(encrypted_blob),
+        )
+        return EncryptedFileParts(
+            metadata=metadata,
+            header_aad=header_aad,
+            ciphertext_kem=ciphertext_kem,
+            nonce=nonce,
+            encrypted_data_aes=encrypted_data_aes,
+        )
+    finally:
+        input_buffer.close()
+
+
+def inspect_encrypted_file_strict(encrypted_blob: bytes) -> EncryptedFileMetadata:
+    """Parse non-secret encrypted-container metadata without using the native backend."""
+    return _parse_encrypted_file_parts(encrypted_blob).metadata
+
+
+def inspect_encrypted_file(encrypted_blob: bytes) -> Optional[Dict[str, Any]]:
+    """Compatibility wrapper for encrypted-container inspection."""
+    try:
+        metadata = inspect_encrypted_file_strict(encrypted_blob)
+        return {
+            "version": metadata.version,
+            "kem": metadata.kem_alg,
+            "header_bytes": metadata.header_bytes,
+            "kem_ciphertext_bytes": metadata.kem_ciphertext_bytes,
+            "encrypted_payload_bytes": metadata.encrypted_payload_bytes,
+            "total_bytes": metadata.total_bytes,
+        }
+    except (FileFormatError, UnsupportedAlgorithmError, SizeLimitError) as exc:
+        logger.error(str(exc))
+        return None
 
 
 # --- File Encryption / Decryption ---
@@ -651,81 +907,14 @@ def decrypt_file_pro(
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """Decrypts data using PQC KEM + AES-GCM and defined file format."""
     logger.info("Starting decryption process.")
-    if not encrypted_blob:
-        logger.error("Input data for decryption is empty.")
-        return None, None
-
-    input_buffer = io.BytesIO(encrypted_blob)
     shared_secret_receiver = None
     aes_key = None
     kem_alg_from_file = None
-    version = None
 
     try:
-        # 1. Read and Validate Fixed Header
-        header_fixed_size = struct.calcsize(cfg.HEADER_BASE_FORMAT)
-        header_fixed_part = input_buffer.read(header_fixed_size)
-        if len(header_fixed_part) < header_fixed_size:
-            raise FileFormatError("File too short - truncated fixed header.")
-
-        magic, version = struct.unpack(cfg.HEADER_BASE_FORMAT, header_fixed_part)
-
-        if magic != cfg.MAGIC_BYTES:
-            logger.error(f"Invalid magic bytes. Expected {cfg.MAGIC_BYTES!r}, got {magic!r}.")
-            return None, None  # Not our file format
-        if version > cfg.FORMAT_VERSION:
-            logger.error(f"File format version ({version}) is newer than supported ({cfg.FORMAT_VERSION}).")
-            return None, None
-        elif version < cfg.FORMAT_VERSION:
-            logger.info(
-                f"File format version ({version}) is older than current ({cfg.FORMAT_VERSION}). Attempting decryption."
-            )
-
-        logger.info(f"Header validated: Magic={magic!r}, Version={version}")
-
-        # 2. Read Variable Header Part
-        # Algo Len (H)
-        kem_alg_len_bytes = input_buffer.read(struct.calcsize(">H"))
-        if len(kem_alg_len_bytes) < struct.calcsize(">H"):
-            raise FileFormatError("Truncated header (KEM algo len).")
-        kem_alg_len = struct.unpack(">H", kem_alg_len_bytes)[0]
-        if kem_alg_len == 0 or kem_alg_len > cfg.MAX_KEM_ALG_NAME_BYTES:
-            raise FileFormatError("Implausible KEM Algo length in header.")
-
-        # Algo Name (kem_alg_len bytes)
-        kem_alg_bytes = input_buffer.read(kem_alg_len)
-        if len(kem_alg_bytes) < kem_alg_len:
-            raise FileFormatError("Truncated header (KEM algo name).")
-        kem_alg_from_file = kem_alg_bytes.decode("utf-8")
-        if not is_allowed_kem_algorithm(kem_alg_from_file):
-            raise UnsupportedAlgorithmError("Unsupported KEM algorithm in encrypted file.")
-        logger.info(f"KEM algorithm from file: {kem_alg_from_file}")
-
-        # KEM CT Len (I)
-        kem_ct_len_bytes = input_buffer.read(struct.calcsize(">I"))
-        if len(kem_ct_len_bytes) < struct.calcsize(">I"):
-            raise FileFormatError("Truncated header (KEM CT len).")
-        kem_ct_len = struct.unpack(">I", kem_ct_len_bytes)[0]
-        if kem_ct_len == 0 or kem_ct_len > cfg.MAX_KEM_CIPHERTEXT_BYTES:
-            raise FileFormatError("Implausible KEM ciphertext length.")
-
-        # KEM CT (kem_ct_len bytes)
-        ciphertext_kem = input_buffer.read(kem_ct_len)
-        if len(ciphertext_kem) < kem_ct_len:
-            raise FileFormatError("Truncated header (KEM CT).")
-
-        # Nonce (fixed size)
-        nonce = input_buffer.read(cfg.AES_NONCE_BYTES)
-        if len(nonce) < cfg.AES_NONCE_BYTES:
-            raise FileFormatError("Truncated header (Nonce).")
-        header_aad = encrypted_blob[: input_buffer.tell()]
-
-        # Rest is AES encrypted data
-        encrypted_data_aes = input_buffer.read()
-        if not encrypted_data_aes:
-            raise FileFormatError("Missing AES-GCM ciphertext and authentication tag.")
-
-        logger.debug("File header parsed successfully.")
+        parts = _parse_encrypted_file_parts(encrypted_blob)
+        kem_alg_from_file = parts.metadata.kem_alg
+        logger.info("Header validated: Magic=%r, Version=%s", cfg.MAGIC_BYTES, parts.metadata.version)
 
         # 3. KEM Decapsulation
         logger.debug(f"Performing KEM decapsulation with {kem_alg_from_file}...")
@@ -737,7 +926,7 @@ def decrypt_file_pro(
                 logger.error("Provided secret key length does not match the encrypted file's KEM algorithm.")
                 return None, kem_alg_from_file
             expected_ciphertext_len = kem.details.get("length_ciphertext")
-            if expected_ciphertext_len and len(ciphertext_kem) != expected_ciphertext_len:
+            if expected_ciphertext_len and parts.metadata.kem_ciphertext_bytes != expected_ciphertext_len:
                 logger.error("KEM ciphertext length does not match the encrypted file's KEM algorithm.")
                 return None, kem_alg_from_file
 
@@ -745,7 +934,7 @@ def decrypt_file_pro(
                 oqs_module,
                 resolved_kem_alg,
                 secret_key_bytes,
-                ciphertext_kem,
+                parts.ciphertext_kem,
             )
             logger.debug("KEM decapsulation successful.")
 
@@ -758,17 +947,10 @@ def decrypt_file_pro(
         logger.debug("Performing AES-GCM decryption...")
         aesgcm = AESGCM(aes_key)
         try:
-            decrypted_data = aesgcm.decrypt(nonce, encrypted_data_aes, header_aad)
+            decrypted_data = aesgcm.decrypt(parts.nonce, parts.encrypted_data_aes, parts.header_aad)
             logger.info("AES-GCM decryption and authentication successful.")
             return decrypted_data, kem_alg_from_file
         except InvalidTag:
-            if version is not None and version < 3:
-                try:
-                    decrypted_data = aesgcm.decrypt(nonce, encrypted_data_aes, None)
-                    logger.info("AES-GCM decryption successful using legacy unauthenticated-header mode.")
-                    return decrypted_data, kem_alg_from_file
-                except InvalidTag:
-                    pass
             logger.error("AES-GCM decryption failed: Authentication tag mismatch.")
             # This is a critical failure - indicates corruption, tampering, or wrong key
             return None, kem_alg_from_file
@@ -776,14 +958,8 @@ def decrypt_file_pro(
             logger.exception(f"AES-GCM decryption failed unexpectedly: {e_aes}")
             return None, kem_alg_from_file
 
-    except struct.error as e_struct:
-        logger.error(f"File format error during header unpacking: {e_struct}")
-        return None, kem_alg_from_file  # Indicates corruption
-    except (FileFormatError, UnsupportedAlgorithmError) as e_val:
+    except (FileFormatError, UnsupportedAlgorithmError, SizeLimitError) as e_val:
         logger.error(f"Invalid or truncated file header: {e_val}")
-        return None, kem_alg_from_file
-    except UnicodeDecodeError:
-        logger.error("Failed to decode KEM algorithm name from file header (corrupted?).")
         return None, kem_alg_from_file
     except CryptoDependencyError as e:
         logger.error(str(e))
@@ -798,12 +974,5 @@ def decrypt_file_pro(
         # Drop local references. Python bytes are not securely zeroized by reassignment/deletion.
         del aes_key
         del shared_secret_receiver
-        if "ciphertext_kem" in locals():
-            del ciphertext_kem
-        if "nonce" in locals():
-            del nonce
-        if "header_aad" in locals():
-            del header_aad
-        if "encrypted_data_aes" in locals():
-            del encrypted_data_aes
-        input_buffer.close()
+        if "parts" in locals():
+            del parts

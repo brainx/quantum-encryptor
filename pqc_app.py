@@ -27,7 +27,7 @@ st.set_page_config(
         **PQC Pro Encryptor v{cfg.FORMAT_VERSION}.0**
 
         Uses **{cfg.KEM_ALG}** (PQC KEM) + **AES-256-GCM** (DEM) with HKDF.
-        Supports optional password protection for private keys (PBKDF2 + AES-GCM).
+        Private keys are always password protected (scrypt + AES-GCM).
 
         **Disclaimer:** Security relies on correct implementation, secure key management,
         and the underlying cryptographic primitives. Requires auditing for production use.
@@ -58,10 +58,10 @@ def format_size(byte_count: int) -> str:
     return f"{mib:.1f} MiB"
 
 
-def uploaded_file_too_large(uploaded_file) -> bool:
+def uploaded_file_too_large(uploaded_file, max_bytes: int = cfg.MAX_FILE_BYTES) -> bool:
     """Return whether a Streamlit upload exceeds the configured in-memory limit."""
     size = getattr(uploaded_file, "size", None)
-    return size is not None and size > cfg.MAX_FILE_BYTES
+    return size is not None and size > max_bytes
 
 
 def sanitize_download_filename(filename: str, fallback: str) -> str:
@@ -73,7 +73,7 @@ def sanitize_download_filename(filename: str, fallback: str) -> str:
 
 def is_strong_private_key_password(password: str) -> bool:
     """Minimum password gate for offline private-key protection."""
-    return len(password) >= 16
+    return len(password) >= cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS
 
 
 def guess_decrypted_filename(encrypted_filename: Path) -> str:
@@ -145,30 +145,25 @@ if operation == "Generate Keys":
     st.markdown(f"Generates a **{active_kem_alg}** public/private key pair (PEM format).")
     st.info(f"Using KEM Algorithm: **{active_kem_alg}**")
 
-    st.subheader("Optional: Protect Private Key with Password")
-    use_password = st.checkbox("Encrypt Private Key with Password", key="gen_use_password")
+    st.subheader("Private Key Password")
     password_valid = False
-    if use_password:
-        st.session_state.password_gen = st.text_input("Enter Password:", type="password", key="gen_pw1")
-        st.session_state.password_gen_confirm = st.text_input("Confirm Password:", type="password", key="gen_pw2")
-        if st.session_state.password_gen or st.session_state.password_gen_confirm:  # Only check if user started typing
-            if not st.session_state.password_gen:
-                st.warning("Password cannot be empty.")
-            elif st.session_state.password_gen != st.session_state.password_gen_confirm:
-                st.warning("Passwords do not match.")
-            elif not is_strong_private_key_password(st.session_state.password_gen):
-                st.warning("Use at least 16 characters for private key password protection.")
-            else:
-                st.success("Passwords match.")
-                password_valid = True
-        # Disable button if passwords needed but not valid
-        disable_gen_button = not password_valid
+    st.session_state.password_gen = st.text_input("Enter Password:", type="password", key="gen_pw1")
+    st.session_state.password_gen_confirm = st.text_input("Confirm Password:", type="password", key="gen_pw2")
+    if st.session_state.password_gen or st.session_state.password_gen_confirm:
+        if not st.session_state.password_gen:
+            st.warning("Password cannot be empty.")
+        elif st.session_state.password_gen != st.session_state.password_gen_confirm:
+            st.warning("Passwords do not match.")
+        elif not is_strong_private_key_password(st.session_state.password_gen):
+            st.warning(
+                f"Use at least {cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters for private key password protection."
+            )
+        else:
+            st.success("Passwords match.")
+            password_valid = True
     else:
-        # Clear potentially entered passwords if checkbox is unchecked
-        st.session_state.password_gen = ""
-        st.session_state.password_gen_confirm = ""
-        password_valid = True  # Valid to have no password if not requested
-        disable_gen_button = False
+        st.warning("A password is required. Unencrypted private keys are not supported.")
+    disable_gen_button = not password_valid
 
     st.markdown("---")
     if st.button(
@@ -176,7 +171,7 @@ if operation == "Generate Keys":
         key="gen_button",
         disabled=disable_gen_button or bool(kem_status_message),
     ):
-        final_password = st.session_state.password_gen if use_password and password_valid else None
+        final_password = st.session_state.password_gen if password_valid else None
 
         with st.status(f"Generating {active_kem_alg} keys...", expanded=True) as status:
             st.write("Generating raw OQS key pair...")
@@ -188,8 +183,7 @@ if operation == "Generate Keys":
                 pub_pem = core.save_key_pem(raw_pub_key, active_kem_alg, "public")
 
                 st.write("Formatting Private Key (PEM)...")
-                if final_password:
-                    st.write("(Encrypting with password...)")
+                st.write("(Encrypting private key with password...)")
                 priv_pem = core.save_key_pem(raw_priv_key, active_kem_alg, "private", password=final_password)
 
                 # Cleanup raw keys immediately after PEM generation
@@ -203,7 +197,7 @@ if operation == "Generate Keys":
                     st.subheader("Download Your Keys (PEM Format)")
                     st.warning(
                         "🚨 **CRITICAL:** Securely store the **Private Key** file. "
-                        "If password protected, remember the password! Loss = permanent data loss."
+                        "Remember the password. Loss = permanent data loss."
                     )
 
                     pub_filename = f"{active_kem_alg.lower()}_public.pem"
@@ -332,27 +326,26 @@ elif operation == "Decrypt File":
 
     if encrypted_file and private_key_pem_file:
         st.markdown("---")
-        encrypted_too_large = uploaded_file_too_large(encrypted_file)
+        encrypted_too_large = uploaded_file_too_large(encrypted_file, cfg.MAX_ENCRYPTED_FILE_BYTES)
         if encrypted_too_large:
             st.error(
                 f"Selected encrypted file is {format_size(encrypted_file.size)}. "
-                f"The maximum supported size is {format_size(cfg.MAX_FILE_BYTES)}."
+                f"The maximum supported encrypted file size is {format_size(cfg.MAX_ENCRYPTED_FILE_BYTES)}."
             )
-        # First, inspect the private key to see if it's encrypted
+        # First, inspect the private key security metadata.
         priv_pem_content: str | None
         try:
             priv_pem_content = private_key_pem_file.getvalue().decode("utf-8")
-            priv_alg, priv_type, priv_encrypted = core.get_key_info_pem(priv_pem_content)
+            priv_info = core.inspect_key_pem_strict(priv_pem_content)
+            priv_type = str(priv_info.get("key_type", "")).title()
         except Exception as e:
             logger.exception("Error reading private key file: %s", e)
-            st.error("Could not read the private key file.")
+            st.error("Could not read a supported encrypted private key file.")
             priv_pem_content = None  # Halt
 
-        password_needed = False
         password_provided = False
         if priv_pem_content:
-            if priv_type == "Private" and priv_encrypted:
-                password_needed = True
+            if priv_type == "Private":
                 st.subheader("Password Required for Private Key")
                 st.session_state.password_decrypt = st.text_input(
                     "Enter Private Key Password:", type="password", key="dec_pw"
@@ -369,10 +362,8 @@ elif operation == "Decrypt File":
             elif not priv_type:
                 st.error("Could not determine key type or algorithm from the Private Key file. Is it a valid PEM?")
                 priv_pem_content = None  # Halt
-            else:  # Private, not encrypted
-                pass  # No password needed
 
-        if priv_pem_content and (not password_needed or password_provided):
+        if priv_pem_content and password_provided:
             original_filename = Path(encrypted_file.name)
             suggested_output_filename = guess_decrypted_filename(original_filename)
             output_filename = st.text_input(
@@ -382,17 +373,15 @@ elif operation == "Decrypt File":
             )
             output_filename = sanitize_download_filename(output_filename, suggested_output_filename)
 
-            disable_dec_button = (
-                not output_filename or (password_needed and not password_provided) or encrypted_too_large
-            )
+            disable_dec_button = not output_filename or not password_provided or encrypted_too_large
 
             if st.button("Decrypt File", key="dec_button", disabled=disable_dec_button):
                 encrypted_blob = encrypted_file.getvalue()
                 if len(encrypted_blob) == 0:
                     st.error("Encrypted file appears to be empty. Cannot decrypt.")
                 else:
-                    if len(encrypted_blob) > cfg.MAX_FILE_BYTES:
-                        st.error("Selected encrypted file exceeds the maximum supported size.")
+                    if len(encrypted_blob) > cfg.MAX_ENCRYPTED_FILE_BYTES:
+                        st.error("Selected encrypted file exceeds the maximum supported encrypted file size.")
                         st.stop()
 
                     with st.status(f"Decrypting '{encrypted_file.name}'...", expanded=False) as status:
@@ -400,13 +389,12 @@ elif operation == "Decrypt File":
                             status.write("Loading private key...")
                             priv_key_bytes, kem_alg_key, key_type = core.load_key_pem(
                                 priv_pem_content,
-                                password=(st.session_state.password_decrypt if password_needed else None),
+                                password=st.session_state.password_decrypt,
                             )
 
                             if not priv_key_bytes or key_type != "private":
                                 err_msg = "Failed to load private key."
-                                if password_needed:
-                                    err_msg += " Check if password is correct."
+                                err_msg += " Check if password is correct."
                                 logger.error(err_msg + " (Core function returned None or wrong key type)")
                                 status.update(label=err_msg, state="error")
                                 st.error(err_msg)

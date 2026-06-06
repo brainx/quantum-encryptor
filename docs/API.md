@@ -14,9 +14,12 @@ The `pqc_agent_tools` module exposes local JSON commands for automation agents. 
 mkdir -p keys data
 
 python -m pqc_agent_tools health --json
+export PQC_PRIVATE_KEY_PASSWORD='<strong-private-key-password>'
 python -m pqc_agent_tools generate-keys --public-out keys/public.pem --private-out keys/private.pem
 python -m pqc_agent_tools inspect-key --key keys/public.pem
 python -m pqc_agent_tools encrypt --input data/plain.txt --public-key keys/public.pem --output data/plain.pqc
+python -m pqc_agent_tools inspect-file --input data/plain.pqc
+python -m pqc_agent_tools verify-file --input data/plain.pqc --private-key keys/private.pem
 python -m pqc_agent_tools decrypt --input data/plain.pqc --private-key keys/private.pem --output data/plain.out.txt
 ```
 
@@ -26,9 +29,9 @@ The installed console script is:
 quantum-encryptor-agent health --json
 ```
 
-Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and existing output files are rejected unless the command includes `--overwrite`.
+Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and existing output files are rejected unless the command includes `--overwrite`. Private-key and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
 
-Password-protected private-key operations read from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`.
+Private-key operations read passwords from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`.
 
 ### Agent JSON Contract
 
@@ -90,13 +93,20 @@ def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
     """
 ```
 
-The core defines typed exceptions for backend, unsupported-algorithm, and file-format failures. Public UI-facing helpers still return `None` on many failures for compatibility, while the UI converts those failures into safe user-facing messages.
+The core defines typed exceptions for backend, unsupported-algorithm, key-policy, KDF, size-limit, authentication, and file-format failures. Public UI-facing helpers still return `None` on many failures for UI compatibility, while the UI converts those failures into safe user-facing messages.
 
 ```python
 class CryptoCoreError(RuntimeError): ...
 class CryptoDependencyError(CryptoCoreError): ...
 class UnsupportedAlgorithmError(ValueError): ...
 class FileFormatError(ValueError): ...
+class PasswordRequiredError(CryptoCoreError): ...
+class WeakPasswordError(ValueError): ...
+class UnencryptedPrivateKeyError(ValueError): ...
+class UnsupportedKDFError(ValueError): ...
+class AuthenticationFailedError(CryptoCoreError): ...
+class SizeLimitError(ValueError): ...
+class InvalidKeyFormatError(ValueError): ...
 ```
 
 ```python
@@ -124,7 +134,7 @@ def derive_symmetric_key_hkdf(shared_secret: bytes) -> bytes:
 ```python
 def derive_key_from_password(password: str, salt: bytes) -> bytes:
     """
-    Derives an encryption key from a password using PBKDF2-HMAC-SHA256.
+    Derives a private-key encryption key from a password using scrypt.
     
     Args:
         password: User-provided password.
@@ -134,7 +144,8 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
         Derived key suitable for AES-256.
         
     Raises:
-        ValueError: If password is empty.
+        PasswordRequiredError: If password is empty.
+        WeakPasswordError: If password is shorter than the configured minimum.
     """
 ```
 
@@ -155,12 +166,12 @@ def encrypt_private_key(raw_private_key: bytes, password: str) -> Tuple[Optional
 ```
 
 ```python
-def decrypt_private_key(encrypted_key_data: Dict[str, bytes], password: str) -> Optional[bytes]:
+def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Optional[bytes]:
     """
     Decrypts private key bytes using AES-GCM with a key derived from password.
     
     Args:
-        encrypted_key_data: Dictionary containing 'salt', 'nonce', and 'encrypted_key'.
+        encrypted_key_data: Dictionary containing 'salt', 'nonce', 'encrypted_key', and KDF metadata.
         password: The password for key derivation.
         
     Returns:
@@ -178,13 +189,13 @@ def save_key_pem(
     password: Optional[str] = None
 ) -> Optional[str]:
     """
-    Saves key data (raw bytes) in PEM format. Encrypts private key if password is provided.
+    Saves key data (raw bytes) in PEM format. Private keys require password protection.
     
     Args:
         key_bytes: Raw key bytes to save.
         kem_alg: The KEM algorithm identifier.
         key_type: Either "public" or "private".
-        password: Optional password for private key encryption.
+        password: Required password for private key encryption.
         
     Returns:
         PEM formatted string, or None on error.
@@ -197,11 +208,11 @@ def load_key_pem(
     password: Optional[str] = None
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
-    Loads key data from PEM string. Decrypts private key if necessary and password is provided.
+    Loads key data from PEM string. Private-key PEMs must be encrypted with the required scrypt metadata.
     
     Args:
         pem_content: The PEM-formatted key data.
-        password: Optional password for private key decryption.
+        password: Required password for private key decryption.
         
     Returns:
         Tuple (raw_key_bytes, kem_algorithm, key_type), or (None, None, None) on error.
@@ -230,7 +241,7 @@ def encrypt_file_pro(
     """
 ```
 
-`encrypt_file_pro` rejects inputs larger than `cfg.MAX_FILE_BYTES`. Format version 3 authenticates the full encrypted-file header as AES-GCM associated data.
+`encrypt_file_pro` rejects plaintext inputs larger than `cfg.MAX_FILE_BYTES`. Format version 3 authenticates the full encrypted-file header as AES-GCM associated data.
 
 ```python
 def decrypt_file_pro(
@@ -249,18 +260,30 @@ def decrypt_file_pro(
     """
 ```
 
+Only format version 3 encrypted containers are accepted. Older file formats are rejected.
+
+```python
+def inspect_encrypted_file_strict(encrypted_blob: bytes) -> EncryptedFileMetadata:
+    """
+    Parses non-secret encrypted-container metadata without using the native backend.
+    """
+```
+
 ## crypto_config Module
 
 The `crypto_config` module provides configuration constants used by the cryptographic operations.
 
 ### Important Constants
 
-- `KEM_ALG`: The post-quantum KEM algorithm used (default: "Kyber768")
+- `KEM_ALG`: The post-quantum KEM algorithm used (default: "ML-KEM-768")
 - `ALLOWED_KEM_ALGS`: Accepted KEM identifiers (`ML-KEM-768` and legacy `Kyber768`)
 - `AES_KEY_BYTES`: Size of AES key in bytes (32 for AES-256)
-- `PBKDF2_ITERATIONS`: Number of iterations for password-based key derivation (390,000)
+- `PRIVATE_KEY_MIN_PASSWORD_CHARS`: Minimum private-key password length
+- `PRIVATE_KEY_KDF_ALG`: Required private-key KDF (`scrypt`)
+- `SCRYPT_N`, `SCRYPT_R`, `SCRYPT_P`: Required scrypt private-key KDF parameters
 - `FORMAT_VERSION`: File format version for encrypted files
 - `MAX_FILE_BYTES`: Maximum in-memory file size accepted by the UI and core encryption path
+- `MAX_ENCRYPTED_FILE_BYTES`: Maximum encrypted-container size accepted by decryption, including bounded header and authentication overhead
 
 ## Example Usage
 
