@@ -91,6 +91,65 @@ class TestKeyGeneration:
             core._require_oqs()
 
 
+class TestOQSCompatibility:
+    """Tests for liboqs-python API compatibility helpers."""
+
+    def test_decapsulate_shared_secret_with_constructor_secret_key_api(self):
+        """liboqs-python 0.15 keeps the private key on the KEM instance."""
+
+        class ModernKEM:
+            def __init__(self, alg_name, secret_key=None):
+                self.alg_name = alg_name
+                self.secret_key = secret_key
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                return None
+
+            def decap_secret(self, ciphertext):
+                assert self.alg_name == cfg.KEM_ALG
+                assert self.secret_key == b"secret-key"
+                assert ciphertext == b"ciphertext"
+                return b"shared-secret"
+
+        class ModernOQS:
+            KeyEncapsulation = ModernKEM
+
+        shared_secret = core._decapsulate_shared_secret(ModernOQS, cfg.KEM_ALG, b"secret-key", b"ciphertext")
+
+        assert shared_secret == b"shared-secret"
+
+    def test_decapsulate_shared_secret_with_legacy_two_argument_api(self):
+        """Older liboqs-python bindings accepted the private key at decapsulation time."""
+
+        class LegacyKEM:
+            def __init__(self, alg_name, **kwargs):
+                if kwargs:
+                    raise TypeError("legacy constructor does not accept secret_key")
+                self.alg_name = alg_name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                return None
+
+            def decap_secret(self, secret_key, ciphertext):
+                assert self.alg_name == cfg.KEM_ALG
+                assert secret_key == b"secret-key"
+                assert ciphertext == b"ciphertext"
+                return b"legacy-shared-secret"
+
+        class LegacyOQS:
+            KeyEncapsulation = LegacyKEM
+
+        shared_secret = core._decapsulate_shared_secret(LegacyOQS, cfg.KEM_ALG, b"secret-key", b"ciphertext")
+
+        assert shared_secret == b"legacy-shared-secret"
+
+
 class TestKeyDerivation:
     """Tests for key derivation functions."""
 

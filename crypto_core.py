@@ -153,6 +153,24 @@ def _b64decode_strict(value: str, label: str) -> Optional[bytes]:
         return None
 
 
+def _decapsulate_shared_secret(
+    oqs_module: Any,
+    kem_alg: str,
+    secret_key_bytes: bytes,
+    ciphertext_kem: bytes,
+) -> bytes:
+    """Decapsulate with liboqs-python versions that differ in secret-key handling."""
+    try:
+        with oqs_module.KeyEncapsulation(kem_alg, secret_key=secret_key_bytes) as kem:
+            return kem.decap_secret(ciphertext_kem)
+    except TypeError as current_api_error:
+        try:
+            with oqs_module.KeyEncapsulation(kem_alg) as kem:
+                return kem.decap_secret(secret_key_bytes, ciphertext_kem)
+        except TypeError:
+            raise current_api_error
+
+
 # --- KEM Key Generation ---
 
 
@@ -723,7 +741,12 @@ def decrypt_file_pro(
                 logger.error("KEM ciphertext length does not match the encrypted file's KEM algorithm.")
                 return None, kem_alg_from_file
 
-            shared_secret_receiver = kem.decap_secret(secret_key_bytes, ciphertext_kem)
+            shared_secret_receiver = _decapsulate_shared_secret(
+                oqs_module,
+                resolved_kem_alg,
+                secret_key_bytes,
+                ciphertext_kem,
+            )
             logger.debug("KEM decapsulation successful.")
 
         # 4. Derive AES Key securely
