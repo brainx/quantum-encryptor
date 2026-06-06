@@ -58,6 +58,7 @@ The application is designed to protect against the following threats:
 - Download filenames are reduced to local filenames before being passed to Streamlit.
 - Private-key password protection requires at least 16 characters in the UI.
 - The core module defines its own logger but leaves root logging configuration to application entry points.
+- The local agent CLI is not a network service, accepts only workspace-relative paths, rejects symlink escapes, and reads passwords from environment variables instead of command-line arguments.
 - CI runs static checks, tests without native `liboqs`, and a native `liboqs` integration test job.
 
 ## Security Best Practices

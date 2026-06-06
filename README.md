@@ -133,11 +133,47 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 4. Enter your password if the private key is password-protected
 5. Download the decrypted file
 
+## Agent Usage
+
+Local automation agents can use the deterministic JSON CLI instead of driving the Streamlit UI. Run commands from the repository workspace and pass only workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and accidental output overwrites are rejected.
+
+```bash
+mkdir -p keys data
+
+python -m pqc_agent_tools health --json
+
+export PQC_PRIVATE_KEY_PASSWORD='<strong-private-key-password>'
+python -m pqc_agent_tools generate-keys \
+  --public-out keys/agent-public.pem \
+  --private-out keys/agent-private.pem
+
+python -m pqc_agent_tools inspect-key --key keys/agent-public.pem
+
+python -m pqc_agent_tools encrypt \
+  --input data/message.txt \
+  --public-key keys/agent-public.pem \
+  --output data/message.pqc
+
+python -m pqc_agent_tools decrypt \
+  --input data/message.pqc \
+  --private-key keys/agent-private.pem \
+  --output data/message.decrypted.txt
+```
+
+The installed console entry point is equivalent:
+
+```bash
+quantum-encryptor-agent health --json
+```
+
+The CLI prints JSON only and never includes plaintext, private keys, passwords, raw file bytes, or absolute local paths in its output. Password-protected private-key operations read passwords from the environment variable named by `--password-env`, defaulting to `PQC_PRIVATE_KEY_PASSWORD`.
+
 ## Security Considerations
 
 - Encrypted files use KEM-derived AES-256-GCM keys and authenticate file header metadata as associated data in format version 3
 - Private key password protection uses PBKDF2-HMAC-SHA256 and AES-256-GCM
 - The web UI enforces a 100 MiB per-file processing limit because files are handled in memory
+- The local agent CLI accepts only workspace-relative paths and returns machine-readable JSON without secret material
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
 - CI runs formatting, linting, type checks, unit tests, and a native `liboqs` integration test job
 - **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
@@ -146,6 +182,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 
 - `crypto_config.py` - Configuration parameters for cryptographic operations
 - `crypto_core.py` - Core cryptographic functions (key generation, encryption, decryption)
+- `pqc_agent_tools.py` - Local JSON CLI for agentic workflows
 - `pqc_app.py` - Streamlit web application interface
 - `start.sh` - Local application startup script
 - `test.sh` - Test runner

@@ -6,6 +6,64 @@ This document provides API notes for the core cryptographic functions in the Qua
 
 The `crypto_core` module provides the main cryptographic operations used by the application.
 
+## Agent CLI
+
+The `pqc_agent_tools` module exposes local JSON commands for automation agents. It does not start a network service and it does not print raw file bytes, plaintext, passwords, private keys, or absolute local paths.
+
+```bash
+mkdir -p keys data
+
+python -m pqc_agent_tools health --json
+python -m pqc_agent_tools generate-keys --public-out keys/public.pem --private-out keys/private.pem
+python -m pqc_agent_tools inspect-key --key keys/public.pem
+python -m pqc_agent_tools encrypt --input data/plain.txt --public-key keys/public.pem --output data/plain.pqc
+python -m pqc_agent_tools decrypt --input data/plain.pqc --private-key keys/private.pem --output data/plain.out.txt
+```
+
+The installed console script is:
+
+```bash
+quantum-encryptor-agent health --json
+```
+
+Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and existing output files are rejected unless the command includes `--overwrite`.
+
+Password-protected private-key operations read from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`.
+
+### Agent JSON Contract
+
+Successful command output:
+
+```json
+{
+  "ok": true,
+  "operation": "encrypt",
+  "format_version": 3,
+  "kem": "ML-KEM-768",
+  "output": "data/plain.pqc"
+}
+```
+
+Failure output:
+
+```json
+{
+  "ok": false,
+  "operation": "decrypt",
+  "error_code": "decryption_failed",
+  "message": "Decryption failed. Check private key, password, and ciphertext integrity."
+}
+```
+
+Exit codes:
+
+- `0`: success
+- `1`: unexpected error
+- `2`: invalid input
+- `3`: backend unavailable
+- `4`: cryptographic or authentication failure
+- `5`: workspace path boundary violation
+
 ### Key Generation
 
 ```python
