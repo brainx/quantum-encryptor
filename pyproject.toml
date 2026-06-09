@@ -28,7 +28,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/brainx/quantum-encryptor"
+Homepage = "https://github.com/brainx/Quantum-Encryptor"
+Repository = "https://github.com/brainx/Quantum-Encryptor"
+Issues = "https://github.com/brainx/Quantum-Encryptor/issues"
 
 [project.scripts]
 quantum-encryptor-agent = "pqc_agent_tools:main"

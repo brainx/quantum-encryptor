@@ -10,7 +10,7 @@ By participating in this project, you agree to abide by our Code of Conduct.
 
 ### Reporting Bugs
 
-- Check if the bug has already been reported in the GitHub Issues section
+- Check if the bug has already been reported in [GitHub Issues](https://github.com/brainx/Quantum-Encryptor/issues)
 - Use the bug report template when creating a new issue
 - Provide detailed steps to reproduce the bug
 - Include information about your environment (OS, Python version, etc.)
@@ -18,7 +18,7 @@ By participating in this project, you agree to abide by our Code of Conduct.
 
 ### Suggesting Enhancements
 
-- Check if the enhancement has already been suggested in the GitHub Issues section
+- Check if the enhancement has already been suggested in [GitHub Issues](https://github.com/brainx/Quantum-Encryptor/issues)
 - Use the feature request template when creating a new issue
 - Clearly describe the enhancement and its expected benefits
 - Consider how the enhancement aligns with the project's goals
@@ -34,10 +34,10 @@ By participating in this project, you agree to abide by our Code of Conduct.
 
 ## Development Setup
 
-1. Fork and clone the repository:
+1. Clone the repository:
    ```bash
-   git clone https://github.com/[YOUR-USERNAME]/quantum-encryptor.git
-   cd quantum-encryptor
+   git clone https://github.com/brainx/Quantum-Encryptor.git
+   cd Quantum-Encryptor
    ```
 
 2. Create a virtual environment and install dependencies:
@@ -50,7 +50,7 @@ By participating in this project, you agree to abide by our Code of Conduct.
 
 3. Install development dependencies:
    ```bash
-   pip install pytest pytest-cov black flake8 mypy
+   pip install -r requirements-dev.txt
    ```
 
 ## Coding Standards
@@ -75,7 +75,7 @@ By participating in this project, you agree to abide by our Code of Conduct.
 - Try to maintain or improve test coverage
 - Run the test suite before submitting a pull request:
   ```bash
-  pytest
+  PYTHON=.venv/bin/python ./test.sh
   ```
 
 ### Type Checking
@@ -83,7 +83,9 @@ By participating in this project, you agree to abide by our Code of Conduct.
 - Use type hints for all new code
 - Run mypy to check static typing:
   ```bash
-  mypy .
+  .venv/bin/python -m mypy \
+    crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py \
+    tests/test_agent_tools.py tests/test_crypto_core.py
   ```
 
 ## Commit Messages
@@ -101,8 +103,9 @@ By participating in this project, you agree to abide by our Code of Conduct.
 
 ## Additional Resources
 
-- [Project Documentation](https://github.com/[YOUR-USERNAME]/quantum-encryptor)
+- [Project Repository](https://github.com/brainx/Quantum-Encryptor)
+- [Issue Tracker](https://github.com/brainx/Quantum-Encryptor/issues)
 - [Open Quantum Safe Documentation](https://openquantumsafe.org/)
 - [NIST Post-Quantum Cryptography](https://csrc.nist.gov/Projects/post-quantum-cryptography)
 
-Thank you for contributing to the Quantum Encryptor project! 
+Thank you for contributing to the Quantum Encryptor project!

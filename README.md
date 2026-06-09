@@ -63,8 +63,8 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/brainx/quantum-encryptor.git
-   cd quantum-encryptor
+   git clone https://github.com/brainx/Quantum-Encryptor.git
+   cd Quantum-Encryptor
    ```
 
 2. Create a virtual environment (recommended):
