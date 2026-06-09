@@ -39,6 +39,20 @@ def _tamper(data: bytes, offset: int) -> bytes:
     return bytes(tampered)
 
 
+def _syntactic_encrypted_blob(version: int = cfg.FORMAT_VERSION) -> bytes:
+    alg = cfg.KEM_ALG.encode("utf-8")
+    return (
+        cfg.MAGIC_BYTES
+        + version.to_bytes(2, "big")
+        + len(alg).to_bytes(2, "big")
+        + alg
+        + (1).to_bytes(4, "big")
+        + b"x"
+        + os.urandom(cfg.AES_NONCE_BYTES)
+        + b"ciphertext-and-tag"
+    )
+
+
 # Test fixtures
 @pytest.fixture
 def kem_algorithm():
@@ -165,7 +179,7 @@ class TestKeyDerivation:
     def test_derive_key_from_password(self):
         """Test password-based key derivation."""
         test_password = "secure-test-password"
-        test_salt = os.urandom(cfg.PBKDF2_SALT_BYTES)
+        test_salt = os.urandom(cfg.SCRYPT_SALT_BYTES)
 
         derived_key = core.derive_key_from_password(test_password, test_salt)
 
@@ -178,9 +192,9 @@ class TestKeyDerivation:
 
     def test_derive_key_empty_password(self):
         """Test password-based key derivation with empty password."""
-        test_salt = os.urandom(cfg.PBKDF2_SALT_BYTES)
+        test_salt = os.urandom(cfg.SCRYPT_SALT_BYTES)
 
-        with pytest.raises(ValueError):
+        with pytest.raises(core.PasswordRequiredError):
             core.derive_key_from_password("", test_salt)
 
 
@@ -204,6 +218,10 @@ class TestPrivateKeyEncryption:
             "salt": salt,
             "nonce": nonce,
             "encrypted_key": encrypted_key,
+            "kdf": cfg.PRIVATE_KEY_KDF_ALG,
+            "kdf_n": cfg.SCRYPT_N,
+            "kdf_r": cfg.SCRYPT_R,
+            "kdf_p": cfg.SCRYPT_P,
         }
 
         # Decrypt with correct password
@@ -238,25 +256,14 @@ class TestPEMKeyFormat:
         assert loaded_alg == kem_alg
         assert loaded_type == "public"
 
-    def test_save_load_private_key_pem_no_password(self, key_pair, kem_algorithm):
-        """Test saving and loading a private key without password."""
+    def test_save_private_key_pem_without_password_is_rejected(self, key_pair, kem_algorithm):
+        """Private keys must be password protected."""
         _, private_key = key_pair
         kem_alg = kem_algorithm
 
-        # Save private key to PEM (no password)
         pem_string = core.save_key_pem(private_key, kem_alg, "private")
-        assert pem_string is not None
-        assert cfg.PEM_PRIVATE_HEADER in pem_string
-        assert cfg.PEM_PRIVATE_FOOTER in pem_string
-        assert cfg.PEM_PROC_TYPE_HEADER not in pem_string  # Not encrypted
 
-        # Load private key from PEM
-        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_string)
-
-        assert loaded_key is not None
-        assert loaded_key == private_key
-        assert loaded_alg == kem_alg
-        assert loaded_type == "private"
+        assert pem_string is None
 
     def test_save_load_private_key_pem_with_password(self, key_pair, kem_algorithm):
         """Test saving and loading a private key with password."""
@@ -270,6 +277,7 @@ class TestPEMKeyFormat:
         assert cfg.PEM_PRIVATE_HEADER in pem_string
         assert cfg.PEM_PRIVATE_FOOTER in pem_string
         assert cfg.PEM_PROC_TYPE_HEADER in pem_string  # Encrypted
+        assert f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG}" in pem_string
 
         # Load private key from PEM with correct password
         loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_string, password=test_password)
@@ -332,7 +340,64 @@ class TestPEMKeyFormat:
             ]
         )
 
-        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_content, password="password")
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_content, password="correct horse battery staple")
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+
+    def test_load_unencrypted_private_key_pem_is_rejected(self):
+        """Legacy unencrypted private keys fail closed."""
+        private_key = base64.b64encode(b"private-key").decode("ascii")
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PRIVATE_HEADER,
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                private_key,
+                cfg.PEM_PRIVATE_FOOTER,
+            ]
+        )
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_content)
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+        with pytest.raises(core.UnencryptedPrivateKeyError):
+            core.inspect_key_pem_strict(pem_content)
+
+    @pytest.mark.parametrize(
+        "kdf_line",
+        [
+            "",
+            "KDF: pbkdf2,iterations=390000",
+            "KDF: scrypt,n=1024,r=8,p=1",
+            "KDF: scrypt,n=32768,r=8",
+            "KDF: scrypt,n=32768,r=8,p=text",
+        ],
+    )
+    def test_encrypted_private_key_rejects_missing_or_weak_kdf_metadata(self, kdf_line):
+        """Encrypted private-key PEM must declare the current scrypt policy."""
+        salt = base64.b64encode(os.urandom(cfg.SCRYPT_SALT_BYTES)).decode("ascii")
+        nonce = base64.b64encode(os.urandom(cfg.AES_NONCE_BYTES)).decode("ascii")
+        encrypted_key = base64.b64encode(b"encrypted-key").decode("ascii")
+        lines = [
+            cfg.PEM_PRIVATE_HEADER,
+            cfg.PEM_PROC_TYPE_HEADER,
+            f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
+        ]
+        if kdf_line:
+            lines.append(kdf_line)
+        lines.extend(
+            [
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                encrypted_key,
+                cfg.PEM_PRIVATE_FOOTER,
+            ]
+        )
+        pem_content = "\n".join(lines)
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_content, password="correct horse battery staple")
 
         assert loaded_key is None
         assert loaded_alg is None
@@ -423,7 +488,25 @@ class TestFileEncryption:
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_data, b"")
 
         assert decrypted_data is None
-        assert detected_alg == bad_alg.decode("utf-8")
+        assert detected_alg is None
+
+    def test_decrypt_rejects_legacy_file_format_versions(self):
+        """Legacy encrypted-file formats are rejected instead of using unauthenticated-header fallback."""
+        decrypted_data, detected_alg = core.decrypt_file_pro(_syntactic_encrypted_blob(version=2), b"")
+
+        assert decrypted_data is None
+        assert detected_alg is None
+
+    def test_inspect_encrypted_file_without_backend(self, monkeypatch):
+        """Encrypted-container metadata inspection does not require native liboqs."""
+        monkeypatch.setattr(core, "oqs", None)
+        monkeypatch.setattr(core, "_native_oqs_library_available", lambda: False)
+
+        metadata = core.inspect_encrypted_file_strict(_syntactic_encrypted_blob())
+
+        assert metadata.version == cfg.FORMAT_VERSION
+        assert metadata.kem_alg == cfg.KEM_ALG
+        assert metadata.kem_ciphertext_bytes == 1
 
     @pytest.mark.parametrize(
         "encrypted_data",
@@ -450,3 +533,14 @@ class TestFileEncryption:
         encrypted_data = core.encrypt_file_pro(b"four", b"", cfg.KEM_ALG)
 
         assert encrypted_data is None
+
+    def test_decrypt_rejects_oversized_encrypted_blob_before_backend_use(self, monkeypatch):
+        """Encrypted-container size limits are enforced before native backend access."""
+        monkeypatch.setattr(cfg, "MAX_ENCRYPTED_FILE_BYTES", 3)
+        monkeypatch.setattr(core, "oqs", None)
+        monkeypatch.setattr(core, "_native_oqs_library_available", lambda: False)
+
+        decrypted_data, detected_alg = core.decrypt_file_pro(b"four", b"")
+
+        assert decrypted_data is None
+        assert detected_alg is None

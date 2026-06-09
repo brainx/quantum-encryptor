@@ -30,8 +30,11 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/brainx/quantum-encryptor"
 
+[project.scripts]
+quantum-encryptor-agent = "pqc_agent_tools:main"
+
 [tool.setuptools]
-py-modules = ["crypto_config", "crypto_core", "pqc_app"]
+py-modules = ["crypto_config", "crypto_core", "pqc_agent_tools", "pqc_app"]
 
 [tool.black]
 line-length = 120
