@@ -43,6 +43,34 @@ jobs:
       - name: Unit tests without native liboqs
         run: PYTHON=python ./test.sh
 
+  locked-runtime-install:
+    name: Locked runtime install
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install locked runtime dependencies
+        run: python -m pip install --require-hashes -r requirements-lock.txt
+
+      - name: Verify package imports
+        run: |
+          python - <<'PY'
+          import crypto_config
+          import crypto_core
+          import pqc_agent_tools
+          import ui_helpers
+
+          print("locked runtime import check ok")
+          PY
+
   native-oqs:
     name: Native liboqs integration tests
     runs-on: ubuntu-latest

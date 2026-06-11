@@ -8,7 +8,7 @@ import re
 # Import core logic and config
 from crypto_config import cfg
 import crypto_core as core
-from ui_helpers import guess_decrypted_filename
+from ui_helpers import format_key_info_for_display, guess_decrypted_filename
 
 # --- Basic Logging Setup ---
 # Configure logging level and format
@@ -461,20 +461,22 @@ elif operation == "Key Utilities":
             st.stop()
         try:
             pem_content = key_util_file.getvalue().decode("utf-8")
-            algo, key_type, is_encrypted = core.get_key_info_pem(pem_content)
+            key_info = core.inspect_key_pem_strict(pem_content)
+            display_info = format_key_info_for_display(key_info)
 
-            if algo and key_type:
-                st.success("Key file parsed successfully.")
-                st.markdown("---")
-                st.write(f"**Key Type:** `{key_type}`")
-                st.write(f"**Algorithm:** `{algo}`")
-                if key_type == "Private":
-                    st.write(f"**Password Encrypted:** `{'Yes' if is_encrypted else 'No'}`")
-                st.markdown("---")
-                st.info("Note: This only checks the headers and format, not the validity of the key data itself.")
-            else:
-                st.error("Failed to parse key file. Is it a valid PEM format with expected headers?")
+            st.success("Key file parsed successfully.")
+            st.markdown("---")
+            for label, value in display_info.items():
+                st.write(f"**{label}:** `{value}`")
+            st.markdown("---")
+            st.info(
+                "Note: This checks supported key metadata and security policy. "
+                "It does not prove the key matches a ciphertext."
+            )
 
+        except (core.InvalidKeyFormatError, core.UnencryptedPrivateKeyError, core.UnsupportedKDFError) as e:
+            logger.warning("Unsupported key file in utility inspector: %s", e)
+            st.error("Unsupported or insecure PEM key file.")
         except Exception as e:
             logger.exception(f"Error inspecting key file: {e}")
             st.error("Could not read or parse the key file.")

@@ -329,6 +329,58 @@ class TestPEMKeyFormat:
         assert loaded_alg == cfg.KEM_ALG
         assert loaded_type == "private"
 
+    def test_load_key_pem_rejects_oversized_public_key_payload(self, monkeypatch):
+        """Decoded PEM key payloads are capped before acceptance."""
+        monkeypatch.setattr(cfg, "MAX_RAW_KEY_BYTES", 3)
+        key_data = base64.b64encode(b"four").decode("ascii")
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PUBLIC_HEADER,
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                key_data,
+                cfg.PEM_PUBLIC_FOOTER,
+            ]
+        )
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_content)
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+
+    def test_load_key_pem_rejects_oversized_private_key_payload_before_decrypt(self, monkeypatch):
+        """Oversized encrypted private-key payloads fail before password KDF/decryption."""
+        monkeypatch.setattr(cfg, "MAX_RAW_KEY_BYTES", 3)
+        monkeypatch.setattr(
+            core,
+            "decrypt_private_key",
+            lambda *_args, **_kwargs: pytest.fail("decrypt should not run"),
+        )
+        salt = base64.b64encode(os.urandom(cfg.SCRYPT_SALT_BYTES)).decode("ascii")
+        nonce = base64.b64encode(os.urandom(cfg.AES_NONCE_BYTES)).decode("ascii")
+        encrypted_key = base64.b64encode(b"four").decode("ascii")
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PRIVATE_HEADER,
+                f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
+                cfg.PEM_PROC_TYPE_HEADER,
+                f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
+                f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                encrypted_key,
+                cfg.PEM_PRIVATE_FOOTER,
+            ]
+        )
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(
+            pem_content,
+            password="river metal orbit cactus 47",
+        )
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+
     def test_private_key_pem_rejects_algorithm_metadata_tampering(self, monkeypatch):
         """Changing authenticated algorithm metadata breaks private-key decryption."""
         password = "river metal orbit cactus 47"

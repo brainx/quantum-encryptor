@@ -719,6 +719,9 @@ def load_key_pem(
     raw_or_encrypted_bytes = _b64decode_strict(key_b64, "PEM key data")
     if raw_or_encrypted_bytes is None:
         return None, None, None
+    if len(raw_or_encrypted_bytes) > cfg.MAX_RAW_KEY_BYTES:
+        logger.error("PEM key payload exceeds maximum raw key size.")
+        return None, None, None
 
     # Handle decryption if necessary
     if key_type == "private" and is_encrypted:

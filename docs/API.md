@@ -151,17 +151,21 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
 
 ### Private Key Encryption/Decryption
 
-Encrypted private-key PEM files use format version 2 metadata. That metadata is authenticated as AES-GCM associated data so changes to the private-key format version, KEM algorithm, KDF parameters, salt, or nonce fail closed during decryption.
+Encrypted private-key PEM files use format version 2 metadata. The AES-GCM tag authenticates the private-key format version, KEM algorithm, scrypt KDF name and parameters, salt, and nonce as associated data. Salt and nonce are serialized as base64 in the PEM text but represented as bytes in `PrivateKeyPemMetadata`.
 
 ```python
 @dataclass(frozen=True)
 class PrivateKeyPemMetadata:
+    """Authenticated metadata for encrypted private-key PEM files."""
+
     format_version: int
     kem_alg: str
-    kdf_alg: str
-    kdf_params: str
-    salt_b64: str
-    nonce_b64: str
+    kdf_name: str
+    kdf_n: int
+    kdf_r: int
+    kdf_p: int
+    salt: bytes
+    nonce: bytes
 ```
 
 ```python
