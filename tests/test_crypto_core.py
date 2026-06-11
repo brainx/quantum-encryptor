@@ -197,6 +197,25 @@ class TestKeyDerivation:
         with pytest.raises(core.PasswordRequiredError):
             core.derive_key_from_password("", test_salt)
 
+    @pytest.mark.parametrize(
+        "password",
+        [
+            "",
+            "short",
+            "aaaaaaaaaaaaaaaa",
+            "1111111111111111",
+            "password12345678",
+        ],
+    )
+    def test_validate_private_key_password_rejects_weak_passwords(self, password):
+        """The shared private-key password policy rejects trivial values."""
+        with pytest.raises((core.PasswordRequiredError, core.WeakPasswordError)):
+            core.validate_private_key_password(password)
+
+    def test_validate_private_key_password_accepts_reasonable_passphrase(self):
+        """A long passphrase with character variety is accepted."""
+        assert core.validate_private_key_password("river metal orbit cactus 47") == "river metal orbit cactus 47"
+
 
 class TestPrivateKeyEncryption:
     """Tests for private key encryption/decryption."""
@@ -207,16 +226,17 @@ class TestPrivateKeyEncryption:
         test_password = "test-password-123"
 
         # Encrypt the private key
-        salt, nonce, encrypted_key = core.encrypt_private_key(private_key, test_password)
+        metadata, encrypted_key = core.encrypt_private_key(private_key, test_password, cfg.KEM_ALG)
 
-        assert salt is not None
-        assert nonce is not None
+        assert metadata is not None
         assert encrypted_key is not None
 
         # Create the key data dict for decryption
         encrypted_key_data = {
-            "salt": salt,
-            "nonce": nonce,
+            "format_version": metadata.format_version,
+            "kem_alg": metadata.kem_alg,
+            "salt": metadata.salt,
+            "nonce": metadata.nonce,
             "encrypted_key": encrypted_key,
             "kdf": cfg.PRIVATE_KEY_KDF_ALG,
             "kdf_n": cfg.SCRYPT_N,
@@ -230,7 +250,7 @@ class TestPrivateKeyEncryption:
         assert decrypted_key == private_key
 
         # Try decrypting with wrong password
-        decrypted_key_wrong = core.decrypt_private_key(encrypted_key_data, "wrong-password")
+        decrypted_key_wrong = core.decrypt_private_key(encrypted_key_data, "different-test-password")
         assert decrypted_key_wrong is None
 
 
@@ -276,6 +296,7 @@ class TestPEMKeyFormat:
         assert pem_string is not None
         assert cfg.PEM_PRIVATE_HEADER in pem_string
         assert cfg.PEM_PRIVATE_FOOTER in pem_string
+        assert f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}" in pem_string
         assert cfg.PEM_PROC_TYPE_HEADER in pem_string  # Encrypted
         assert f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG}" in pem_string
 
@@ -289,10 +310,93 @@ class TestPEMKeyFormat:
 
         # Try loading with wrong password
         loaded_key_wrong, _loaded_alg_wrong, _loaded_type_wrong = core.load_key_pem(
-            pem_string, password="wrong-password"
+            pem_string, password="different-test-password"
         )
 
         assert loaded_key_wrong is None  # Decryption failed
+
+    def test_save_load_private_key_pem_v2_with_authenticated_metadata(self):
+        """Private-key PEM v2 authenticates metadata and round-trips."""
+        password = "river metal orbit cactus 47"
+        raw_private_key = b"private-key-bytes"
+
+        pem_string = core.save_key_pem(raw_private_key, cfg.KEM_ALG, "private", password=password)
+
+        assert pem_string is not None
+        assert f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}" in pem_string
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_string, password=password)
+        assert loaded_key == raw_private_key
+        assert loaded_alg == cfg.KEM_ALG
+        assert loaded_type == "private"
+
+    def test_private_key_pem_rejects_algorithm_metadata_tampering(self, monkeypatch):
+        """Changing authenticated algorithm metadata breaks private-key decryption."""
+        password = "river metal orbit cactus 47"
+        monkeypatch.setattr(cfg, "ALLOWED_KEM_ALGS", (cfg.KEM_ALG, "Fake-KEM"))
+
+        pem_string = core.save_key_pem(b"private-key-bytes", cfg.KEM_ALG, "private", password=password)
+        assert pem_string is not None
+        tampered = pem_string.replace(f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}", "Algorithm: Fake-KEM")
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(tampered, password=password)
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+
+    def test_private_key_pem_rejects_kdf_metadata_tampering(self):
+        """Changing authenticated KDF metadata breaks private-key decryption."""
+        password = "river metal orbit cactus 47"
+        pem_string = core.save_key_pem(b"private-key-bytes", cfg.KEM_ALG, "private", password=password)
+        assert pem_string is not None
+        tampered = pem_string.replace(f"n={cfg.SCRYPT_N}", "n=65536")
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(tampered, password=password)
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+
+    def test_private_key_pem_rejects_dek_metadata_tampering(self):
+        """Changing authenticated salt/nonce metadata breaks private-key decryption."""
+        password = "river metal orbit cactus 47"
+        pem_string = core.save_key_pem(b"private-key-bytes", cfg.KEM_ALG, "private", password=password)
+        assert pem_string is not None
+        dek_line = next(line for line in pem_string.splitlines() if line.startswith(cfg.PEM_DEK_INFO_HEADER))
+        _salt_b64, nonce_b64 = dek_line[len(cfg.PEM_DEK_INFO_HEADER) :].split(",", 1)
+        replacement_salt = base64.b64encode(b"2" * cfg.SCRYPT_SALT_BYTES).decode("ascii")
+        tampered = pem_string.replace(dek_line, f"{cfg.PEM_DEK_INFO_HEADER}{replacement_salt},{nonce_b64}")
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(tampered, password=password)
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+
+    def test_legacy_encrypted_private_key_without_format_version_is_rejected(self):
+        """Legacy encrypted private-key PEMs with unsigned metadata fail closed."""
+        salt = base64.b64encode(os.urandom(cfg.SCRYPT_SALT_BYTES)).decode("ascii")
+        nonce = base64.b64encode(os.urandom(cfg.AES_NONCE_BYTES)).decode("ascii")
+        encrypted_key = base64.b64encode(b"encrypted-key").decode("ascii")
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PRIVATE_HEADER,
+                cfg.PEM_PROC_TYPE_HEADER,
+                f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
+                f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                encrypted_key,
+                cfg.PEM_PRIVATE_FOOTER,
+            ]
+        )
+
+        loaded_key, loaded_alg, loaded_type = core.load_key_pem(pem_content, password="river metal orbit cactus 47")
+
+        assert loaded_key is None
+        assert loaded_alg is None
+        assert loaded_type is None
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
 
     @pytest.mark.parametrize(
         "pem_content",
@@ -332,8 +436,10 @@ class TestPEMKeyFormat:
         pem_content = "\n".join(
             [
                 cfg.PEM_PRIVATE_HEADER,
+                f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
                 cfg.PEM_PROC_TYPE_HEADER,
                 f"{cfg.PEM_DEK_INFO_HEADER}{bad_salt},{nonce}",
+                f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
                 f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
                 encrypted_key,
                 cfg.PEM_PRIVATE_FOOTER,
@@ -383,6 +489,7 @@ class TestPEMKeyFormat:
         encrypted_key = base64.b64encode(b"encrypted-key").decode("ascii")
         lines = [
             cfg.PEM_PRIVATE_HEADER,
+            f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
             cfg.PEM_PROC_TYPE_HEADER,
             f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
         ]
@@ -489,6 +596,23 @@ class TestFileEncryption:
 
         assert decrypted_data is None
         assert detected_alg is None
+
+    def test_decrypt_rejects_private_key_algorithm_mismatch_before_backend_use(self):
+        """A private key for a non-matching KEM cannot be used for a parsed container."""
+        decrypted_data, detected_alg = core.decrypt_file_pro(
+            _syntactic_encrypted_blob(),
+            b"private-key",
+            expected_kem_alg="Different-KEM",
+        )
+
+        assert decrypted_data is None
+        assert detected_alg == cfg.KEM_ALG
+
+    def test_canonical_kem_algorithm_treats_kyber768_as_ml_kem_768(self):
+        """Configured ML-KEM/Kyber aliases remain compatible."""
+        assert core.canonical_kem_algorithm("Kyber768") == "ML-KEM-768"
+        assert core.canonical_kem_algorithm("ML-KEM-768") == "ML-KEM-768"
+        assert core.canonical_kem_algorithm("Other-KEM") == "Other-KEM"
 
     def test_decrypt_rejects_legacy_file_format_versions(self):
         """Legacy encrypted-file formats are rejected instead of using unauthenticated-header fallback."""

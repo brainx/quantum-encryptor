@@ -7,6 +7,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 ## Assets
 
 - Private-key PEM files and their passwords.
+- Encrypted private-key PEM metadata, including KEM algorithm, KDF parameters, salt, and nonce.
 - KEM shared secrets and derived AES keys.
 - Plaintext input files and decrypted output files.
 - Encrypted `.pqc` containers and their authenticated metadata.
@@ -23,9 +24,11 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 ## Abuse Cases
 
 - Supplying malformed or legacy private-key PEM files to bypass password protection.
+- Tampering with encrypted private-key PEM metadata to downgrade KDF parameters or confuse the KEM algorithm.
+- Combining a private key for one KEM label with an encrypted container carrying a different KEM label.
 - Supplying weak, missing, or reused private-key passwords.
 - Tampering with encrypted-file headers, KEM ciphertext, nonce, AES ciphertext, or authentication tag.
-- Feeding oversized files to exhaust process memory.
+- Feeding oversized PEM, plaintext, or encrypted-container inputs to exhaust process memory.
 - Using absolute paths, parent traversal, or symlinks to make the agent CLI read or write outside the workspace.
 - Triggering native backend failures during import, key generation, encryption, or decryption.
 - Leaking plaintext, private keys, passwords, raw bytes, or absolute local paths through JSON output or logs.
@@ -33,7 +36,10 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 ## Required Invariants
 
 - Private keys are never saved or accepted unless encrypted with the required scrypt KDF metadata.
+- Encrypted private-key PEM files must include `PQC-Key-Format: 2`, and private-key metadata must be authenticated as AES-GCM associated data.
+- File decryption must reject a private-key KEM label that does not match the encrypted-container KEM label after compatibility alias normalization.
 - Encrypted files must be format version 3 and must authenticate the complete header as AES-GCM associated data.
+- PEM, plaintext, and encrypted-container inputs must be bounded before expensive parsing or cryptographic work.
 - Decryption failures do not produce plaintext output files.
 - Agent CLI paths stay workspace-relative and cannot escape through symlinks.
 - Agent CLI JSON output never includes secret material or absolute local paths.
@@ -41,13 +47,16 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 
 ## Current Mitigations
 
-- Strict PEM base64, KDF, salt, nonce, and key-type validation.
-- Mandatory private-key password policy with a minimum length of 16 characters.
+- Strict PEM base64, KDF, salt, nonce, format-version, KEM, and key-type validation.
+- Mandatory private-key password policy with a minimum length of 16 characters, at least 5 unique characters, and known weak password rejection.
 - scrypt private-key password derivation with fixed required parameters.
+- Encrypted private-key PEM v2 metadata authenticated as AES-GCM associated data and legacy encrypted private-key metadata rejected by default.
+- Private-key KEM metadata checked against encrypted-container KEM metadata before backend decapsulation.
+- PEM/key, plaintext, and encrypted-container size checks before parsing or decrypting.
 - v3-only encrypted-container parsing with bounded header and ciphertext lengths.
 - AES-256-GCM with full encrypted-file header as associated data.
 - Lazy native `liboqs` loading with dependency failures reported as unavailable backend state.
-- Workspace-only agent CLI path validation, overwrite protection, atomic writes, and JSON-only responses.
+- Workspace-only agent CLI path validation, exclusive non-overwrite creation, atomic replacement on explicit overwrite, and JSON-only responses.
 
 ## Limitations
 

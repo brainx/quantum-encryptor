@@ -149,8 +149,40 @@ def _target_file_mode(path: Path, private_file: bool) -> int:
         return 0o666 & ~_current_umask()
 
 
-def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: bool, operation: str) -> None:
-    mode = _target_file_mode(path, private_file)
+def _fsync_parent_dir(path: Path) -> None:
+    if os.name == "nt":
+        return
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _write_new_file_exclusive(path: Path, data: bytes, mode: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd: Optional[int] = None
+    created = False
+    try:
+        fd = os.open(path, flags, mode)
+        created = True
+        with os.fdopen(fd, "wb") as out:
+            fd = None
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(path, mode)
+        _fsync_parent_dir(path)
+    except Exception:
+        if created:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _replace_file_atomically(path: Path, data: bytes, mode: int) -> None:
     tmp_path: Optional[Path] = None
     fd: Optional[int] = None
     try:
@@ -163,15 +195,9 @@ def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: b
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
         os.chmod(tmp_path, mode)
-        if not overwrite and path.exists():
-            raise AgentCommandError(
-                "output_exists",
-                "Output file already exists. Pass --overwrite to replace it.",
-                EXIT_INVALID_INPUT,
-                operation,
-            )
         os.replace(tmp_path, path)
         os.chmod(path, mode)
+        _fsync_parent_dir(path)
     finally:
         if fd is not None:
             os.close(fd)
@@ -179,18 +205,59 @@ def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: b
             tmp_path.unlink(missing_ok=True)
 
 
-def _read_workspace_file(path_text: str, workspace: Path) -> tuple[Path, bytes]:
-    path = _resolve_input_path(path_text, workspace)
-    data = path.read_bytes()
-    return path, data
+def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: bool, operation: str) -> None:
+    mode = _target_file_mode(path, private_file)
+    if overwrite:
+        _replace_file_atomically(path, data, mode)
+        return
+    try:
+        _write_new_file_exclusive(path, data, mode)
+    except FileExistsError as exc:
+        raise AgentCommandError(
+            "output_exists",
+            "Output file already exists. Pass --overwrite to replace it.",
+            EXIT_INVALID_INPUT,
+            operation,
+        ) from exc
 
 
-def _read_workspace_text(path_text: str, workspace: Path) -> tuple[Path, str]:
+def _read_workspace_file_limited(path_text: str, workspace: Path, max_bytes: int) -> tuple[Path, bytes]:
     path = _resolve_input_path(path_text, workspace)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not stat input path.", EXIT_INVALID_INPUT) from exc
+    if size > max_bytes:
+        raise AgentCommandError(
+            "file_too_large",
+            "Input file exceeds the configured size limit.",
+            EXIT_INVALID_INPUT,
+        )
+    try:
+        return path, path.read_bytes()
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not read input path.", EXIT_INVALID_INPUT) from exc
+
+
+def _read_workspace_text(path_text: str, workspace: Path, max_bytes: Optional[int] = None) -> tuple[Path, str]:
+    path = _resolve_input_path(path_text, workspace)
+    limit = cfg.MAX_PEM_BYTES if max_bytes is None else max_bytes
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not stat input path.", EXIT_INVALID_INPUT) from exc
+    if size > limit:
+        raise AgentCommandError(
+            "file_too_large",
+            "Text input file exceeds the configured size limit.",
+            EXIT_INVALID_INPUT,
+        )
     try:
         return path, path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise AgentCommandError("invalid_input", "File must be valid UTF-8 text.", EXIT_INVALID_INPUT) from exc
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not read input path.", EXIT_INVALID_INPUT) from exc
 
 
 def _write_workspace_file(
@@ -225,17 +292,15 @@ def _write_workspace_text(
 def _password_from_env(env_name: str, operation: str, required: bool) -> Optional[str]:
     password = os.environ.get(env_name)
     if password:
-        if len(password) < cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS:
+        try:
+            return core.validate_private_key_password(password)
+        except (core.PasswordRequiredError, core.WeakPasswordError) as exc:
             raise AgentCommandError(
                 "weak_password",
-                (
-                    f"Set {env_name} to a private-key password with at least "
-                    f"{cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters."
-                ),
+                f"Set {env_name} to a stronger private-key password: {exc}",
                 EXIT_CRYPTO_FAILURE,
                 operation,
-            )
-        return password
+            ) from exc
     if required:
         raise AgentCommandError(
             "password_required",
@@ -254,7 +319,7 @@ def _agent_error_from_core(operation: str, exc: Exception) -> AgentCommandError:
     if isinstance(exc, core.WeakPasswordError):
         return AgentCommandError(
             "weak_password",
-            f"Private-key password must be at least {cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters.",
+            str(exc),
             EXIT_CRYPTO_FAILURE,
             operation,
         )
@@ -390,12 +455,7 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
 
 def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     operation = "encrypt"
-    input_path, input_data = _read_workspace_file(args.input, workspace)
-    if len(input_data) > cfg.MAX_FILE_BYTES:
-        raise AgentCommandError(
-            "file_too_large", "Input file exceeds the configured size limit.", EXIT_INVALID_INPUT, operation
-        )
-
+    input_path, input_data = _read_workspace_file_limited(args.input, workspace, cfg.MAX_FILE_BYTES)
     public_key_path, public_key_pem = _read_workspace_text(args.public_key, workspace)
     output_path = _resolve_output_path(args.output, workspace, args.overwrite)
 
@@ -427,7 +487,7 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
 
 def handle_inspect_file(args: argparse.Namespace, workspace: Path) -> int:
     operation = "inspect-file"
-    input_path, encrypted_blob = _read_workspace_file(args.input, workspace)
+    input_path, encrypted_blob = _read_workspace_file_limited(args.input, workspace, cfg.MAX_ENCRYPTED_FILE_BYTES)
     try:
         metadata = core.inspect_encrypted_file_strict(encrypted_blob)
     except Exception as exc:
@@ -471,16 +531,9 @@ def _load_required_private_key(
 
 def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
     operation = "decrypt"
-    encrypted_path, encrypted_blob = _read_workspace_file(args.input, workspace)
+    encrypted_path, encrypted_blob = _read_workspace_file_limited(args.input, workspace, cfg.MAX_ENCRYPTED_FILE_BYTES)
     if not encrypted_blob:
         raise AgentCommandError("invalid_input", "Encrypted input file is empty.", EXIT_INVALID_INPUT, operation)
-    if len(encrypted_blob) > cfg.MAX_ENCRYPTED_FILE_BYTES:
-        raise AgentCommandError(
-            "file_too_large",
-            "Encrypted input file exceeds the configured encrypted-file size limit.",
-            EXIT_INVALID_INPUT,
-            operation,
-        )
 
     output_path = _resolve_output_path(args.output, workspace, args.overwrite)
     private_key_path, private_key, kem_alg = _load_required_private_key(
@@ -492,7 +545,7 @@ def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
 
     _resolve_backend(operation, kem_alg)
     with _suppress_library_output():
-        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key)
+        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
     del encrypted_blob
     del private_key
 
@@ -519,7 +572,7 @@ def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
 
 def handle_verify_file(args: argparse.Namespace, workspace: Path) -> int:
     operation = "verify-file"
-    encrypted_path, encrypted_blob = _read_workspace_file(args.input, workspace)
+    encrypted_path, encrypted_blob = _read_workspace_file_limited(args.input, workspace, cfg.MAX_ENCRYPTED_FILE_BYTES)
     try:
         metadata = core.inspect_encrypted_file_strict(encrypted_blob)
     except Exception as exc:
@@ -534,7 +587,7 @@ def handle_verify_file(args: argparse.Namespace, workspace: Path) -> int:
 
     _resolve_backend(operation, kem_alg)
     with _suppress_library_output():
-        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key)
+        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
     del encrypted_blob
     del private_key
 

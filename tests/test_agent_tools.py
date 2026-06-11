@@ -52,6 +52,7 @@ def _valid_private_pem(encrypted: bool = True) -> str:
     return "\n".join(
         [
             cfg.PEM_PRIVATE_HEADER,
+            f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
             cfg.PEM_PROC_TYPE_HEADER,
             f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
             f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
@@ -120,6 +121,18 @@ def test_inspect_key_rejects_unencrypted_private_key(monkeypatch, tmp_path, caps
 
     assert code == tools.EXIT_CRYPTO_FAILURE
     assert payload["error_code"] == "unencrypted_private_key"
+
+
+def test_inspect_key_rejects_oversized_pem_before_parse(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cfg, "MAX_PEM_BYTES", 16)
+    (tmp_path / "huge.pem").write_text("A" * 17, encoding="utf-8")
+    monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: pytest.fail("PEM parser should not run"))
+
+    code, payload = _run_agent(["inspect-key", "--key", "huge.pem"], capsys)
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "file_too_large"
 
 
 def test_path_boundary_rejects_absolute_and_parent_paths(monkeypatch, tmp_path, capsys):
@@ -194,6 +207,69 @@ def test_encrypt_rejects_existing_output_without_overwrite(monkeypatch, tmp_path
     assert output_path.read_bytes() == b"encrypted"
 
 
+def test_atomic_write_non_overwrite_uses_exclusive_create(monkeypatch, tmp_path):
+    output_path = tmp_path / "new-output.bin"
+    original_open = tools.os.open
+    opened_flags = []
+
+    def tracking_open(path, flags, mode=0o777, *args, **kwargs):
+        if os.fspath(path) == os.fspath(output_path):
+            opened_flags.append(flags)
+        return original_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(tools.os, "open", tracking_open)
+
+    tools._atomic_write_file(output_path, b"new", overwrite=False, private_file=False, operation="test")
+
+    assert output_path.read_bytes() == b"new"
+    assert any(flags & os.O_EXCL for flags in opened_flags)
+
+
+def test_atomic_write_non_overwrite_rejects_existing_file(tmp_path):
+    output_path = tmp_path / "existing.bin"
+    output_path.write_bytes(b"existing")
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._atomic_write_file(output_path, b"new", overwrite=False, private_file=False, operation="test")
+
+    assert exc.value.error_code == "output_exists"
+    assert output_path.read_bytes() == b"existing"
+
+
+def test_encrypt_rejects_oversized_public_key_before_parse(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cfg, "MAX_PEM_BYTES", 16)
+    (tmp_path / "message.txt").write_bytes(b"hello")
+    (tmp_path / "recipient.pem").write_text("A" * 17, encoding="utf-8")
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: pytest.fail("PEM parser should not run"))
+
+    code, payload = _run_agent(
+        ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "message.pqc"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "file_too_large"
+    assert not (tmp_path / "message.pqc").exists()
+
+
+def test_encrypt_rejects_oversized_input_before_key_parse(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cfg, "MAX_FILE_BYTES", 4)
+    (tmp_path / "message.txt").write_bytes(b"12345")
+    (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: pytest.fail("PEM parser should not run"))
+
+    code, payload = _run_agent(
+        ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "message.pqc"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "file_too_large"
+    assert not (tmp_path / "message.pqc").exists()
+
+
 def test_decrypt_requires_password_env_for_encrypted_private_key(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.pqc").write_bytes(b"encrypted")
@@ -219,6 +295,31 @@ def test_decrypt_requires_password_env_for_encrypted_private_key(monkeypatch, tm
     assert payload["error_code"] == "password_required"
 
 
+def test_decrypt_rejects_oversized_private_key_before_parse(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cfg, "MAX_PEM_BYTES", 16)
+    (tmp_path / "message.pqc").write_bytes(b"encrypted")
+    (tmp_path / "private.pem").write_text("A" * 17, encoding="utf-8")
+    monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: pytest.fail("PEM parser should not run"))
+
+    code, payload = _run_agent(
+        [
+            "decrypt",
+            "--input",
+            "message.pqc",
+            "--private-key",
+            "private.pem",
+            "--output",
+            "message.txt",
+        ],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "file_too_large"
+    assert not (tmp_path / "message.txt").exists()
+
+
 def test_decrypt_uses_password_env_and_writes_plaintext_file(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.pqc").write_bytes(b"encrypted")
@@ -231,7 +332,12 @@ def test_decrypt_uses_password_env_and_writes_plaintext_file(monkeypatch, tmp_pa
         return b"private", cfg.KEM_ALG, "private"
 
     monkeypatch.setattr(core, "load_key_pem", load_private_key)
-    monkeypatch.setattr(core, "decrypt_file_pro", lambda _blob, _private_key: (b"plaintext", cfg.KEM_ALG))
+
+    def decrypt_file(_blob, _private_key, expected_kem_alg=None):
+        assert expected_kem_alg == cfg.KEM_ALG
+        return b"plaintext", cfg.KEM_ALG
+
+    monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
 
     code, payload = _run_agent(
         [
@@ -265,7 +371,12 @@ def test_decrypt_allows_ciphertext_overhead_above_plaintext_limit(monkeypatch, t
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
-    monkeypatch.setattr(core, "decrypt_file_pro", lambda _blob, _private_key: (b"abc", cfg.KEM_ALG))
+
+    def decrypt_file(_blob, _private_key, expected_kem_alg=None):
+        assert expected_kem_alg == cfg.KEM_ALG
+        return b"abc", cfg.KEM_ALG
+
+    monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
 
     code, payload = _run_agent(
         ["decrypt", "--input", "message.pqc", "--private-key", "private.pem", "--output", "message.txt"],
@@ -283,6 +394,7 @@ def test_decrypt_rejects_encrypted_input_above_encrypted_limit(monkeypatch, tmp_
     monkeypatch.setattr(cfg, "MAX_ENCRYPTED_FILE_BYTES", 4)
     (tmp_path / "message.pqc").write_bytes(b"12345")
     (tmp_path / "private.pem").write_text("private key placeholder", encoding="utf-8")
+    monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: pytest.fail("PEM parser should not run"))
 
     code, payload = _run_agent(
         ["decrypt", "--input", "message.pqc", "--private-key", "private.pem", "--output", "message.txt"],
@@ -292,6 +404,22 @@ def test_decrypt_rejects_encrypted_input_above_encrypted_limit(monkeypatch, tmp_
     assert code == tools.EXIT_INVALID_INPUT
     assert payload["error_code"] == "file_too_large"
     assert not (tmp_path / "message.txt").exists()
+
+
+def test_verify_file_rejects_encrypted_input_above_limit_before_private_key_parse(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cfg, "MAX_ENCRYPTED_FILE_BYTES", 4)
+    (tmp_path / "message.pqc").write_bytes(b"12345")
+    (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
+    monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: pytest.fail("PEM parser should not run"))
+
+    code, payload = _run_agent(
+        ["verify-file", "--input", "message.pqc", "--private-key", "private.pem"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "file_too_large"
 
 
 def test_generate_keys_uses_password_env_without_printing_key_material(monkeypatch, tmp_path, capsys):
@@ -344,6 +472,23 @@ def test_generate_keys_requires_password_env(monkeypatch, tmp_path, capsys):
     assert not (tmp_path / "agent-private.pem").exists()
 
 
+def test_generate_keys_rejects_weak_password_env(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "aaaaaaaaaaaaaaaa")
+    monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
+    monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: pytest.fail("key generation should not run"))
+
+    code, payload = _run_agent(
+        ["generate-keys", "--public-out", "agent-public.pem", "--private-out", "agent-private.pem"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_CRYPTO_FAILURE
+    assert payload["error_code"] == "weak_password"
+    assert not (tmp_path / "agent-public.pem").exists()
+    assert not (tmp_path / "agent-private.pem").exists()
+
+
 def test_encrypt_mocked_flow_writes_encrypted_file(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.txt").write_bytes(b"hello")
@@ -382,7 +527,12 @@ def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_pa
     monkeypatch.setenv("AGENT_SECRET", "correct horse battery staple")
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
-    monkeypatch.setattr(core, "decrypt_file_pro", lambda _blob, _private_key: (b"plaintext", cfg.KEM_ALG))
+
+    def decrypt_file(_blob, _private_key, expected_kem_alg=None):
+        assert expected_kem_alg == cfg.KEM_ALG
+        return b"plaintext", cfg.KEM_ALG
+
+    monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
 
     code, payload = _run_agent(
         [

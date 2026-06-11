@@ -145,23 +145,41 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
         
     Raises:
         PasswordRequiredError: If password is empty.
-        WeakPasswordError: If password is shorter than the configured minimum.
+        WeakPasswordError: If password fails the configured length, variety, or known-weak-password policy.
     """
 ```
 
 ### Private Key Encryption/Decryption
 
+Encrypted private-key PEM files use format version 2 metadata. That metadata is authenticated as AES-GCM associated data so changes to the private-key format version, KEM algorithm, KDF parameters, salt, or nonce fail closed during decryption.
+
 ```python
-def encrypt_private_key(raw_private_key: bytes, password: str) -> Tuple[Optional[bytes], Optional[bytes], Optional[bytes]]:
+@dataclass(frozen=True)
+class PrivateKeyPemMetadata:
+    format_version: int
+    kem_alg: str
+    kdf_alg: str
+    kdf_params: str
+    salt_b64: str
+    nonce_b64: str
+```
+
+```python
+def encrypt_private_key(
+    raw_private_key: bytes,
+    password: str,
+    kem_alg: str,
+) -> Tuple[Optional[PrivateKeyPemMetadata], Optional[bytes]]:
     """
     Encrypts raw private key bytes using AES-GCM with a key derived from password.
     
     Args:
         raw_private_key: The raw private key bytes to encrypt.
         password: The password to derive the encryption key from.
+        kem_alg: The private key KEM algorithm to authenticate in PEM metadata.
         
     Returns:
-        Tuple containing (salt, nonce, encrypted_key), or (None, None, None) on error.
+        Tuple containing (metadata, encrypted_key), or (None, None) on error.
     """
 ```
 
@@ -171,7 +189,8 @@ def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Op
     Decrypts private key bytes using AES-GCM with a key derived from password.
     
     Args:
-        encrypted_key_data: Dictionary containing 'salt', 'nonce', 'encrypted_key', and KDF metadata.
+        encrypted_key_data: Dictionary containing encrypted key bytes plus format version,
+            KEM algorithm, salt, nonce, and required scrypt KDF metadata.
         password: The password for key derivation.
         
     Returns:
@@ -189,7 +208,8 @@ def save_key_pem(
     password: Optional[str] = None
 ) -> Optional[str]:
     """
-    Saves key data (raw bytes) in PEM format. Private keys require password protection.
+    Saves key data (raw bytes) in PEM format. Private keys require password protection
+    and include PQC-Key-Format: 2 metadata.
     
     Args:
         key_bytes: Raw key bytes to save.
@@ -208,7 +228,8 @@ def load_key_pem(
     password: Optional[str] = None
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
-    Loads key data from PEM string. Private-key PEMs must be encrypted with the required scrypt metadata.
+    Loads key data from PEM string. Private-key PEMs must be encrypted with
+    PQC-Key-Format: 2 and the required authenticated scrypt metadata.
     
     Args:
         pem_content: The PEM-formatted key data.
@@ -246,7 +267,8 @@ def encrypt_file_pro(
 ```python
 def decrypt_file_pro(
     encrypted_data: bytes,
-    private_key: bytes
+    private_key: bytes,
+    expected_kem_alg: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Decrypts file data using KEM+DEM hybrid decryption.
@@ -254,6 +276,9 @@ def decrypt_file_pro(
     Args:
         encrypted_data: Encrypted file bytes.
         private_key: Private key bytes for decryption.
+        expected_kem_alg: Optional KEM algorithm from the private key. If provided,
+            it must match the encrypted container KEM metadata after compatibility
+            alias normalization.
         
     Returns:
         Tuple (decrypted_data, kem_algorithm), or (None, None) on error.
@@ -279,8 +304,12 @@ The `crypto_config` module provides configuration constants used by the cryptogr
 - `ALLOWED_KEM_ALGS`: Accepted KEM identifiers (`ML-KEM-768` and legacy `Kyber768`)
 - `AES_KEY_BYTES`: Size of AES key in bytes (32 for AES-256)
 - `PRIVATE_KEY_MIN_PASSWORD_CHARS`: Minimum private-key password length
+- `PRIVATE_KEY_MIN_UNIQUE_CHARS`: Minimum private-key password character variety
 - `PRIVATE_KEY_KDF_ALG`: Required private-key KDF (`scrypt`)
 - `SCRYPT_N`, `SCRYPT_R`, `SCRYPT_P`: Required scrypt private-key KDF parameters
+- `PEM_PRIVATE_KEY_FORMAT_VERSION`: Required encrypted private-key PEM metadata version
+- `MAX_PEM_BYTES`: Maximum PEM/key bytes accepted before parsing
+- `MAX_RAW_KEY_BYTES`: Maximum raw key payload accepted inside PEM
 - `FORMAT_VERSION`: File format version for encrypted files
 - `MAX_FILE_BYTES`: Maximum in-memory file size accepted by the UI and core encryption path
 - `MAX_ENCRYPTED_FILE_BYTES`: Maximum encrypted-container size accepted by decryption, including bounded header and authentication overhead
@@ -299,7 +328,7 @@ public_key, private_key = core.generate_oqs_keys(kem_alg)
 
 # Save keys in PEM format
 public_pem = core.save_key_pem(public_key, kem_alg, "public")
-private_pem = core.save_key_pem(private_key, kem_alg, "private", password="long-secure-password")
+private_pem = core.save_key_pem(private_key, kem_alg, "private", password="river-metal-orbit-cactus-47")
 
 # Write PEM files
 with open("public_key.pem", "w") as f:
@@ -334,13 +363,13 @@ with open("encrypted_document.pqc", "wb") as f:
 with open("private_key.pem", "r") as f:
     priv_pem = f.read()
     
-priv_key, _, _ = core.load_key_pem(priv_pem, password="long-secure-password")
+priv_key, priv_kem_alg, _ = core.load_key_pem(priv_pem, password="river-metal-orbit-cactus-47")
 
 # Decrypt the file
 with open("encrypted_document.pqc", "rb") as f:
     encrypted_data = f.read()
     
-decrypted_data, _ = core.decrypt_file_pro(encrypted_data, priv_key)
+decrypted_data, _ = core.decrypt_file_pro(encrypted_data, priv_key, expected_kem_alg=priv_kem_alg)
 
 with open("decrypted_document.pdf", "wb") as f:
     f.write(decrypted_data)

@@ -25,6 +25,7 @@ The application uses a hybrid cryptographic approach, combining post-quantum key
    - Used for deriving keys from passwords for private key protection
    - Required parameters: `n=32768`, `r=8`, `p=1`
    - Salt size: 16 bytes (128 bits)
+   - Encrypted private-key PEM format version 2 authenticates the KEM algorithm, KDF metadata, salt, and nonce as AES-GCM associated data
 
 ## Threat Model
 
@@ -45,8 +46,11 @@ The application is designed to protect against the following threats:
 4. **Implementation Vulnerabilities**
    - Memory leaks exposing sensitive information
    - Improper key management
-   - Malformed or tampered encrypted-file headers
-   - Unexpected native backend failures during import/startup
+- Malformed or tampered encrypted-file headers
+- Malformed or tampered encrypted private-key PEM metadata
+- KEM algorithm confusion between a private key and an encrypted container
+- Oversized PEM/key inputs causing avoidable memory pressure before parsing
+- Unexpected native backend failures during import/startup
 
 ## Current Mitigations
 
@@ -54,13 +58,16 @@ The application is designed to protect against the following threats:
 - Encrypted-file headers include magic bytes, version, KEM name length, KEM ciphertext length, and nonce validation.
 - Only encrypted-file format version 3 is accepted; legacy unauthenticated-header formats are rejected.
 - Format version 3 uses the complete header as AES-GCM associated data, so header tampering fails authentication.
-- PEM parsing uses strict base64 decoding and validates encrypted private-key salt, nonce, and scrypt KDF metadata.
+- Encrypted private-key PEM parsing requires `PQC-Key-Format: 2`; legacy encrypted private-key metadata is rejected by default.
+- PEM private-key encryption authenticates the private-key format version, KEM algorithm, KDF parameters, salt, and nonce as AES-GCM associated data.
+- PEM parsing uses strict base64 decoding and validates encrypted private-key salt, nonce, scrypt KDF metadata, maximum PEM size, and maximum raw key payload size.
+- File decryption verifies that the private-key KEM metadata matches the encrypted-container KEM metadata after normalizing the `ML-KEM-768` and `Kyber768` compatibility aliases.
 - The UI and core encryption path enforce a 100 MiB plaintext in-memory file limit; decryption accepts only the bounded encrypted-container size needed for header, KEM ciphertext, nonce, and tag overhead.
 - Download filenames are reduced to local filenames before being passed to Streamlit.
-- Private-key password protection requires at least 16 characters in the core, UI, and agent CLI.
+- Private-key password protection requires at least 16 characters, at least 5 unique characters, and rejects known weak values in the core, UI, and agent CLI.
 - Unencrypted private keys are rejected in the core, UI, and agent CLI.
 - The core module defines its own logger but leaves root logging configuration to application entry points.
-- The local agent CLI is not a network service, accepts only workspace-relative paths, rejects symlink escapes, writes outputs through temporary files, stores private keys and decrypted plaintext with owner-only permissions on POSIX systems, and reads passwords from environment variables instead of command-line arguments.
+- The local agent CLI is not a network service, accepts only workspace-relative paths, rejects symlink escapes, creates non-overwrite outputs with exclusive file creation, stores private keys and decrypted plaintext with owner-only permissions on POSIX systems, and reads passwords from environment variables instead of command-line arguments.
 - CI runs static checks, tests without native `liboqs`, and a native `liboqs` integration test job.
 
 ## Security Best Practices

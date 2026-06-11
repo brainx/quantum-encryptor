@@ -58,6 +58,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 - Open Quantum Safe native `liboqs` shared library
 - Open Quantum Safe `liboqs-python` wrapper, which imports as `oqs`
 - Dependencies listed in `requirements.txt`
+- Optional hash-locked installs from `requirements-lock.txt` or `requirements-dev-lock.txt`
 
 ## Installation
 
@@ -76,6 +77,11 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
+   ```
+
+   For a reproducible runtime install with pinned hashes:
+   ```bash
+   pip install --require-hashes -r requirements-lock.txt
    ```
 
 4. Install or expose native `liboqs`.
@@ -177,9 +183,13 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 ## Security Considerations
 
 - Encrypted files use KEM-derived AES-256-GCM keys, require format version 3, and authenticate file header metadata as associated data
-- Private keys must be password protected with scrypt-derived AES-256-GCM keys; unencrypted private keys are rejected
+- Encrypted private-key PEM files require `PQC-Key-Format: 2`; private-key metadata, KEM algorithm, KDF parameters, salt, and nonce are authenticated as AES-GCM associated data
+- Private keys must be password protected with scrypt-derived AES-256-GCM keys; unencrypted private keys and legacy encrypted private-key PEM metadata are rejected by default
+- Private-key passwords require at least 16 characters, at least 5 unique characters, and must not match known weak values
+- Decryption checks encrypted-file KEM metadata against the private-key KEM metadata, with `ML-KEM-768` and `Kyber768` treated as compatibility aliases
+- PEM/key reads are capped at 128 KiB before parsing; plaintext and encrypted-container reads keep the existing bounded in-memory limits
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
-- The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems
+- The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
 - CI runs formatting, linting, type checks, unit tests, and a native `liboqs` integration test job
 - See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for repository trust boundaries, assets, abuse cases, and invariants
@@ -191,8 +201,10 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - `crypto_core.py` - Core cryptographic functions (key generation, encryption, decryption)
 - `pqc_agent_tools.py` - Local JSON CLI for agentic workflows
 - `pqc_app.py` - Streamlit web application interface
+- `ui_helpers.py` - UI-safe filename helpers
 - `start.sh` - Local application startup script
 - `test.sh` - Test runner
+- `requirements-lock.txt` / `requirements-dev-lock.txt` - Hash-locked runtime and development dependency sets
 - `pyproject.toml` / `setup.py` - Packaging metadata
 
 ## License

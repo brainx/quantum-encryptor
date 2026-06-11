@@ -96,6 +96,27 @@ class EncryptedFileParts:
     encrypted_data_aes: bytes
 
 
+@dataclass(frozen=True)
+class PrivateKeyPemMetadata:
+    """Authenticated metadata for encrypted private-key PEM files."""
+
+    format_version: int
+    kem_alg: str
+    kdf_name: str
+    kdf_n: int
+    kdf_r: int
+    kdf_p: int
+    salt: bytes
+    nonce: bytes
+
+
+COMMON_WEAK_PASSWORDS = {
+    "passwordpassword",
+    "password12345678",
+    "qwertyuiopasdfgh",
+}
+
+
 def _native_oqs_library_available() -> bool:
     if ctypes.util.find_library("oqs"):
         return True
@@ -169,6 +190,13 @@ def _kem_aliases(kem_alg: str) -> Tuple[str, ...]:
 def is_allowed_kem_algorithm(kem_alg: Optional[str]) -> bool:
     """Return whether a KEM identifier is supported by this application."""
     return bool(kem_alg) and kem_alg in cfg.ALLOWED_KEM_ALGS
+
+
+def canonical_kem_algorithm(kem_alg: str) -> str:
+    """Normalize KEM aliases that are equivalent for this application."""
+    if kem_alg in {"ML-KEM-768", "Kyber768"}:
+        return "ML-KEM-768"
+    return kem_alg
 
 
 def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
@@ -297,6 +325,11 @@ def validate_private_key_password(password: Optional[str]) -> str:
         raise WeakPasswordError(
             f"Private-key password must be at least {cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters."
         )
+    if len(set(password)) < cfg.PRIVATE_KEY_MIN_UNIQUE_CHARS:
+        raise WeakPasswordError("Private-key password has too little character variety.")
+    normalized = "".join(password.lower().split())
+    if normalized in COMMON_WEAK_PASSWORDS:
+        raise WeakPasswordError("Private-key password is too common.")
     return password
 
 
@@ -311,6 +344,35 @@ def _current_private_key_kdf_metadata() -> Dict[str, int | str]:
 
 def _current_private_key_kdf_line() -> str:
     return f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG}," f"n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}"
+
+
+def _private_key_metadata_aad(metadata: PrivateKeyPemMetadata) -> bytes:
+    return b"\n".join(
+        [
+            b"PQC-PRIVATE-KEY-METADATA-AAD",
+            f"format={metadata.format_version}".encode("ascii"),
+            f"algorithm={metadata.kem_alg}".encode("utf-8"),
+            f"kdf={metadata.kdf_name}".encode("ascii"),
+            f"kdf_n={metadata.kdf_n}".encode("ascii"),
+            f"kdf_r={metadata.kdf_r}".encode("ascii"),
+            f"kdf_p={metadata.kdf_p}".encode("ascii"),
+            b"salt=" + base64.b64encode(metadata.salt),
+            b"nonce=" + base64.b64encode(metadata.nonce),
+        ]
+    )
+
+
+def _parse_private_key_format_line(line: str) -> int:
+    if not line.startswith(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER):
+        raise InvalidKeyFormatError("Encrypted private-key PEM is missing format metadata.")
+    value = line[len(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER) :].strip()
+    try:
+        format_version = int(value)
+    except ValueError as exc:
+        raise InvalidKeyFormatError("Encrypted private-key PEM has malformed format metadata.") from exc
+    if format_version != cfg.PEM_PRIVATE_KEY_FORMAT_VERSION:
+        raise InvalidKeyFormatError("Encrypted private-key PEM uses an unsupported format version.")
+    return format_version
 
 
 def _parse_private_key_kdf_line(line: str) -> Dict[str, int | str]:
@@ -362,26 +424,38 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
 
 
 def encrypt_private_key(
-    raw_private_key: bytes, password: str
-) -> Tuple[Optional[bytes], Optional[bytes], Optional[bytes]]:
-    """Encrypts raw private key bytes using AES-GCM with a key derived from password."""
+    raw_private_key: bytes,
+    password: str,
+    kem_alg: str,
+) -> Tuple[Optional[PrivateKeyPemMetadata], Optional[bytes]]:
+    """Encrypt raw private key bytes with metadata authenticated as AES-GCM AAD."""
     try:
         validate_private_key_password(password)
     except (PasswordRequiredError, WeakPasswordError) as exc:
         logger.error(str(exc))
-        return None, None, None
+        return None, None
 
     salt = os.urandom(cfg.SCRYPT_SALT_BYTES)
     try:
         derived_key = derive_key_from_password(password, salt)
         nonce = os.urandom(cfg.AES_NONCE_BYTES)
+        metadata = PrivateKeyPemMetadata(
+            format_version=cfg.PEM_PRIVATE_KEY_FORMAT_VERSION,
+            kem_alg=kem_alg,
+            kdf_name=cfg.PRIVATE_KEY_KDF_ALG,
+            kdf_n=cfg.SCRYPT_N,
+            kdf_r=cfg.SCRYPT_R,
+            kdf_p=cfg.SCRYPT_P,
+            salt=salt,
+            nonce=nonce,
+        )
         aesgcm = AESGCM(derived_key)
-        encrypted_key = aesgcm.encrypt(nonce, raw_private_key, None)  # No AAD needed here
+        encrypted_key = aesgcm.encrypt(nonce, raw_private_key, _private_key_metadata_aad(metadata))
         logger.info("Private key encrypted successfully.")
-        return salt, nonce, encrypted_key
+        return metadata, encrypted_key
     except Exception as e:
         logger.exception(f"Failed to encrypt private key: {e}")
-        return None, None, None
+        return None, None
     finally:
         # Clean up derived key
         if "derived_key" in locals():
@@ -416,11 +490,49 @@ def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Op
         logger.error("Encrypted private key uses unsupported KDF metadata.")
         return None
 
+    format_version = encrypted_key_data.get("format_version")
+    kem_alg = encrypted_key_data.get("kem_alg")
+    use_legacy_aad = False
+    metadata_format_version: Optional[int] = None
+    metadata_kem_alg: Optional[str] = None
+    if format_version is None:
+        if cfg.ALLOW_LEGACY_PRIVATE_KEY_PEM:
+            use_legacy_aad = True
+        else:
+            logger.error("Encrypted private key is missing authenticated format metadata.")
+            return None
+    elif format_version != cfg.PEM_PRIVATE_KEY_FORMAT_VERSION:
+        logger.error("Encrypted private key uses unsupported format metadata.")
+        return None
+    else:
+        metadata_format_version = format_version
+    if not use_legacy_aad:
+        if not isinstance(kem_alg, str) or not is_allowed_kem_algorithm(kem_alg):
+            logger.error("Encrypted private key is missing or uses unsupported algorithm metadata.")
+            return None
+        metadata_kem_alg = kem_alg
+
     derived_key = None  # Ensure cleanup
     try:
         derived_key = derive_key_from_password(password, salt)
         aesgcm = AESGCM(derived_key)
-        raw_private_key = aesgcm.decrypt(nonce, encrypted_key, None)
+        aad = None
+        if not use_legacy_aad:
+            if metadata_format_version is None or metadata_kem_alg is None:
+                logger.error("Encrypted private key is missing authenticated format metadata.")
+                return None
+            metadata = PrivateKeyPemMetadata(
+                format_version=metadata_format_version,
+                kem_alg=metadata_kem_alg,
+                kdf_name=kdf_name,
+                kdf_n=kdf_n,
+                kdf_r=kdf_r,
+                kdf_p=kdf_p,
+                salt=salt,
+                nonce=nonce,
+            )
+            aad = _private_key_metadata_aad(metadata)
+        raw_private_key = aesgcm.decrypt(nonce, encrypted_key, aad)
         logger.info("Private key decrypted successfully.")
         return raw_private_key
     except (InvalidTag, InvalidKey):
@@ -470,16 +582,17 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
             logger.error("Private keys must be password protected.")
             return None
 
-        salt, nonce, encrypted_key = encrypt_private_key(key_bytes, password)
-        if salt and nonce and encrypted_key:
-            salt_b64 = base64.b64encode(salt).decode("ascii")
-            nonce_b64 = base64.b64encode(nonce).decode("ascii")
+        metadata, encrypted_key = encrypt_private_key(key_bytes, password, kem_alg)
+        if metadata and encrypted_key:
+            salt_b64 = base64.b64encode(metadata.salt).decode("ascii")
+            nonce_b64 = base64.b64encode(metadata.nonce).decode("ascii")
             encoded_key_b64 = base64.b64encode(encrypted_key).decode("ascii")
             dek_info = f"{cfg.PEM_DEK_INFO_HEADER}{salt_b64},{nonce_b64}"
+            pem_data_lines.append(f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{metadata.format_version}")
             pem_data_lines.append(cfg.PEM_PROC_TYPE_HEADER)
             pem_data_lines.append(dek_info)
             pem_data_lines.append(_current_private_key_kdf_line())
-            pem_data_lines.append(f"{cfg.PEM_ALGORITHM_HEADER}{kem_alg}")  # Store algo even if encrypted
+            pem_data_lines.append(f"{cfg.PEM_ALGORITHM_HEADER}{metadata.kem_alg}")  # Authenticated as PEM AAD
             logger.info("Saving encrypted private key to PEM.")
         else:
             logger.error("Failed to encrypt private key for PEM saving.")
@@ -521,6 +634,7 @@ def load_key_pem(
     key_type = None
     is_encrypted = False
     kem_alg = None
+    private_key_format_version: Optional[int] = None
     dek_parts: Dict[str, Any] = {}
     kdf_parts: Dict[str, int | str] = {}
     key_b64_lines = []
@@ -544,6 +658,15 @@ def load_key_pem(
 
         if line.startswith(cfg.PEM_ALGORITHM_HEADER):
             kem_alg = line[len(cfg.PEM_ALGORITHM_HEADER) :].strip()
+        elif line.startswith(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER):
+            if key_type == "private":
+                try:
+                    private_key_format_version = _parse_private_key_format_line(line)
+                except InvalidKeyFormatError as exc:
+                    logger.error(str(exc))
+                    return None, None, None
+            else:
+                logger.warning("Found private-key format header in a public key PEM. Ignoring.")
         elif line == cfg.PEM_PROC_TYPE_HEADER:
             if key_type == "private":
                 is_encrypted = True
@@ -608,8 +731,13 @@ def load_key_pem(
         if not kdf_parts:
             logger.error("Encrypted private key PEM is missing required KDF metadata.")
             return None, None, None
+        if private_key_format_version is None and not cfg.ALLOW_LEGACY_PRIVATE_KEY_PEM:
+            logger.error("Encrypted private key PEM is missing authenticated format metadata.")
+            return None, None, None
 
         dek_parts["encrypted_key"] = raw_or_encrypted_bytes
+        dek_parts["format_version"] = private_key_format_version
+        dek_parts["kem_alg"] = kem_alg
         dek_parts["kdf"] = kdf_parts.get("name")
         dek_parts["kdf_n"] = kdf_parts.get("n")
         dek_parts["kdf_r"] = kdf_parts.get("r")
@@ -691,12 +819,18 @@ def inspect_key_pem_strict(pem_content: str) -> Dict[str, Any]:
     if key_type == "Private":
         if not is_encrypted:
             raise UnencryptedPrivateKeyError("Unencrypted private keys are rejected.")
+        format_line = None
         kdf_line = None
         for line in pem_content.strip().splitlines()[1:-1]:
             stripped = line.strip()
+            if stripped.startswith(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER):
+                format_line = stripped
             if stripped.startswith(cfg.PEM_KDF_HEADER):
                 kdf_line = stripped
-                break
+        if format_line is None and not cfg.ALLOW_LEGACY_PRIVATE_KEY_PEM:
+            raise InvalidKeyFormatError("Encrypted private-key PEM is missing format metadata.")
+        if format_line is not None:
+            result["private_key_format_version"] = _parse_private_key_format_line(format_line)
         if kdf_line is None:
             raise UnsupportedKDFError("Encrypted private-key PEM is missing KDF metadata.")
         kdf_parts = _parse_private_key_kdf_line(kdf_line)
@@ -904,6 +1038,7 @@ def encrypt_file_pro(input_data: bytes, public_key_bytes: bytes, kem_alg: str = 
 def decrypt_file_pro(
     encrypted_blob: bytes,
     secret_key_bytes: bytes,
+    expected_kem_alg: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """Decrypts data using PQC KEM + AES-GCM and defined file format."""
     logger.info("Starting decryption process.")
@@ -915,6 +1050,11 @@ def decrypt_file_pro(
         parts = _parse_encrypted_file_parts(encrypted_blob)
         kem_alg_from_file = parts.metadata.kem_alg
         logger.info("Header validated: Magic=%r, Version=%s", cfg.MAGIC_BYTES, parts.metadata.version)
+        if expected_kem_alg is not None and canonical_kem_algorithm(expected_kem_alg) != canonical_kem_algorithm(
+            kem_alg_from_file
+        ):
+            logger.error("Private key algorithm does not match encrypted file algorithm.")
+            return None, kem_alg_from_file
 
         # 3. KEM Decapsulation
         logger.debug(f"Performing KEM decapsulation with {kem_alg_from_file}...")

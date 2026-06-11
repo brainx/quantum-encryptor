@@ -4,6 +4,7 @@ pytest-cov>=4.0.0
 black>=23.0.0
 mypy>=1.0.0
 flake8>=6.0.0
+pip-tools>=7.5.0
 build>=1.2.0
 setuptools>=69.0.0
 wheel>=0.42.0

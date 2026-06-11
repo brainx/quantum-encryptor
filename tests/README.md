@@ -15,6 +15,8 @@ PYTHON=.venv/bin/python ./test.sh --cov=. tests/
 
 # Run a specific test file
 ./test.sh tests/test_crypto_core.py
+./test.sh tests/test_agent_tools.py
+./test.sh tests/test_ui_helpers.py
 
 # Run a specific test class
 ./test.sh tests/test_crypto_core.py::TestKeyGeneration
@@ -39,6 +41,15 @@ The tests are organized by module and functionality:
   - Private key encryption/decryption
   - PEM format handling
   - File encryption/decryption
+- `test_agent_tools.py` - Tests for the local JSON CLI safety boundary
+  - Workspace-relative path validation
+  - Input size checks before file parsing
+  - Non-overwrite and explicit-overwrite file creation
+  - Safe JSON error contracts
+- `test_ui_helpers.py` - Tests for UI filename helpers
+  - Local decrypted filename guesses
+  - `.pqc` suffix handling
+  - Path component stripping
 
 ## Writing New Tests
 
@@ -62,6 +73,8 @@ pip install -r requirements-dev.txt
 ```
 
 Native `liboqs` is required for the key generation and end-to-end file encryption tests. When native `liboqs` is unavailable, those tests skip and the non-backend validation still runs.
+
+Security-critical tests cover encrypted private-key PEM v2 metadata authentication, legacy encrypted private-key PEM rejection, password policy enforcement, encrypted-container KEM mismatch rejection, oversized input rejection, and no-overwrite output safety.
 
 ## Continuous Integration
 

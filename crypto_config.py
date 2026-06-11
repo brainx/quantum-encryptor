@@ -23,6 +23,7 @@ class CryptoConfig:
 
     # For deriving keys from passwords for private key encryption
     PRIVATE_KEY_MIN_PASSWORD_CHARS = 16
+    PRIVATE_KEY_MIN_UNIQUE_CHARS = 5
     PRIVATE_KEY_KDF_ALG = "scrypt"
     SCRYPT_SALT_BYTES = 16
     SCRYPT_N = 32768
@@ -45,6 +46,9 @@ class CryptoConfig:
     PEM_PUBLIC_FOOTER = "-----END PQC PUBLIC KEY-----"
     PEM_PRIVATE_HEADER = "-----BEGIN PQC PRIVATE KEY-----"
     PEM_PRIVATE_FOOTER = "-----END PQC PRIVATE KEY-----"
+    PEM_PRIVATE_KEY_FORMAT_HEADER = "PQC-Key-Format: "
+    PEM_PRIVATE_KEY_FORMAT_VERSION = 2
+    ALLOW_LEGACY_PRIVATE_KEY_PEM = False
     PEM_ALGORITHM_HEADER = "Algorithm: "
     PEM_KDF_HEADER = "KDF: "
     # Headers for encrypted private keys
@@ -53,6 +57,8 @@ class CryptoConfig:
 
     # --- General ---
     MAX_FILE_BYTES = 100 * 1024 * 1024
+    MAX_PEM_BYTES = 128 * 1024
+    MAX_RAW_KEY_BYTES = 64 * 1024
     MAX_KEM_ALG_NAME_BYTES = 64
     MAX_KEM_CIPHERTEXT_BYTES = 1024 * 1024
     MAX_ENCRYPTED_FILE_BYTES = (

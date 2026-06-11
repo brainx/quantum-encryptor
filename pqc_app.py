@@ -8,6 +8,7 @@ import re
 # Import core logic and config
 from crypto_config import cfg
 import crypto_core as core
+from ui_helpers import guess_decrypted_filename
 
 # --- Basic Logging Setup ---
 # Configure logging level and format
@@ -58,10 +59,17 @@ def format_size(byte_count: int) -> str:
     return f"{mib:.1f} MiB"
 
 
-def uploaded_file_too_large(uploaded_file, max_bytes: int = cfg.MAX_FILE_BYTES) -> bool:
+def uploaded_file_too_large(uploaded_file, max_bytes: int | None = None) -> bool:
     """Return whether a Streamlit upload exceeds the configured in-memory limit."""
     size = getattr(uploaded_file, "size", None)
-    return size is not None and size > max_bytes
+    limit = cfg.MAX_FILE_BYTES if max_bytes is None else max_bytes
+    return size is not None and size > limit
+
+
+def uploaded_key_file_too_large(uploaded_file, max_bytes: int | None = None) -> bool:
+    """Return whether a Streamlit PEM/key upload exceeds the configured limit."""
+    limit = cfg.MAX_PEM_BYTES if max_bytes is None else max_bytes
+    return uploaded_file_too_large(uploaded_file, limit)
 
 
 def sanitize_download_filename(filename: str, fallback: str) -> str:
@@ -71,34 +79,13 @@ def sanitize_download_filename(filename: str, fallback: str) -> str:
     return candidate or fallback
 
 
-def is_strong_private_key_password(password: str) -> bool:
-    """Minimum password gate for offline private-key protection."""
-    return len(password) >= cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS
-
-
-def guess_decrypted_filename(encrypted_filename: Path) -> str:
-    """Tries to suggest a sensible name for the decrypted file."""
-    stem = encrypted_filename.stem
-    suffix = encrypted_filename.suffix
-
-    if stem.endswith("_encrypted"):
-        decrypted_stem = stem[:-10]
-        # Try to recover original suffix if it was part of the stem
-        original_stem_path = Path(decrypted_stem)
-        original_suffix = original_stem_path.suffix
-        if original_suffix:
-            # If e.g. file was 'doc_encrypted.txt', stem='doc_encrypted', suffix='.txt' -> WRONG
-            # If file was 'doc.txt_encrypted.pqc', stem='doc.txt_encrypted', suffix='.pqc'
-            # Need to handle both cases... let's simplify: if .pqc, try removing _encrypted
-            if suffix == ".pqc":
-                # Suggest removing _encrypted and keeping original stem suffix
-                return f"{decrypted_stem}"  # Path handles suffix correctly
-            else:
-                # Keep original suffix if it wasn't .pqc
-                return f"{decrypted_stem}{suffix}"
-
-    # Default fallback
-    return f"{encrypted_filename.stem}_decrypted{'.bin' if suffix == '.pqc' else suffix}"
+def validate_private_key_password_for_ui(password: str) -> tuple[bool, str | None]:
+    """Validate private-key password text with the core policy."""
+    try:
+        core.validate_private_key_password(password)
+        return True, None
+    except (core.PasswordRequiredError, core.WeakPasswordError) as exc:
+        return False, str(exc)
 
 
 # --- Main Application UI ---
@@ -154,13 +141,12 @@ if operation == "Generate Keys":
             st.warning("Password cannot be empty.")
         elif st.session_state.password_gen != st.session_state.password_gen_confirm:
             st.warning("Passwords do not match.")
-        elif not is_strong_private_key_password(st.session_state.password_gen):
-            st.warning(
-                f"Use at least {cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS} characters for private key password protection."
-            )
         else:
-            st.success("Passwords match.")
-            password_valid = True
+            password_valid, password_error = validate_private_key_password_for_ui(st.session_state.password_gen)
+            if password_valid:
+                st.success("Passwords match.")
+            else:
+                st.warning(password_error)
     else:
         st.warning("A password is required. Unencrypted private keys are not supported.")
     disable_gen_button = not password_valid
@@ -241,6 +227,12 @@ elif operation == "Encrypt File":
                 f"Selected file is {format_size(uploaded_file.size)}. "
                 f"The maximum supported size is {format_size(cfg.MAX_FILE_BYTES)}."
             )
+        if uploaded_key_file_too_large(public_key_pem_file):
+            st.error(
+                f"Public key file is {format_size(public_key_pem_file.size)}. "
+                f"The maximum supported PEM size is {format_size(cfg.MAX_PEM_BYTES)}."
+            )
+            st.stop()
         pub_pem_content: str | None
         try:
             pub_pem_content = public_key_pem_file.getvalue().decode("utf-8")
@@ -332,6 +324,12 @@ elif operation == "Decrypt File":
                 f"Selected encrypted file is {format_size(encrypted_file.size)}. "
                 f"The maximum supported encrypted file size is {format_size(cfg.MAX_ENCRYPTED_FILE_BYTES)}."
             )
+        if uploaded_key_file_too_large(private_key_pem_file):
+            st.error(
+                f"Private key file is {format_size(private_key_pem_file.size)}. "
+                f"The maximum supported PEM size is {format_size(cfg.MAX_PEM_BYTES)}."
+            )
+            st.stop()
         # First, inspect the private key security metadata.
         priv_pem_content: str | None
         try:
@@ -403,7 +401,11 @@ elif operation == "Decrypt File":
                                 status.write("Reading encrypted data...")  # Already done by getvalue()
                                 status.write("Performing decryption and authentication...")
 
-                                decrypted_data, _detected_alg = core.decrypt_file_pro(encrypted_blob, priv_key_bytes)
+                                decrypted_data, _detected_alg = core.decrypt_file_pro(
+                                    encrypted_blob,
+                                    priv_key_bytes,
+                                    expected_kem_alg=kem_alg_key,
+                                )
 
                                 status.write("Cleaning up...")
                                 del encrypted_blob
@@ -451,6 +453,12 @@ elif operation == "Key Utilities":
     key_util_file = st.file_uploader("Upload Key File (.pem)", type=["pem"], key="util_key_input")
 
     if key_util_file:
+        if uploaded_key_file_too_large(key_util_file):
+            st.error(
+                f"Key file is {format_size(key_util_file.size)}. "
+                f"The maximum supported PEM size is {format_size(cfg.MAX_PEM_BYTES)}."
+            )
+            st.stop()
         try:
             pem_content = key_util_file.getvalue().decode("utf-8")
             algo, key_type, is_encrypted = core.get_key_info_pem(pem_content)

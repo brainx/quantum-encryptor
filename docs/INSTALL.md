@@ -27,11 +27,35 @@ Install runtime dependencies:
 pip install -r requirements.txt
 ```
 
+For a reproducible runtime install with package hashes:
+
+```bash
+pip install --require-hashes -r requirements-lock.txt
+```
+
 For development and verification:
 
 ```bash
 pip install -r requirements-dev.txt
 ```
+
+For reproducible development installs:
+
+```bash
+pip install --require-hashes -r requirements-dev-lock.txt
+```
+
+Regenerate the lock files only after intentionally changing dependency inputs:
+
+```bash
+PIP_TOOLS_CACHE_DIR=.cache/pip-tools \
+  pip-compile --generate-hashes --output-file=requirements-lock.txt requirements.txt
+
+PIP_TOOLS_CACHE_DIR=.cache/pip-tools \
+  pip-compile --allow-unsafe --generate-hashes --output-file=requirements-dev-lock.txt requirements-dev.txt
+```
+
+The development lock uses `--allow-unsafe` so build tooling dependencies such as `pip` and `setuptools` are pinned when they are part of the resolved toolchain.
 
 ## Native liboqs
 
