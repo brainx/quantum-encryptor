@@ -624,6 +624,12 @@ jaraco-functools==4.5.0 \
     --hash=sha256:3bb5665ea4a020cf78a7040e89154c77edadb3ca74f366479669c5999aa70b03 \
     --hash=sha256:79ce39246eddbde4b3a03b77ea5f0f7878dc669b166a66cf3fa8e266aa3fa2f4
     # via keyring
+jeepney==0.9.0 ; sys_platform == "linux" \
+    --hash=sha256:97e5714520c16fc0a45695e5365a2e11b81ea79bba796e26f9f1d178cb182683
+    # via
+    #   -r requirements-dev.txt
+    #   keyring
+    #   secretstorage
 jinja2==3.1.6 \
     --hash=sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d \
     --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
@@ -1686,6 +1692,11 @@ rpds-py==2026.5.1 \
     # via
     #   jsonschema
     #   referencing
+secretstorage==3.5.0 ; sys_platform == "linux" \
+    --hash=sha256:0ce65888c0725fcb2c5bc0fdb8e5438eece02c523557ea40ce0703c266248137
+    # via
+    #   -r requirements-dev.txt
+    #   keyring
 six==1.17.0 \
     --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 \
     --hash=sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81
