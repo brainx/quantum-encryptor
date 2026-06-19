@@ -10,8 +10,8 @@ To run the tests, execute the following from the project root:
 # Run all tests
 ./test.sh
 
-# Run with coverage report
-PYTHON=.venv/bin/python ./test.sh --cov=. tests/
+# Run with the same core-module coverage gate used by CI
+PYTHON=.venv/bin/python ./test.sh --cov=crypto_core --cov=pqc_agent_tools --cov=ui_helpers --cov-report=term-missing --cov-fail-under=70
 
 # Run a specific test file
 ./test.sh tests/test_crypto_core.py
@@ -83,10 +83,14 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs:
 - `black --check`
 - `flake8`
 - `mypy`
-- Unit tests without native `liboqs`
+- Unit tests without native `liboqs`, with at least 70% coverage on core modules
+- Package build, `twine check`, wheel install, and agent CLI health smoke test
+- Runtime dependency audit with `pip-audit`
+- Python security linting with `bandit`
 - A native `liboqs` integration job so backend-dependent KEM round-trip tests run in CI
 
 ## Coverage Goals
 
-- Aim for at least 80% test coverage on core modules
+- Maintain at least 70% test coverage on core modules in CI
+- Raise the gate toward 80% as backend-independent crypto-core tests expand
 - Prioritize coverage of security-critical functionality

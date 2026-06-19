@@ -155,7 +155,7 @@ def _load_oqs_module() -> Any:
         except (RuntimeError, SystemExit) as exc:
             _oqs_load_error = f"Could not initialize liboqs-python: {exc}"
             raise CryptoDependencyError(_oqs_load_error) from exc
-        except BaseException as exc:
+        except Exception as exc:
             _oqs_load_error = f"Unexpected error initializing liboqs-python: {exc}"
             raise CryptoDependencyError(_oqs_load_error) from exc
     return oqs

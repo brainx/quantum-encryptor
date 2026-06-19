@@ -119,12 +119,13 @@ if kem_status_message:
     st.sidebar.warning(kem_status_message)
 
 # State Management (using session state is generally better)
+# Empty password field defaults are not credential values.
 if "password_gen" not in st.session_state:
-    st.session_state.password_gen = ""
+    st.session_state.password_gen = ""  # nosec B105
 if "password_gen_confirm" not in st.session_state:
-    st.session_state.password_gen_confirm = ""
+    st.session_state.password_gen_confirm = ""  # nosec B105
 if "password_decrypt" not in st.session_state:
-    st.session_state.password_decrypt = ""
+    st.session_state.password_decrypt = ""  # nosec B105
 
 # === Key Generation ===
 if operation == "Generate Keys":

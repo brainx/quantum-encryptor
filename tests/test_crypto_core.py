@@ -104,6 +104,22 @@ class TestKeyGeneration:
         with pytest.raises(core.CryptoDependencyError):
             core._require_oqs()
 
+    def test_load_oqs_module_does_not_swallow_keyboard_interrupt(self, monkeypatch):
+        """Control-flow interrupts must not be converted into backend dependency errors."""
+        monkeypatch.setattr(core, "oqs", None)
+        monkeypatch.setattr(core, "_oqs_load_error", None)
+        monkeypatch.setattr(core, "_native_oqs_library_available", lambda: True)
+
+        def raise_keyboard_interrupt(_module_name):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(core.importlib, "import_module", raise_keyboard_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            core._load_oqs_module()
+
+        assert core.oqs is None
+
 
 class TestOQSCompatibility:
     """Tests for liboqs-python API compatibility helpers."""
