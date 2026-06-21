@@ -32,13 +32,13 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Check formatting
-        run: python -m black --check crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py setup.py tests/test_agent_tools.py tests/test_crypto_core.py tests/test_ui_helpers.py
+        run: python -m black --check api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py setup.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_ui_helpers.py
 
       - name: Lint
-        run: python -m flake8 crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py setup.py tests/test_agent_tools.py tests/test_crypto_core.py tests/test_ui_helpers.py
+        run: python -m flake8 api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py setup.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_ui_helpers.py
 
       - name: Type check
-        run: python -m mypy crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py tests/test_agent_tools.py tests/test_crypto_core.py tests/test_ui_helpers.py
+        run: python -m mypy api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_ui_helpers.py
 
       - name: Unit tests without native liboqs
         run: PYTHON=python ./test.sh --cov=crypto_core --cov=pqc_agent_tools --cov=ui_helpers --cov-report=term-missing --cov-fail-under=70
@@ -102,6 +102,55 @@ jobs:
       - name: Run Python security lint
         run: python -m bandit -q -r crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py
 
+  web:
+    name: Custom web UI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Type check frontend
+        run: npm run check
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser UI smoke
+        run: |
+          SKIP_WEB_BUILD=1 PYTHON=python ./start.sh &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4000/api/health >/dev/null; then
+              npm run ui-smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
   locked-runtime-install:
     name: Locked runtime install
     runs-on: ubuntu-latest
@@ -124,6 +173,7 @@ jobs:
           python - <<'PY'
           import crypto_config
           import crypto_core
+          import api_app
           import pqc_agent_tools
           import ui_helpers
 

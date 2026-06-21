@@ -1,19 +1,31 @@
 # Application Screenshots
 
-These screenshots show the Streamlit interface using the tracked dark theme. They were captured from the local app with native `liboqs` unavailable, so the backend readiness warning and disabled key generation button are expected.
+These screenshots show the custom local web UI. They were captured from the local app with native `liboqs` unavailable, so the backend readiness warning and disabled key generation or file processing controls are expected.
 
-## Generate Keys
+## Custom Web Encrypt Workflow
 
-![Generate keys workflow with backend readiness warning](screenshots/generate-keys-backend-warning.jpg)
+![Custom web encrypt workflow with backend readiness warning](screenshots/custom-web-encrypt-workflow.png)
 
-## Encrypt File
+## Custom Web Mobile Inspect
 
-![Encrypt file workflow](screenshots/encrypt-file-workflow.jpg)
+![Custom web mobile key inspection workflow](screenshots/custom-web-mobile-inspect.png)
 
-## Decrypt File
+## Legacy Streamlit Reference
 
-![Decrypt file workflow](screenshots/decrypt-file-workflow.jpg)
+The default `./start.sh` path serves the custom local web UI. These older screenshots remain as a reference for the legacy Streamlit interface available through `LEGACY_STREAMLIT=1 ./start.sh`.
 
-## Key Utilities
+### Generate Keys
 
-![Key utilities workflow](screenshots/key-utilities-workflow.jpg)
+![Legacy generate keys workflow with backend readiness warning](screenshots/generate-keys-backend-warning.jpg)
+
+### Encrypt File
+
+![Legacy encrypt file workflow](screenshots/encrypt-file-workflow.jpg)
+
+### Decrypt File
+
+![Legacy decrypt file workflow](screenshots/decrypt-file-workflow.jpg)
+
+### Key Utilities
+
+![Legacy key utilities workflow](screenshots/key-utilities-workflow.jpg)

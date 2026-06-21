@@ -3,6 +3,8 @@ set -eu
 
 if [ -n "${PYTHON:-}" ]; then
   PYTHON_BIN="$PYTHON"
+elif [ -x ".venv/bin/python" ]; then
+  PYTHON_BIN=".venv/bin/python"
 else
   PYTHON_BIN=""
   for candidate in python3.13 python3.12 python3.11 python3.10 python3 python; do

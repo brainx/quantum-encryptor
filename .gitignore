@@ -142,3 +142,6 @@ dmypy.json
 *.pqc
 test_files/ 
 .DS_Store
+node_modules/
+static/app/
+tmp/

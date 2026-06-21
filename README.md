@@ -9,15 +9,15 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 <p align="center">
   <a href="docs/SCREENSHOTS.md">
     <img
-      src="docs/screenshots/generate-keys-backend-warning.jpg"
-      alt="Quantum Encryptor Streamlit app showing the generate keys workflow and backend readiness warning"
+      src="docs/screenshots/custom-web-encrypt-workflow.png"
+      alt="Quantum Encryptor custom web app showing the encrypt file workflow and backend readiness warning"
       width="900"
     >
   </a>
 </p>
 
 <p align="center">
-  <strong>Dark Streamlit interface for ML-KEM-768 key generation, file encryption, decryption, and PEM key inspection.</strong>
+  <strong>Dark local web interface for ML-KEM-768 key generation, file encryption, decryption, and PEM key inspection.</strong>
 </p>
 
 ## Features
@@ -25,7 +25,7 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 - **Post-Quantum Security**: Uses ML-KEM-768, with Kyber768 retained as a legacy compatibility alias
 - **Hybrid Encryption**: Combines quantum-resistant key exchange with AES-256-GCM symmetric encryption
 - **Password-Protected Keys**: Private keys are always encrypted with scrypt-derived AES-256-GCM keys
-- **User-Friendly Interface**: Simple web-based UI built with Streamlit
+- **User-Friendly Interface**: Custom local web UI with a Python ASGI API
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Screenshots
@@ -33,20 +33,11 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 The backend readiness warning shown here is expected when native `liboqs` is not installed in the local environment. Click any image to open the full screenshot page.
 
 <p>
-  <a href="docs/SCREENSHOTS.md#generate-keys">
-    <img src="docs/screenshots/generate-keys-backend-warning.jpg" alt="Generate keys workflow" width="49%">
+  <a href="docs/SCREENSHOTS.md#custom-web-encrypt-workflow">
+    <img src="docs/screenshots/custom-web-encrypt-workflow.png" alt="Custom web encrypt workflow" width="64%">
   </a>
-  <a href="docs/SCREENSHOTS.md#encrypt-file">
-    <img src="docs/screenshots/encrypt-file-workflow.jpg" alt="Encrypt file workflow" width="49%">
-  </a>
-</p>
-
-<p>
-  <a href="docs/SCREENSHOTS.md#decrypt-file">
-    <img src="docs/screenshots/decrypt-file-workflow.jpg" alt="Decrypt file workflow" width="49%">
-  </a>
-  <a href="docs/SCREENSHOTS.md#key-utilities">
-    <img src="docs/screenshots/key-utilities-workflow.jpg" alt="Key utilities workflow" width="49%">
+  <a href="docs/SCREENSHOTS.md#custom-web-mobile-inspect">
+    <img src="docs/screenshots/custom-web-mobile-inspect.png" alt="Custom web mobile key inspection workflow" width="32%">
   </a>
 </p>
 
@@ -57,7 +48,8 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 - Python 3.10 through 3.13
 - Open Quantum Safe native `liboqs` shared library
 - Open Quantum Safe `liboqs-python` wrapper, which imports as `oqs`
-- Dependencies listed in `requirements.txt`
+- Python dependencies listed in `requirements.txt`
+- Node.js 20.19+ or 22.12+ and npm for building the custom web UI
 - Optional hash-locked installs from `requirements-lock.txt` or `requirements-dev-lock.txt`
 
 ## Installation
@@ -77,6 +69,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
+   npm install
    ```
 
    For a reproducible runtime install with pinned hashes:
@@ -99,7 +92,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
    ./start.sh
    ```
 
-   The app listens on `127.0.0.1:4000` by default. Set `PORT` to override the local development port:
+   The custom web app builds the frontend and listens on `127.0.0.1:4000` by default. Set `PORT` to override the local development port:
    ```bash
    PORT=4001 ./start.sh
    ```
@@ -110,11 +103,44 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
    PYTHON=.venv/bin/python ./test.sh
    ```
 
+   To run the legacy Streamlit UI during transition:
+   ```bash
+   LEGACY_STREAMLIT=1 ./start.sh
+   ```
+
+   Frontend development can run Vite separately on `127.0.0.1:4001`:
+   ```bash
+   npm run dev
+   ```
+
 2. Open the web interface in your browser. You can:
    - Generate a new post-quantum key pair
    - Encrypt files using a recipient's public key
    - Decrypt files using your private key
    - Access key utilities
+
+## Verification
+
+Run the Python test suite:
+
+```bash
+./test.sh
+```
+
+Run the custom frontend checks:
+
+```bash
+npm run build
+npm run check
+```
+
+With the app already running on `127.0.0.1:4000`, run the browser smoke test:
+
+```bash
+npm run ui-smoke
+```
+
+The UI smoke test writes ignored screenshots under `tmp/ui-smoke/`.
 
 ### Key Generation
 
@@ -191,7 +217,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
-- CI runs formatting, linting, type checks, unit tests, and a native `liboqs` integration test job
+- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, browser UI smoke, locked runtime install, and a native `liboqs` integration test job
 - See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for repository trust boundaries, assets, abuse cases, and invariants
 - **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
 
@@ -199,8 +225,11 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 
 - `crypto_config.py` - Configuration parameters for cryptographic operations
 - `crypto_core.py` - Core cryptographic functions (key generation, encryption, decryption)
+- `api_app.py` - Local ASGI API and static web UI server
 - `pqc_agent_tools.py` - Local JSON CLI for agentic workflows
-- `pqc_app.py` - Streamlit web application interface
+- `pqc_app.py` - Legacy Streamlit web application interface
+- `web/` - React frontend source for the custom UI
+- `package.json` / `vite.config.ts` - Frontend build configuration
 - `ui_helpers.py` - UI-safe filename helpers
 - `start.sh` - Local application startup script
 - `test.sh` - Test runner
