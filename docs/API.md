@@ -33,6 +33,12 @@ Agent commands must use workspace-relative paths. Absolute paths, `..` traversal
 
 Private-key operations read passwords from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`.
 
+## Local Web API
+
+The custom web UI is served by `api_app.py` on `127.0.0.1` by default. `GET /api/health` returns a per-process `apiToken` used by the same-origin frontend. Every state-changing `/api/*` request must include that value in the `X-Quantum-Encryptor-Token` header.
+
+When a browser sends an `Origin` header on a state-changing API request, the server only accepts local origins beginning with `http://127.0.0.1:` or `http://localhost:`. Requests without the local API token are rejected before route handlers parse uploaded files or form data.
+
 ### Agent JSON Contract
 
 Successful command output:

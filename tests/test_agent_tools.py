@@ -551,3 +551,118 @@ def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_pa
     assert payload["bytes_verified"] == len(b"plaintext")
     assert "plaintext" not in json.dumps(payload)
     assert not (tmp_path / "message.txt").exists()
+
+
+def test_invalid_agent_args_return_json_error(capsys):
+    code = tools.run(["inspect-key"])
+    captured = capsys.readouterr()
+
+    assert captured.err == ""
+    assert code == tools.EXIT_INVALID_INPUT
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["error_code"] == "invalid_args"
+
+
+def test_health_reports_backend_available(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: cfg.KEM_ALG)
+
+    code, payload = _run_agent(["health", "--json"], capsys)
+
+    assert code == tools.EXIT_SUCCESS
+    assert payload["backend_available"] is True
+    assert payload["kem"] == cfg.KEM_ALG
+    assert payload["workspace"] == tmp_path.name
+
+
+def test_path_helpers_reject_empty_paths_and_input_directories(tmp_path):
+    with pytest.raises(tools.AgentCommandError) as empty_path:
+        tools._reject_unsafe_path_text(" ")
+    assert empty_path.value.error_code == "invalid_path"
+
+    (tmp_path / "directory").mkdir()
+    with pytest.raises(tools.AgentCommandError) as directory_input:
+        tools._resolve_input_path("directory", tmp_path)
+    assert directory_input.value.error_code == "invalid_path"
+
+
+def test_output_path_rejects_existing_directory_even_with_overwrite(tmp_path):
+    (tmp_path / "output").mkdir()
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._resolve_output_path("output", tmp_path, overwrite=True)
+
+    assert exc.value.error_code == "invalid_path"
+
+
+def test_read_workspace_text_rejects_invalid_utf8(tmp_path):
+    (tmp_path / "bad.pem").write_bytes(b"\xff")
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._read_workspace_text("bad.pem", tmp_path)
+
+    assert exc.value.error_code == "invalid_input"
+
+
+def test_atomic_write_overwrite_replaces_file_and_preserves_mode(tmp_path):
+    output_path = tmp_path / "existing.bin"
+    output_path.write_bytes(b"old")
+    output_path.chmod(0o640)
+
+    tools._atomic_write_file(output_path, b"new", overwrite=True, private_file=False, operation="test")
+
+    assert output_path.read_bytes() == b"new"
+    if os.name != "nt":
+        assert stat.S_IMODE(output_path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize(
+    ("core_exc", "error_code", "exit_code"),
+    [
+        (core.PasswordRequiredError("missing"), "password_required", tools.EXIT_CRYPTO_FAILURE),
+        (core.WeakPasswordError("weak"), "weak_password", tools.EXIT_CRYPTO_FAILURE),
+        (core.UnencryptedPrivateKeyError("plain"), "unencrypted_private_key", tools.EXIT_CRYPTO_FAILURE),
+        (core.UnsupportedKDFError("kdf"), "unsupported_kdf", tools.EXIT_INVALID_INPUT),
+        (core.InvalidKeyFormatError("key"), "invalid_key", tools.EXIT_INVALID_INPUT),
+        (core.UnsupportedAlgorithmError("alg"), "unsupported_algorithm", tools.EXIT_INVALID_INPUT),
+        (core.SizeLimitError("large"), "file_too_large", tools.EXIT_INVALID_INPUT),
+        (core.FileFormatError("format"), "invalid_file_format", tools.EXIT_INVALID_INPUT),
+        (core.CryptoDependencyError("backend"), "backend_unavailable", tools.EXIT_BACKEND_UNAVAILABLE),
+        (RuntimeError("other"), "crypto_error", tools.EXIT_CRYPTO_FAILURE),
+    ],
+)
+def test_agent_error_from_core_maps_known_failures(core_exc, error_code, exit_code):
+    converted = tools._agent_error_from_core("operation", core_exc)
+
+    assert converted.operation == "operation"
+    assert converted.error_code == error_code
+    assert converted.exit_code == exit_code
+
+
+def test_resolve_backend_maps_unsupported_algorithm(monkeypatch):
+    def unsupported(_kem_alg):
+        raise core.UnsupportedAlgorithmError("unsupported")
+
+    monkeypatch.setattr(core, "resolve_kem_algorithm", unsupported)
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._resolve_backend("encrypt", "Unsupported")
+
+    assert exc.value.error_code == "unsupported_algorithm"
+    assert exc.value.exit_code == tools.EXIT_INVALID_INPUT
+
+
+def test_generate_keys_rejects_same_output_path(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
+    monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
+    monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: pytest.fail("key generation should not run"))
+
+    code, payload = _run_agent(
+        ["generate-keys", "--public-out", "same.pem", "--private-out", "same.pem"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "invalid_path"

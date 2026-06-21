@@ -41,6 +41,10 @@ quantum-encryptor-agent = "pqc_agent_tools:main"
 [tool.setuptools]
 py-modules = ["api_app", "crypto_config", "crypto_core", "pqc_agent_tools", "pqc_app", "ui_helpers"]
 
+[tool.setuptools.data-files]
+"static/app" = ["static/app/index.html"]
+"static/app/assets" = ["static/app/assets/*"]
+
 [tool.black]
 line-length = 120
 target-version = ["py310", "py311", "py312", "py313"]

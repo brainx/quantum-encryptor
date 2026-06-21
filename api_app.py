@@ -6,6 +6,8 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -25,9 +27,26 @@ from ui_helpers import format_key_info_for_display, guess_decrypted_filename
 logger = logging.getLogger(__name__)
 
 APP_ROOT = Path(__file__).resolve().parent
-STATIC_APP_DIR = APP_ROOT / "static" / "app"
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 SMALL_FORM_MAX_BYTES = 64 * 1024
+LOCAL_API_TOKEN = os.environ.get("QUANTUM_ENCRYPTOR_API_TOKEN") or secrets.token_urlsafe(32)
+ALLOWED_ORIGIN_PREFIXES = (
+    "http://127.0.0.1:",
+    "http://localhost:",
+)
+
+
+def _static_app_dir() -> Path:
+    source_static_app = APP_ROOT / "static" / "app"
+    installed_static_app = Path(sys.prefix) / "static" / "app"
+    if source_static_app.exists():
+        return source_static_app
+    if installed_static_app.exists():
+        return installed_static_app
+    return source_static_app
+
+
+STATIC_APP_DIR = _static_app_dir()
 
 
 class RequestBodyTooLarge(Exception):
@@ -133,6 +152,50 @@ def _header_value(scope: Scope, name: bytes) -> str | None:
         if header_name.lower() == name:
             return value.decode("latin1")
     return None
+
+
+def _is_state_changing_api(scope: Scope) -> bool:
+    method = str(scope.get("method", "GET")).upper()
+    path = str(scope.get("path", ""))
+    return method in {"POST", "PUT", "PATCH", "DELETE"} and path.startswith("/api/")
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    return origin.startswith(ALLOWED_ORIGIN_PREFIXES)
+
+
+def _has_valid_local_api_token(token: str | None) -> bool:
+    if token is None:
+        return False
+    return secrets.compare_digest(token.encode("utf-8"), LOCAL_API_TOKEN.encode("utf-8"))
+
+
+class LocalApiGuardMiddleware:
+    """Require local browser context plus per-process token for state-changing API requests."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_state_changing_api(scope):
+            await self.app(scope, receive, send)
+            return
+
+        origin = _header_value(scope, b"origin")
+        if not _is_allowed_origin(origin):
+            await _json_error(ApiError(403, "forbidden_origin", "Request origin is not allowed."))(scope, receive, send)
+            return
+
+        token = _header_value(scope, b"x-quantum-encryptor-token")
+        if not _has_valid_local_api_token(token):
+            await _json_error(ApiError(403, "missing_api_token", "Missing or invalid local API token."))(
+                scope, receive, send
+            )
+            return
+
+        await self.app(scope, receive, send)
 
 
 class ApiBodyLimitMiddleware:
@@ -255,6 +318,7 @@ def _health_payload() -> dict[str, Any]:
         "maxFileBytes": cfg.MAX_FILE_BYTES,
         "maxEncryptedFileBytes": cfg.MAX_ENCRYPTED_FILE_BYTES,
         "maxPemBytes": cfg.MAX_PEM_BYTES,
+        "apiToken": LOCAL_API_TOKEN,
         "passwordPolicy": {
             "minChars": cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS,
             "minUniqueChars": cfg.PRIVATE_KEY_MIN_UNIQUE_CHARS,
@@ -263,7 +327,10 @@ def _health_payload() -> dict[str, Any]:
 
 
 async def health(_request: Request) -> JSONResponse:
-    return _success_json(_health_payload())
+    response = _success_json(_health_payload())
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 async def inspect_key(request: Request) -> JSONResponse:
@@ -431,6 +498,7 @@ def create_app() -> Starlette:
         routes.append(Route("/{path:path}", frontend_missing, methods=["GET"]))
     app = Starlette(debug=False, routes=routes)
     app.add_middleware(ApiBodyLimitMiddleware)
+    app.add_middleware(LocalApiGuardMiddleware)
     return app
 
 

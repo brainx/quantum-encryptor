@@ -41,7 +41,14 @@ jobs:
         run: python -m mypy api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_ui_helpers.py
 
       - name: Unit tests without native liboqs
-        run: PYTHON=python ./test.sh --cov=crypto_core --cov=pqc_agent_tools --cov=ui_helpers --cov-report=term-missing --cov-fail-under=70
+        run: >
+          PYTHON=python ./test.sh
+          --cov=crypto_core
+          --cov=pqc_agent_tools
+          --cov=ui_helpers
+          --cov=api_app
+          --cov-report=term-missing
+          --cov-fail-under=80
 
   package:
     name: Build and install package
@@ -57,8 +64,20 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
       - name: Install build tooling
         run: python -m pip install -r requirements-dev.txt
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
 
       - name: Build package artifacts
         run: python -m build
@@ -72,6 +91,21 @@ jobs:
           . /tmp/qe-wheel-test/bin/activate
           python -m pip install dist/*.whl
           quantum-encryptor-agent health --json
+
+      - name: Smoke installed web UI
+        run: |
+          . /tmp/qe-wheel-test/bin/activate
+          PORT=4002 python -m api_app &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4002/ | grep -q '<div id="root"></div>'; then
+              curl -fsS http://127.0.0.1:4002/api/health >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
 
   security:
     name: Security checks

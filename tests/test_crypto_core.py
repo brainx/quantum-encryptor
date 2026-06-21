@@ -76,6 +76,67 @@ def key_pair(kem_algorithm) -> Tuple[bytes, bytes]:
 class TestKeyGeneration:
     """Tests for key generation functions."""
 
+    def test_native_oqs_library_available_uses_find_library(self, monkeypatch):
+        """A system-discoverable liboqs shared library is accepted."""
+        monkeypatch.setattr(
+            core.ctypes.util, "find_library", lambda name: "/usr/lib/liboqs.so" if name == "oqs" else None
+        )
+
+        assert core._native_oqs_library_available() is True
+
+    def test_native_oqs_library_available_checks_install_path(self, monkeypatch, tmp_path):
+        """OQS_INSTALL_PATH is checked for common shared-library directories."""
+        monkeypatch.setattr(core.ctypes.util, "find_library", lambda _name: None)
+        monkeypatch.delenv("OQS_INSTALL_PATH", raising=False)
+
+        assert core._native_oqs_library_available() is False
+
+        monkeypatch.setenv("OQS_INSTALL_PATH", str(tmp_path))
+        assert core._native_oqs_library_available() is False
+
+        lib_dir = tmp_path / "lib"
+        lib_dir.mkdir()
+        (lib_dir / "liboqs.so").write_text("", encoding="utf-8")
+
+        assert core._native_oqs_library_available() is True
+
+    def test_load_oqs_module_success_sets_global_module(self, monkeypatch):
+        """A successful lazy import stores the oqs module for reuse."""
+        fake_oqs = object()
+        monkeypatch.setattr(core, "oqs", None)
+        monkeypatch.setattr(core, "_oqs_load_error", None)
+        monkeypatch.setattr(core, "_native_oqs_library_available", lambda: True)
+        monkeypatch.setattr(core.importlib, "import_module", lambda _name: fake_oqs)
+
+        assert core._load_oqs_module() is fake_oqs
+        assert core.oqs is fake_oqs
+        assert core._oqs_load_error is None
+
+    @pytest.mark.parametrize(
+        "raised",
+        [
+            ImportError("missing wrapper"),
+            RuntimeError("init failed"),
+            ValueError("unexpected"),
+        ],
+    )
+    def test_load_oqs_module_wraps_import_failures(self, monkeypatch, raised):
+        """Import and initialization failures are surfaced as dependency errors."""
+        monkeypatch.setattr(core, "oqs", None)
+        monkeypatch.setattr(core, "_oqs_load_error", None)
+        monkeypatch.setattr(core, "_native_oqs_library_available", lambda: True)
+
+        def fail_import(_module_name):
+            raise raised
+
+        monkeypatch.setattr(core.importlib, "import_module", fail_import)
+
+        with pytest.raises(core.CryptoDependencyError):
+            core._load_oqs_module()
+
+        assert core.oqs is None
+        assert core._oqs_load_error is not None
+
     def test_generate_oqs_keys(self, kem_algorithm):
         """Test generating key pairs."""
         public_key, private_key = core.generate_oqs_keys(kem_algorithm)
@@ -119,6 +180,44 @@ class TestKeyGeneration:
             core._load_oqs_module()
 
         assert core.oqs is None
+
+    def test_enabled_kem_mechanisms_supports_current_and_legacy_getters(self, monkeypatch):
+        """liboqs-python getter name differences are normalized."""
+
+        class ModernOQS:
+            @staticmethod
+            def get_enabled_kem_mechanisms():
+                return [cfg.KEM_ALG]
+
+        class LegacyOQS:
+            @staticmethod
+            def get_enabled_KEM_mechanisms():
+                return ["Kyber768"]
+
+        monkeypatch.setattr(core, "oqs", ModernOQS)
+        assert core._enabled_kem_mechanisms() == (cfg.KEM_ALG,)
+
+        monkeypatch.setattr(core, "oqs", LegacyOQS)
+        assert core._enabled_kem_mechanisms() == ("Kyber768",)
+
+        monkeypatch.setattr(core, "oqs", object())
+        with pytest.raises(core.CryptoDependencyError):
+            core._enabled_kem_mechanisms()
+
+    def test_kem_aliases_and_resolve_alias_fallback(self, monkeypatch):
+        """ML-KEM and Kyber aliases resolve to whichever compatible backend is enabled."""
+        assert core._kem_aliases("ML-KEM-768") == ("ML-KEM-768", "Kyber768")
+        assert core._kem_aliases("Kyber768") == ("Kyber768", "ML-KEM-768")
+        assert core._kem_aliases("Other") == ("Other",)
+
+        monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: ("Kyber768",))
+        assert core.resolve_kem_algorithm("ML-KEM-768") == "Kyber768"
+        assert core.is_kem_available("ML-KEM-768") is True
+
+        monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: ())
+        with pytest.raises(core.CryptoDependencyError):
+            core.resolve_kem_algorithm("ML-KEM-768")
+        assert core.is_kem_available("ML-KEM-768") is False
 
 
 class TestOQSCompatibility:
@@ -178,6 +277,19 @@ class TestOQSCompatibility:
         shared_secret = core._decapsulate_shared_secret(LegacyOQS, cfg.KEM_ALG, b"secret-key", b"ciphertext")
 
         assert shared_secret == b"legacy-shared-secret"
+
+    def test_decapsulate_shared_secret_reraises_current_api_type_error(self):
+        """If current and legacy liboqs calls fail, preserve the current API error."""
+
+        class BrokenKEM:
+            def __init__(self, _alg_name, **_kwargs):
+                raise TypeError("current api failed")
+
+        class BrokenOQS:
+            KeyEncapsulation = BrokenKEM
+
+        with pytest.raises(TypeError, match="current api failed"):
+            core._decapsulate_shared_secret(BrokenOQS, cfg.KEM_ALG, b"secret-key", b"ciphertext")
 
 
 class TestKeyDerivation:

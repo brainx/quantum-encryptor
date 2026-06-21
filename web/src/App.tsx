@@ -27,6 +27,7 @@ const DEFAULT_HEALTH: Health = {
   maxFileBytes: 100 * 1024 * 1024,
   maxEncryptedFileBytes: 101 * 1024 * 1024,
   maxPemBytes: 128 * 1024,
+  apiToken: "",
   passwordPolicy: { minChars: 16, minUniqueChars: 5 }
 };
 

@@ -9,6 +9,7 @@ export type Health = {
   maxFileBytes: number;
   maxEncryptedFileBytes: number;
   maxPemBytes: number;
+  apiToken: string;
   passwordPolicy: {
     minChars: number;
     minUniqueChars: number;
@@ -47,6 +48,9 @@ type ApiErrorPayload = {
   message: string;
 };
 
+let localApiToken = "";
+let healthRequest: Promise<Health> | null = null;
+
 export class ApiError extends Error {
   code: string;
   status: number;
@@ -56,6 +60,16 @@ export class ApiError extends Error {
     this.code = code;
     this.status = status;
   }
+}
+
+async function apiTokenHeaders(): Promise<HeadersInit> {
+  if (!localApiToken) {
+    await fetchHealth();
+  }
+  if (!localApiToken) {
+    throw new ApiError(503, "missing_api_token", "Local API token is not available.");
+  }
+  return { "X-Quantum-Encryptor-Token": localApiToken };
 }
 
 function filenameFromDisposition(disposition: string | null, fallback: string): string {
@@ -78,15 +92,25 @@ async function parseError(response: Response): Promise<never> {
 }
 
 export async function fetchHealth(): Promise<Health> {
-  const response = await fetch("/api/health");
-  if (!response.ok) await parseError(response);
-  return (await response.json()) as Health;
+  if (!healthRequest) {
+    healthRequest = fetch("/api/health")
+      .then(async (response) => {
+        if (!response.ok) await parseError(response);
+        const payload = (await response.json()) as Health;
+        localApiToken = payload.apiToken;
+        return payload;
+      })
+      .finally(() => {
+        healthRequest = null;
+      });
+  }
+  return healthRequest;
 }
 
 export async function inspectKey(file: File): Promise<KeyInspectResult> {
   const form = new FormData();
   form.append("key", file);
-  const response = await fetch("/api/keys/inspect", { method: "POST", body: form });
+  const response = await fetch("/api/keys/inspect", { method: "POST", body: form, headers: await apiTokenHeaders() });
   if (!response.ok) await parseError(response);
   return (await response.json()) as KeyInspectResult;
 }
@@ -94,7 +118,7 @@ export async function inspectKey(file: File): Promise<KeyInspectResult> {
 export async function generateKeys(password: string): Promise<GeneratedKeys> {
   const form = new FormData();
   form.append("password", password);
-  const response = await fetch("/api/keys/generate", { method: "POST", body: form });
+  const response = await fetch("/api/keys/generate", { method: "POST", body: form, headers: await apiTokenHeaders() });
   if (!response.ok) await parseError(response);
   return (await response.json()) as GeneratedKeys;
 }
@@ -104,7 +128,7 @@ export async function encryptFile(file: File, publicKey: File, outputFilename: s
   form.append("file", file);
   form.append("public_key", publicKey);
   form.append("output_filename", outputFilename);
-  const response = await fetch("/api/files/encrypt", { method: "POST", body: form });
+  const response = await fetch("/api/files/encrypt", { method: "POST", body: form, headers: await apiTokenHeaders() });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),
@@ -123,7 +147,7 @@ export async function decryptFile(
   form.append("private_key", privateKey);
   form.append("password", password);
   form.append("output_filename", outputFilename);
-  const response = await fetch("/api/files/decrypt", { method: "POST", body: form });
+  const response = await fetch("/api/files/decrypt", { method: "POST", body: form, headers: await apiTokenHeaders() });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),

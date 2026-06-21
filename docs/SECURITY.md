@@ -63,6 +63,7 @@ The application is designed to protect against the following threats:
 - PEM parsing uses strict base64 decoding and validates encrypted private-key salt, nonce, scrypt KDF metadata, maximum PEM size, and maximum raw key payload size.
 - File decryption verifies that the private-key KEM metadata matches the encrypted-container KEM metadata after normalizing the `ML-KEM-768` and `Kyber768` compatibility aliases.
 - The UI and core encryption path enforce a 100 MiB plaintext in-memory file limit; decryption accepts only the bounded encrypted-container size needed for header, KEM ciphertext, nonce, and tag overhead.
+- The local web API requires a per-process `X-Quantum-Encryptor-Token` for state-changing `/api/*` requests and rejects non-local browser origins when an `Origin` header is present.
 - Download filenames are reduced to local filenames before being passed to Streamlit.
 - Private-key password protection requires at least 16 characters, at least 5 unique characters, and rejects known weak values in the core, UI, and agent CLI.
 - Unencrypted private keys are rejected in the core, UI, and agent CLI.

@@ -43,6 +43,14 @@ The backend readiness warning shown here is expected when native `liboqs` is not
 
 See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page.
 
+## Project Documentation
+
+- [Security policy](SECURITY.md)
+- [Security design notes](docs/SECURITY.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Release checklist](docs/RELEASE_CHECKLIST.md)
+- [Changelog](CHANGELOG.md)
+
 ## Requirements
 
 - Python 3.10 through 3.13
@@ -215,6 +223,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - Decryption checks encrypted-file KEM metadata against the private-key KEM metadata, with `ML-KEM-768` and `Kyber768` treated as compatibility aliases
 - PEM/key reads are capped at 128 KiB before parsing; plaintext and encrypted-container reads keep the existing bounded in-memory limits
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
+- State-changing local web API requests require a per-process API token and reject non-local browser origins when an `Origin` header is present
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
 - CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, browser UI smoke, locked runtime install, and a native `liboqs` integration test job
