@@ -6,6 +6,6 @@ starlette>=1.3.1,<2
 uvicorn>=0.49.0,<1
 python-multipart>=0.0.32,<1
 # Keep the locked runtime install portable on Ubuntu/Python 3.13.
-httptools>=0.6.4,<0.7
+httptools>=0.8.0,<0.9
 # Streamlit pulls this on Linux; pin it explicitly so hashed locks stay portable.
 watchdog>=2.1.5,<7
