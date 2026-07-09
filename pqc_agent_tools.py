@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -103,10 +104,17 @@ def _reject_unsafe_path_text(path_text: str) -> Path:
 
 def _resolve_input_path(path_text: str, workspace: Path) -> Path:
     relative_path = _reject_unsafe_path_text(path_text)
-    resolved = (workspace / relative_path).resolve(strict=True)
+    try:
+        resolved = (workspace / relative_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AgentCommandError("invalid_path", "Input path could not be resolved.", EXIT_INVALID_INPUT) from exc
     if not _is_relative_to(resolved, workspace):
         raise AgentCommandError("path_outside_workspace", "Path escapes the workspace.", EXIT_PATH_VIOLATION)
-    if not resolved.is_file():
+    try:
+        is_file = resolved.is_file()
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not inspect input path.", EXIT_INVALID_INPUT) from exc
+    if not is_file:
         raise AgentCommandError("invalid_path", "Input path must be a file.", EXIT_INVALID_INPUT)
     return resolved
 
@@ -222,43 +230,87 @@ def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: b
         ) from exc
 
 
-def _read_workspace_file_limited(path_text: str, workspace: Path, max_bytes: int) -> tuple[Path, bytes]:
-    path = _resolve_input_path(path_text, workspace)
+def _open_workspace_input(path: Path, workspace: Path) -> int:
+    """Open a resolved workspace file without following replacement symlinks."""
+    if os.name == "nt":
+        return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+    relative_path = path.relative_to(workspace)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(workspace, directory_flags)
     try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise AgentCommandError("invalid_path", "Could not stat input path.", EXIT_INVALID_INPUT) from exc
-    if size > max_bytes:
-        raise AgentCommandError(
-            "file_too_large",
-            "Input file exceeds the configured size limit.",
-            EXIT_INVALID_INPUT,
+        for part in relative_path.parts[:-1]:
+            next_fd = os.open(part, directory_flags | nofollow, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return os.open(
+            relative_path.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0) | nofollow,
+            dir_fd=directory_fd,
         )
+    finally:
+        os.close(directory_fd)
+
+
+def _read_resolved_workspace_file_limited(
+    path: Path,
+    workspace: Path,
+    max_bytes: int,
+    too_large_message: str,
+) -> bytes:
+    fd: Optional[int] = None
     try:
-        return path, path.read_bytes()
+        fd = _open_workspace_input(path, workspace)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise AgentCommandError("invalid_path", "Input path must be a file.", EXIT_INVALID_INPUT)
+        if file_stat.st_size > max_bytes:
+            raise AgentCommandError("file_too_large", too_large_message, EXIT_INVALID_INPUT)
+        with os.fdopen(fd, "rb") as input_file:
+            fd = None
+            data = input_file.read(max_bytes + 1)
+    except AgentCommandError:
+        raise
     except OSError as exc:
         raise AgentCommandError("invalid_path", "Could not read input path.", EXIT_INVALID_INPUT) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    if len(data) > max_bytes:
+        raise AgentCommandError("file_too_large", too_large_message, EXIT_INVALID_INPUT)
+    return data
+
+
+def _read_workspace_file_limited(path_text: str, workspace: Path, max_bytes: int) -> tuple[Path, bytes]:
+    path = _resolve_input_path(path_text, workspace)
+    data = _read_resolved_workspace_file_limited(
+        path,
+        workspace,
+        max_bytes,
+        "Input file exceeds the configured size limit.",
+    )
+    return path, data
 
 
 def _read_workspace_text(path_text: str, workspace: Path, max_bytes: Optional[int] = None) -> tuple[Path, str]:
     path = _resolve_input_path(path_text, workspace)
     limit = cfg.MAX_PEM_BYTES if max_bytes is None else max_bytes
+    data = _read_resolved_workspace_file_limited(
+        path,
+        workspace,
+        limit,
+        "Text input file exceeds the configured size limit.",
+    )
     try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise AgentCommandError("invalid_path", "Could not stat input path.", EXIT_INVALID_INPUT) from exc
-    if size > limit:
-        raise AgentCommandError(
-            "file_too_large",
-            "Text input file exceeds the configured size limit.",
-            EXIT_INVALID_INPUT,
-        )
-    try:
-        return path, path.read_text(encoding="utf-8")
+        return path, data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise AgentCommandError("invalid_input", "File must be valid UTF-8 text.", EXIT_INVALID_INPUT) from exc
-    except OSError as exc:
-        raise AgentCommandError("invalid_path", "Could not read input path.", EXIT_INVALID_INPUT) from exc
+        raise AgentCommandError(
+            "invalid_input",
+            "File must be valid UTF-8 text.",
+            EXIT_INVALID_INPUT,
+        ) from exc
 
 
 def _write_workspace_file(

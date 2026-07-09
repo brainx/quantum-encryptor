@@ -812,6 +812,25 @@ class TestFileEncryption:
         assert metadata.kem_alg == cfg.KEM_ALG
         assert metadata.kem_ciphertext_bytes == 1
 
+    def test_inspect_encrypted_file_rejects_payload_shorter_than_gcm_tag(self):
+        """A container cannot authenticate when its AES section lacks a full GCM tag."""
+        encrypted_data = _syntactic_encrypted_blob()
+        payload_offset = _encrypted_blob_offsets(encrypted_data)["payload"]
+        malformed = encrypted_data[:payload_offset] + b"x" * (cfg.AES_TAG_BYTES - 1)
+
+        with pytest.raises(core.FileFormatError, match="authentication tag"):
+            core.inspect_encrypted_file_strict(malformed)
+
+    def test_inspect_encrypted_file_rejects_payload_above_plaintext_bound(self, monkeypatch):
+        """The AES section is bounded by plaintext size plus the GCM tag."""
+        monkeypatch.setattr(cfg, "MAX_FILE_BYTES", 3)
+        encrypted_data = _syntactic_encrypted_blob()
+        payload_offset = _encrypted_blob_offsets(encrypted_data)["payload"]
+        oversized = encrypted_data[:payload_offset] + b"x" * (3 + cfg.AES_TAG_BYTES + 1)
+
+        with pytest.raises(core.SizeLimitError, match="payload"):
+            core.inspect_encrypted_file_strict(oversized)
+
     @pytest.mark.parametrize(
         "encrypted_data",
         [

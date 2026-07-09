@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -133,6 +134,95 @@ def test_inspect_key_rejects_oversized_pem_before_parse(monkeypatch, tmp_path, c
 
     assert code == tools.EXIT_INVALID_INPUT
     assert payload["error_code"] == "file_too_large"
+
+
+def test_inspect_key_reports_missing_path_as_invalid_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    code, payload = _run_agent(["inspect-key", "--key", "missing.pem"], capsys)
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["operation"] == "inspect-key"
+    assert payload["error_code"] == "invalid_path"
+
+
+def test_workspace_read_enforces_limit_against_understated_path_stat(monkeypatch, tmp_path):
+    input_path = tmp_path / "growing.bin"
+    input_path.write_bytes(b"12345")
+    original_stat = Path.stat
+
+    def understated_stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == input_path:
+            values = list(result)
+            values[6] = 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(Path, "stat", understated_stat)
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._read_workspace_file_limited("growing.bin", tmp_path, max_bytes=1)
+
+    assert exc.value.error_code == "file_too_large"
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "O_NOFOLLOW"), reason="POSIX no-follow open required")
+def test_workspace_read_rejects_file_replaced_by_symlink(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    input_path = workspace / "message.bin"
+    input_path.write_bytes(b"inside")
+    resolved = tools._resolve_input_path("message.bin", workspace)
+
+    outside_path = tmp_path / "outside.bin"
+    outside_path.write_bytes(b"outside")
+    input_path.unlink()
+    input_path.symlink_to(outside_path)
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._read_resolved_workspace_file_limited(resolved, workspace, 64, "too large")
+
+    assert exc.value.error_code == "invalid_path"
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "O_NONBLOCK"), reason="POSIX nonblocking open required")
+def test_workspace_input_opens_final_descriptor_nonblocking(monkeypatch, tmp_path):
+    input_path = tmp_path / "message.bin"
+    input_path.write_bytes(b"message")
+    opened_flags = []
+    original_open = tools.os.open
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == input_path.name and dir_fd is not None:
+            opened_flags.append(flags)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(tools.os, "open", tracking_open)
+
+    fd = tools._open_workspace_input(input_path, tmp_path)
+    os.close(fd)
+
+    assert opened_flags
+    assert opened_flags[-1] & os.O_NONBLOCK
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"),
+    reason="POSIX FIFO support required",
+)
+def test_workspace_read_rejects_file_replaced_by_fifo(tmp_path):
+    input_path = tmp_path / "message.bin"
+    input_path.write_bytes(b"message")
+    resolved = tools._resolve_input_path("message.bin", tmp_path)
+
+    input_path.unlink()
+    os.mkfifo(input_path)
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._read_resolved_workspace_file_limited(resolved, tmp_path, 64, "too large")
+
+    assert exc.value.error_code == "invalid_path"
 
 
 def test_path_boundary_rejects_absolute_and_parent_paths(monkeypatch, tmp_path, capsys):
