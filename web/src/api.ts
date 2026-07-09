@@ -72,6 +72,36 @@ async function apiTokenHeaders(): Promise<HeadersInit> {
   return { "X-Quantum-Encryptor-Token": localApiToken };
 }
 
+async function rejectedApiToken(response: Response): Promise<boolean> {
+  if (response.status !== 403) return false;
+  try {
+    const payload = (await response.clone().json()) as Partial<ApiErrorPayload>;
+    return payload.error_code === "missing_api_token";
+  } catch {
+    return false;
+  }
+}
+
+async function fetchWithApiToken(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+  const send = async (): Promise<{ response: Response; token: string }> => {
+    const headers = new Headers(init.headers);
+    const tokenHeaders = new Headers(await apiTokenHeaders());
+    const token = tokenHeaders.get("X-Quantum-Encryptor-Token") || "";
+    headers.set("X-Quantum-Encryptor-Token", token);
+    return { response: await fetch(input, { ...init, headers }), token };
+  };
+
+  let attempt = await send();
+  if (await rejectedApiToken(attempt.response)) {
+    if (localApiToken === attempt.token) {
+      localApiToken = "";
+      await fetchHealth();
+    }
+    attempt = await send();
+  }
+  return attempt.response;
+}
+
 function filenameFromDisposition(disposition: string | null, fallback: string): string {
   if (!disposition) return fallback;
   const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
@@ -110,7 +140,7 @@ export async function fetchHealth(): Promise<Health> {
 export async function inspectKey(file: File): Promise<KeyInspectResult> {
   const form = new FormData();
   form.append("key", file);
-  const response = await fetch("/api/keys/inspect", { method: "POST", body: form, headers: await apiTokenHeaders() });
+  const response = await fetchWithApiToken("/api/keys/inspect", { method: "POST", body: form });
   if (!response.ok) await parseError(response);
   return (await response.json()) as KeyInspectResult;
 }
@@ -118,7 +148,7 @@ export async function inspectKey(file: File): Promise<KeyInspectResult> {
 export async function generateKeys(password: string): Promise<GeneratedKeys> {
   const form = new FormData();
   form.append("password", password);
-  const response = await fetch("/api/keys/generate", { method: "POST", body: form, headers: await apiTokenHeaders() });
+  const response = await fetchWithApiToken("/api/keys/generate", { method: "POST", body: form });
   if (!response.ok) await parseError(response);
   return (await response.json()) as GeneratedKeys;
 }
@@ -128,7 +158,7 @@ export async function encryptFile(file: File, publicKey: File, outputFilename: s
   form.append("file", file);
   form.append("public_key", publicKey);
   form.append("output_filename", outputFilename);
-  const response = await fetch("/api/files/encrypt", { method: "POST", body: form, headers: await apiTokenHeaders() });
+  const response = await fetchWithApiToken("/api/files/encrypt", { method: "POST", body: form });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),
@@ -147,7 +177,7 @@ export async function decryptFile(
   form.append("private_key", privateKey);
   form.append("password", password);
   form.append("output_filename", outputFilename);
-  const response = await fetch("/api/files/decrypt", { method: "POST", body: form, headers: await apiTokenHeaders() });
+  const response = await fetchWithApiToken("/api/files/decrypt", { method: "POST", body: form });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),

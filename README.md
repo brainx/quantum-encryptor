@@ -221,12 +221,12 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - Private keys must be password protected with scrypt-derived AES-256-GCM keys; unencrypted private keys and legacy encrypted private-key PEM metadata are rejected by default
 - Private-key passwords require at least 16 characters, at least 5 unique characters, and must not match known weak values
 - Decryption checks encrypted-file KEM metadata against the private-key KEM metadata, with `ML-KEM-768` and `Kyber768` treated as compatibility aliases
-- PEM/key reads are capped at 128 KiB before parsing; plaintext and encrypted-container reads keep the existing bounded in-memory limits
+- PEM/key reads are capped at 128 KiB before parsing; POSIX workspace inputs use descriptor-anchored, no-follow reads, and reads remain bounded even if a file changes during the operation
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
 - State-changing local web API requests require a per-process API token and reject non-local browser origins when an `Origin` header is present
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
-- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, browser UI smoke, locked runtime install, and a native `liboqs` integration test job
+- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.15.0 release commit; repository CodeQL default setup provides static analysis
 - See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for repository trust boundaries, assets, abuse cases, and invariants
 - **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
 

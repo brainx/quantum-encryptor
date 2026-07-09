@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4001",
     "build": "tsc --noEmit && vite build",
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit && npm run test:api",
+    "test:api": "node --test scripts/api_client.test.mjs",
     "ui-smoke": "node scripts/ui_smoke.mjs"
   },
   "dependencies": {

@@ -88,14 +88,26 @@ jobs:
       - name: Install built wheel
         run: |
           python -m venv /tmp/qe-wheel-test
-          . /tmp/qe-wheel-test/bin/activate
-          python -m pip install dist/*.whl
-          quantum-encryptor-agent health --json
+          /tmp/qe-wheel-test/bin/python -m pip install dist/*.whl
+          cd "$(mktemp -d)"
+          /tmp/qe-wheel-test/bin/quantum-encryptor-agent health --json
+          /tmp/qe-wheel-test/bin/python -I - <<'PY'
+          from pathlib import Path
+          import sys
+
+          import api_app
+          import pqc_agent_tools
+
+          prefix = Path(sys.prefix).resolve()
+          for module in (api_app, pqc_agent_tools):
+              module_path = Path(module.__file__).resolve()
+              assert module_path.is_relative_to(prefix), (module.__name__, module_path, prefix)
+          PY
 
       - name: Smoke installed web UI
         run: |
-          . /tmp/qe-wheel-test/bin/activate
-          PORT=4002 python -m api_app &
+          cd "$(mktemp -d)"
+          PORT=4002 /tmp/qe-wheel-test/bin/python -I -m api_app &
           server_pid=$!
           trap 'kill "$server_pid"' EXIT
           for attempt in $(seq 1 30); do
@@ -121,6 +133,12 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
       - name: Install security tooling
         run: python -m pip install -r requirements-dev.txt
 
@@ -133,8 +151,11 @@ jobs:
       - name: Audit locked development dependencies
         run: python -m pip_audit -r requirements-dev-lock.txt
 
+      - name: Audit web dependencies
+        run: npm audit --package-lock-only --audit-level=high
+
       - name: Run Python security lint
-        run: python -m bandit -q -r crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py
+        run: python -m bandit -q -r api_app.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py
 
   web:
     name: Custom web UI
@@ -239,7 +260,11 @@ jobs:
 
       - name: Build and install native liboqs
         run: |
-          git clone --depth=1 https://github.com/open-quantum-safe/liboqs.git .ci/liboqs
+          git init .ci/liboqs
+          git -C .ci/liboqs remote add origin https://github.com/open-quantum-safe/liboqs.git
+          # liboqs 0.15.0
+          git -C .ci/liboqs fetch --depth=1 origin 97f6b86b1b6d109cfd43cf276ae39c2e776aed80
+          git -C .ci/liboqs checkout --detach 97f6b86b1b6d109cfd43cf276ae39c2e776aed80
           cmake -S .ci/liboqs -B .ci/liboqs/build \
             -GNinja \
             -DBUILD_SHARED_LIBS=ON \

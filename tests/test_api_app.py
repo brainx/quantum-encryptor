@@ -50,6 +50,15 @@ def test_content_disposition_quotes_download_filename():
     assert "filename*=UTF-8''encrypted%20file.pqc" in header
 
 
+def test_content_disposition_uses_ascii_fallback_for_unicode_filename():
+    response = api_app._download_response(b"encrypted", "秘密.pqc")
+    header = response.headers["content-disposition"]
+
+    assert header.isascii()
+    assert 'filename="__.pqc"' in header
+    assert "filename*=UTF-8''%E7%A7%98%E5%AF%86.pqc" in header
+
+
 def test_download_filename_suggestion_uses_existing_ui_helper():
     assert api_app.guess_decrypted_filename(Path("payload_encrypted.pqc")) == "payload"
 

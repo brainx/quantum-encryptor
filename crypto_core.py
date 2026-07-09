@@ -895,8 +895,10 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
 
         header_aad = encrypted_blob[: input_buffer.tell()]
         encrypted_data_aes = input_buffer.read()
-        if not encrypted_data_aes:
-            raise FileFormatError("Missing AES-GCM ciphertext and authentication tag.")
+        if len(encrypted_data_aes) < cfg.AES_TAG_BYTES:
+            raise FileFormatError("AES-GCM payload is shorter than the authentication tag.")
+        if len(encrypted_data_aes) > cfg.MAX_FILE_BYTES + cfg.AES_TAG_BYTES:
+            raise SizeLimitError("AES-GCM payload exceeds maximum supported size.")
 
         metadata = EncryptedFileMetadata(
             version=version,
