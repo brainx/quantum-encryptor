@@ -2,18 +2,18 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import ts from "typescript";
+import { transformWithOxc } from "vite";
 
 let moduleSequence = 0;
 
 async function loadApiModule() {
   const source = await readFile(new URL("../web/src/api.ts", import.meta.url), "utf8");
-  const compiled = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2022
-    }
-  }).outputText;
+  const compiled = (
+    await transformWithOxc(source, "api.ts", {
+      lang: "ts",
+      sourcemap: false
+    })
+  ).code;
   const encoded = Buffer.from(compiled).toString("base64");
   moduleSequence += 1;
   return import(`data:text/javascript;base64,${encoded}#${moduleSequence}`);
