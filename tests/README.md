@@ -74,7 +74,7 @@ pip install -r requirements-dev.txt
 
 Native `liboqs` is required for the key generation and end-to-end file encryption tests. When native `liboqs` is unavailable, those tests skip and the non-backend validation still runs.
 
-Security-critical tests cover encrypted private-key PEM v2 metadata authentication, legacy encrypted private-key PEM rejection, password policy enforcement, encrypted-container KEM mismatch rejection, oversized input rejection, and no-overwrite output safety.
+Security-critical tests cover encrypted private-key PEM v2 metadata authentication, legacy encrypted private-key PEM rejection, password policy enforcement, encrypted-container KEM mismatch rejection, malformed AES-GCM payload bounds, race-resistant bounded workspace reads, oversized input rejection, and no-overwrite output safety.
 
 ## Continuous Integration
 
@@ -83,14 +83,15 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs:
 - `black --check`
 - `flake8`
 - `mypy`
-- Unit tests without native `liboqs`, with at least 70% coverage on core modules
-- Package build, `twine check`, wheel install, and agent CLI health smoke test
-- Runtime dependency audit with `pip-audit`
+- Unit tests without native `liboqs`, with at least 80% coverage on core modules
+- Frontend API client tests, build/type checks, and browser smoke tests
+- Package build, `twine check`, isolated wheel import, agent CLI health, and installed web UI smoke tests
+- Python runtime/development dependency audits with `pip-audit` and web dependency audits with `npm audit`
 - Python security linting with `bandit`
+- CodeQL analysis for Python, JavaScript/TypeScript, and GitHub Actions
 - A native `liboqs` integration job so backend-dependent KEM round-trip tests run in CI
 
 ## Coverage Goals
 
-- Maintain at least 70% test coverage on core modules in CI
-- Raise the gate toward 80% as backend-independent crypto-core tests expand
+- Maintain at least 80% test coverage on core modules in CI
 - Prioritize coverage of security-critical functionality
