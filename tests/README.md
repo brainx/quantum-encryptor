@@ -88,8 +88,9 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs:
 - Package build, `twine check`, isolated wheel import, agent CLI health, and installed web UI smoke tests
 - Python runtime/development dependency audits with `pip-audit` and web dependency audits with `npm audit`
 - Python security linting with `bandit`
-- CodeQL analysis for Python, JavaScript/TypeScript, and GitHub Actions
 - A native `liboqs` integration job so backend-dependent KEM round-trip tests run in CI
+
+GitHub CodeQL default setup provides repository static analysis without a duplicate advanced-configuration workflow.
 
 ## Coverage Goals
 

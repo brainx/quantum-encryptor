@@ -226,7 +226,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - State-changing local web API requests require a per-process API token and reject non-local browser origins when an `Origin` header is present
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
-- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, CodeQL analysis, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.15.0 release commit
+- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.15.0 release commit; repository CodeQL default setup provides static analysis
 - See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for repository trust boundaries, assets, abuse cases, and invariants
 - **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
 
