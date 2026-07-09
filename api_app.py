@@ -106,8 +106,12 @@ def _safe_unexpected(operation: str, exc: Exception) -> JSONResponse:
 
 
 def _content_disposition(filename: str) -> str:
-    quoted = quote(filename)
-    return f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quoted}"
+    ascii_fallback = "".join(
+        character if character.isascii() and 0x20 <= ord(character) < 0x7F else "_" for character in filename
+    )
+    ascii_fallback = ascii_fallback.replace("\\", "_").replace('"', "_") or "download.bin"
+    quoted = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
 
 
 def _download_response(data: bytes, filename: str, media_type: str = "application/octet-stream") -> Response:
