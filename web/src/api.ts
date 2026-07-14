@@ -4,6 +4,7 @@ export type Health = {
   backendMessage: string;
   formatVersion: number;
   kem: string;
+  kemComponent: string;
   configuredKem: string;
   dem: string;
   maxFileBytes: number;

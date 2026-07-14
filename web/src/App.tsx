@@ -20,8 +20,9 @@ const DEFAULT_HEALTH: Health = {
   ok: true,
   backendReady: false,
   backendMessage: "Checking backend readiness.",
-  formatVersion: 3,
-  kem: "ML-KEM-768",
+  formatVersion: 4,
+  kem: "ML-KEM-768+X25519",
+  kemComponent: "ML-KEM-768",
   configuredKem: "ML-KEM-768",
   dem: "AES-256-GCM",
   maxFileBytes: 100 * 1024 * 1024,
@@ -214,7 +215,7 @@ function Sidebar({ activeView, health, onSelect }: { activeView: View; health: H
 
       <div className="metadata-grid" aria-label="Configuration">
         <MetaBadge label="Format" value={`v${health.formatVersion}`} />
-        <MetaBadge label="KEM" value={health.kem} />
+        <MetaBadge label="Hybrid suite" value={health.kem} />
         <MetaBadge label="DEM" value={health.dem} />
         <MetaBadge label="Max file" value={formatBytes(health.maxFileBytes)} />
       </div>

@@ -3,6 +3,7 @@ import os
 import struct
 import logging
 import base64
+import hashlib
 import io
 import binascii
 import ctypes.util
@@ -17,6 +18,8 @@ from crypto_config import cfg
 # Cryptography Libraries
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.exceptions import InvalidTag, InvalidKey  # For password decryption
@@ -81,6 +84,7 @@ class EncryptedFileMetadata:
     kem_alg: str
     header_bytes: int
     kem_ciphertext_bytes: int
+    x25519_ciphertext_bytes: int
     encrypted_payload_bytes: int
     total_bytes: int
 
@@ -92,6 +96,7 @@ class EncryptedFileParts:
     metadata: EncryptedFileMetadata
     header_aad: bytes
     ciphertext_kem: bytes
+    x25519_ephemeral_public: bytes
     nonce: bytes
     encrypted_data_aes: bytes
 
@@ -190,6 +195,11 @@ def _kem_aliases(kem_alg: str) -> Tuple[str, ...]:
 def is_allowed_kem_algorithm(kem_alg: Optional[str]) -> bool:
     """Return whether a KEM identifier is supported by this application."""
     return bool(kem_alg) and kem_alg in cfg.ALLOWED_KEM_ALGS
+
+
+def is_allowed_key_algorithm(key_alg: Optional[str]) -> bool:
+    """Return whether a public/private key algorithm is supported."""
+    return bool(key_alg) and key_alg in cfg.ALLOWED_KEY_ALGS
 
 
 def canonical_kem_algorithm(kem_alg: str) -> str:
@@ -299,6 +309,44 @@ def generate_oqs_keys(
         return None, None
 
 
+def pack_hybrid_key(x25519_key: bytes, mlkem_key: bytes) -> bytes:
+    """Encode a composite key as fixed-width X25519 material followed by ML-KEM material."""
+    if len(x25519_key) != cfg.X25519_KEY_BYTES or not mlkem_key:
+        raise InvalidKeyFormatError("Composite key components have invalid lengths.")
+    return x25519_key + mlkem_key
+
+
+def unpack_hybrid_key(key_bytes: bytes, key_type: str) -> Tuple[bytes, bytes]:
+    """Decode the X25519 and ML-KEM components from a composite key."""
+    if key_type not in {"public", "private"}:
+        raise InvalidKeyFormatError("Composite key type must be public or private.")
+    if len(key_bytes) <= cfg.X25519_KEY_BYTES:
+        raise InvalidKeyFormatError("Composite key is missing an X25519 or ML-KEM component.")
+    return key_bytes[: cfg.X25519_KEY_BYTES], key_bytes[cfg.X25519_KEY_BYTES :]
+
+
+def generate_hybrid_keys(kem_alg: str = cfg.KEM_ALG) -> Tuple[Optional[bytes], Optional[bytes]]:
+    """Generate independent X25519 and ML-KEM key pairs and return composite key payloads."""
+    mlkem_public, mlkem_private = generate_oqs_keys(kem_alg)
+    if not mlkem_public or not mlkem_private:
+        return None, None
+
+    x25519_private_key = x25519.X25519PrivateKey.generate()
+    x25519_public = x25519_private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    x25519_private = x25519_private_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    return (
+        pack_hybrid_key(x25519_public, mlkem_public),
+        pack_hybrid_key(x25519_private, mlkem_private),
+    )
+
+
 # --- Key Derivation Functions ---
 
 
@@ -315,6 +363,39 @@ def derive_symmetric_key_hkdf(shared_secret: bytes) -> bytes:
     # Drop this local reference only; immutable bytes are not securely zeroized in Python.
     del shared_secret
     return derived_key
+
+
+def derive_hybrid_symmetric_key(
+    mlkem_shared_secret: bytes,
+    x25519_shared_secret: bytes,
+    x25519_ephemeral_public: bytes,
+    x25519_recipient_public: bytes,
+    suite: str = cfg.HYBRID_KEM_ALG,
+) -> bytes:
+    """Combine ML-KEM and X25519 shares using an RFC 9980-inspired binding pattern."""
+    if len(mlkem_shared_secret) != cfg.AES_KEY_BYTES:
+        raise ValueError("ML-KEM shared secret must be 32 bytes.")
+    if len(x25519_shared_secret) != cfg.X25519_KEY_BYTES or x25519_shared_secret == bytes(cfg.X25519_KEY_BYTES):
+        raise ValueError("X25519 shared secret is invalid.")
+    if len(x25519_ephemeral_public) != cfg.X25519_KEY_BYTES:
+        raise ValueError("X25519 ephemeral public key must be 32 bytes.")
+    if len(x25519_recipient_public) != cfg.X25519_KEY_BYTES:
+        raise ValueError("X25519 recipient public key must be 32 bytes.")
+    if suite != cfg.HYBRID_KEM_ALG:
+        raise UnsupportedAlgorithmError(f"Unsupported hybrid suite: {suite!r}")
+
+    domain = cfg.HYBRID_KDF_DOMAIN
+    if len(domain) > 255:
+        raise ValueError("Hybrid KDF domain separator is too long.")
+    return hashlib.sha3_256(
+        mlkem_shared_secret
+        + x25519_shared_secret
+        + x25519_ephemeral_public
+        + x25519_recipient_public
+        + suite.encode("utf-8")
+        + domain
+        + bytes([len(domain)])
+    ).digest()
 
 
 def validate_private_key_password(password: Optional[str]) -> str:
@@ -370,7 +451,7 @@ def _parse_private_key_format_line(line: str) -> int:
         format_version = int(value)
     except ValueError as exc:
         raise InvalidKeyFormatError("Encrypted private-key PEM has malformed format metadata.") from exc
-    if format_version != cfg.PEM_PRIVATE_KEY_FORMAT_VERSION:
+    if format_version not in cfg.SUPPORTED_PRIVATE_KEY_FORMAT_VERSIONS:
         raise InvalidKeyFormatError("Encrypted private-key PEM uses an unsupported format version.")
     return format_version
 
@@ -501,13 +582,13 @@ def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Op
         else:
             logger.error("Encrypted private key is missing authenticated format metadata.")
             return None
-    elif format_version != cfg.PEM_PRIVATE_KEY_FORMAT_VERSION:
+    elif format_version not in cfg.SUPPORTED_PRIVATE_KEY_FORMAT_VERSIONS:
         logger.error("Encrypted private key uses unsupported format metadata.")
         return None
     else:
         metadata_format_version = format_version
     if not use_legacy_aad:
-        if not isinstance(kem_alg, str) or not is_allowed_kem_algorithm(kem_alg):
+        if not isinstance(kem_alg, str) or not is_allowed_key_algorithm(kem_alg):
             logger.error("Encrypted private key is missing or uses unsupported algorithm metadata.")
             return None
         metadata_kem_alg = kem_alg
@@ -559,9 +640,15 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
     if key_type not in ["public", "private"]:
         logger.error(f"Invalid key_type specified for saving: {key_type}")
         return None
-    if not is_allowed_kem_algorithm(kem_alg):
+    if not is_allowed_key_algorithm(kem_alg):
         logger.error("Unsupported KEM algorithm specified for PEM saving.")
         return None
+    if kem_alg == cfg.HYBRID_KEM_ALG:
+        try:
+            unpack_hybrid_key(key_bytes, key_type)
+        except InvalidKeyFormatError as exc:
+            logger.error(str(exc))
+            return None
 
     pem_data_lines = []
     dek_info = ""
@@ -707,7 +794,7 @@ def load_key_pem(
     if not kem_alg:
         logger.error("Algorithm not specified in PEM file.")
         return None, None, None
-    if not is_allowed_kem_algorithm(kem_alg):
+    if not is_allowed_key_algorithm(kem_alg):
         logger.error("Unsupported KEM algorithm in PEM file.")
         return None, None, None
     if not key_b64_lines:
@@ -754,6 +841,12 @@ def load_key_pem(
             return None, None, None
         else:
             logger.info(f"Successfully loaded and decrypted private key for algorithm {kem_alg}.")
+            if kem_alg == cfg.HYBRID_KEM_ALG:
+                try:
+                    unpack_hybrid_key(raw_key_bytes, "private")
+                except InvalidKeyFormatError as exc:
+                    logger.error(str(exc))
+                    return None, None, None
             # Drop local references to intermediate encrypted key material.
             del raw_or_encrypted_bytes
             del dek_parts
@@ -763,6 +856,12 @@ def load_key_pem(
         logger.error("Unencrypted private keys are rejected by the current security policy.")
         return None, None, None
     else:  # Public key
+        if kem_alg == cfg.HYBRID_KEM_ALG:
+            try:
+                unpack_hybrid_key(raw_or_encrypted_bytes, "public")
+            except InvalidKeyFormatError as exc:
+                logger.error(str(exc))
+                return None, None, None
         logger.info(f"Successfully loaded public key for algorithm {kem_alg}.")
         return raw_or_encrypted_bytes, kem_alg, key_type
 
@@ -803,7 +902,7 @@ def get_key_info_pem(pem_content: str) -> Tuple[Optional[str], Optional[str], bo
 
     if not kem_alg:
         return None, key_type, is_encrypted  # Algo missing
-    if not is_allowed_kem_algorithm(kem_alg):
+    if not is_allowed_key_algorithm(kem_alg):
         return None, key_type, is_encrypted
 
     return kem_alg, key_type, is_encrypted
@@ -858,7 +957,7 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
         magic, version = struct.unpack(cfg.HEADER_BASE_FORMAT, header_fixed_part)
         if magic != cfg.MAGIC_BYTES:
             raise FileFormatError("Invalid magic bytes.")
-        if version != cfg.FORMAT_VERSION:
+        if version not in cfg.SUPPORTED_FORMAT_VERSIONS:
             raise FileFormatError("Unsupported encrypted-file format version.")
 
         kem_alg_len_bytes = input_buffer.read(struct.calcsize(">H"))
@@ -875,8 +974,11 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
             kem_alg_from_file = kem_alg_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise FileFormatError("KEM algorithm name is not valid UTF-8.") from exc
-        if not is_allowed_kem_algorithm(kem_alg_from_file):
-            raise UnsupportedAlgorithmError("Unsupported KEM algorithm in encrypted file.")
+        if version == cfg.FORMAT_VERSION:
+            if kem_alg_from_file != cfg.HYBRID_KEM_ALG:
+                raise UnsupportedAlgorithmError("Version 4 requires the configured hybrid suite.")
+        elif not is_allowed_kem_algorithm(kem_alg_from_file):
+            raise UnsupportedAlgorithmError("Unsupported legacy KEM algorithm in encrypted file.")
 
         kem_ct_len_bytes = input_buffer.read(struct.calcsize(">I"))
         if len(kem_ct_len_bytes) < struct.calcsize(">I"):
@@ -888,6 +990,12 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
         ciphertext_kem = input_buffer.read(kem_ct_len)
         if len(ciphertext_kem) < kem_ct_len:
             raise FileFormatError("Truncated header (KEM CT).")
+
+        x25519_ephemeral_public = b""
+        if version == cfg.FORMAT_VERSION:
+            x25519_ephemeral_public = input_buffer.read(cfg.X25519_KEY_BYTES)
+            if len(x25519_ephemeral_public) < cfg.X25519_KEY_BYTES:
+                raise FileFormatError("Truncated header (X25519 ephemeral public key).")
 
         nonce = input_buffer.read(cfg.AES_NONCE_BYTES)
         if len(nonce) < cfg.AES_NONCE_BYTES:
@@ -905,6 +1013,7 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
             kem_alg=kem_alg_from_file,
             header_bytes=len(header_aad),
             kem_ciphertext_bytes=len(ciphertext_kem),
+            x25519_ciphertext_bytes=len(x25519_ephemeral_public),
             encrypted_payload_bytes=len(encrypted_data_aes),
             total_bytes=len(encrypted_blob),
         )
@@ -912,6 +1021,7 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
             metadata=metadata,
             header_aad=header_aad,
             ciphertext_kem=ciphertext_kem,
+            x25519_ephemeral_public=x25519_ephemeral_public,
             nonce=nonce,
             encrypted_data_aes=encrypted_data_aes,
         )
@@ -933,6 +1043,7 @@ def inspect_encrypted_file(encrypted_blob: bytes) -> Optional[Dict[str, Any]]:
             "kem": metadata.kem_alg,
             "header_bytes": metadata.header_bytes,
             "kem_ciphertext_bytes": metadata.kem_ciphertext_bytes,
+            "x25519_ciphertext_bytes": metadata.x25519_ciphertext_bytes,
             "encrypted_payload_bytes": metadata.encrypted_payload_bytes,
             "total_bytes": metadata.total_bytes,
         }
@@ -944,9 +1055,13 @@ def inspect_encrypted_file(encrypted_blob: bytes) -> Optional[Dict[str, Any]]:
 # --- File Encryption / Decryption ---
 
 
-def encrypt_file_pro(input_data: bytes, public_key_bytes: bytes, kem_alg: str = cfg.KEM_ALG) -> Optional[bytes]:
-    """Encrypts input data using PQC KEM + AES-GCM with defined file format."""
-    logger.info(f"Starting encryption with KEM: {kem_alg}")
+def encrypt_file_pro(
+    input_data: bytes,
+    public_key_bytes: bytes,
+    kem_alg: str = cfg.HYBRID_KEM_ALG,
+) -> Optional[bytes]:
+    """Encrypt data with ML-KEM-768 + X25519 and AES-256-GCM in a v4 container."""
+    logger.info("Starting encryption with suite: %s", kem_alg)
     if len(input_data) > cfg.MAX_FILE_BYTES:
         logger.error("Input data exceeds maximum supported size.")
         return None
@@ -954,61 +1069,72 @@ def encrypt_file_pro(input_data: bytes, public_key_bytes: bytes, kem_alg: str = 
         logger.warning("Input data for encryption is empty.")
         # Empty files are valid; the encrypted output still carries header metadata and an auth tag.
 
-    shared_secret_sender = None
+    mlkem_shared_secret = None
+    x25519_shared_secret = None
     aes_key = None
     output_buffer = io.BytesIO()
 
     try:
-        resolved_kem_alg = resolve_kem_algorithm(kem_alg)
+        if kem_alg != cfg.HYBRID_KEM_ALG:
+            raise UnsupportedAlgorithmError("New encryption requires the ML-KEM-768+X25519 suite.")
+
+        x25519_recipient_public_bytes, mlkem_public_key = unpack_hybrid_key(public_key_bytes, "public")
+        x25519_recipient_public = x25519.X25519PublicKey.from_public_bytes(x25519_recipient_public_bytes)
+
+        resolved_kem_alg = resolve_kem_algorithm(cfg.KEM_ALG)
         oqs_module = _require_oqs()
         with oqs_module.KeyEncapsulation(resolved_kem_alg) as kem:
             expected_public_key_len = kem.details.get("length_public_key")
-            if expected_public_key_len and len(public_key_bytes) != expected_public_key_len:
-                logger.error("Recipient public key length does not match the selected KEM algorithm.")
+            if expected_public_key_len and len(mlkem_public_key) != expected_public_key_len:
+                logger.error("Recipient ML-KEM public key length does not match the selected suite.")
                 return None
 
-            # 1. KEM Encapsulation
-            ciphertext_kem, shared_secret_sender = kem.encap_secret(public_key_bytes)
+            ciphertext_kem, mlkem_shared_secret = kem.encap_secret(mlkem_public_key)
             expected_ciphertext_len = kem.details.get("length_ciphertext")
             if expected_ciphertext_len and len(ciphertext_kem) != expected_ciphertext_len:
                 logger.error("KEM encapsulation produced an unexpected ciphertext length.")
                 return None
 
-            # 2. Derive AES Key securely
-            aes_key = derive_symmetric_key_hkdf(shared_secret_sender)
-            # Drop the local shared-secret reference. Python bytes are not securely zeroized.
-            shared_secret_sender = None
+        x25519_ephemeral_private = x25519.X25519PrivateKey.generate()
+        x25519_ephemeral_public = x25519_ephemeral_private.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        x25519_shared_secret = x25519_ephemeral_private.exchange(x25519_recipient_public)
+        aes_key = derive_hybrid_symmetric_key(
+            mlkem_shared_secret,
+            x25519_shared_secret,
+            x25519_ephemeral_public,
+            x25519_recipient_public_bytes,
+            kem_alg,
+        )
+        mlkem_shared_secret = None
+        x25519_shared_secret = None
 
-            # 3. Generate Nonce
-            nonce = os.urandom(cfg.AES_NONCE_BYTES)
+        nonce = os.urandom(cfg.AES_NONCE_BYTES)
 
-            # 4. Construct File Header
-            kem_alg_bytes = resolved_kem_alg.encode("utf-8")
-            if len(kem_alg_bytes) > cfg.MAX_KEM_ALG_NAME_BYTES:
-                logger.error("KEM algorithm name is too long for this file format.")
-                return None
-            # Pack fixed part
-            output_buffer.write(struct.pack(cfg.HEADER_BASE_FORMAT, cfg.MAGIC_BYTES, cfg.FORMAT_VERSION))
-            # Pack variable parts: Algo Len, Algo, CT Len, CT, Nonce
-            # Use explicit packing formats for clarity
-            output_buffer.write(struct.pack(">H", len(kem_alg_bytes)))  # Algo name len (ushort)
-            output_buffer.write(kem_alg_bytes)
-            output_buffer.write(struct.pack(">I", len(ciphertext_kem)))  # KEM CT len (uint)
-            output_buffer.write(ciphertext_kem)
-            output_buffer.write(nonce)  # Nonce (fixed size defined in cfg)
+        suite_bytes = kem_alg.encode("utf-8")
+        if len(suite_bytes) > cfg.MAX_KEM_ALG_NAME_BYTES:
+            logger.error("Hybrid suite name is too long for this file format.")
+            return None
+        output_buffer.write(struct.pack(cfg.HEADER_BASE_FORMAT, cfg.MAGIC_BYTES, cfg.FORMAT_VERSION))
+        output_buffer.write(struct.pack(">H", len(suite_bytes)))
+        output_buffer.write(suite_bytes)
+        output_buffer.write(struct.pack(">I", len(ciphertext_kem)))
+        output_buffer.write(ciphertext_kem)
+        output_buffer.write(x25519_ephemeral_public)
+        output_buffer.write(nonce)
 
-            header_aad = output_buffer.getvalue()
+        header_aad = output_buffer.getvalue()
 
-            # 5. AES-GCM Encryption. The full header is AAD so metadata tampering fails auth.
-            aesgcm = AESGCM(aes_key)
-            encrypted_data_aes = aesgcm.encrypt(nonce, input_data, header_aad)
+        aesgcm = AESGCM(aes_key)
+        encrypted_data_aes = aesgcm.encrypt(nonce, input_data, header_aad)
 
-            # 6. Append Encrypted Data
-            output_buffer.write(encrypted_data_aes)
+        output_buffer.write(encrypted_data_aes)
 
-            encrypted_blob = output_buffer.getvalue()
-            logger.info(f"Encryption successful. Output size: {len(encrypted_blob)} bytes.")
-            return encrypted_blob
+        encrypted_blob = output_buffer.getvalue()
+        logger.info("Encryption successful. Output size: %s bytes.", len(encrypted_blob))
+        return encrypted_blob
 
     except CryptoDependencyError as e:
         logger.error(str(e))
@@ -1021,14 +1147,15 @@ def encrypt_file_pro(input_data: bytes, public_key_bytes: bytes, kem_alg: str = 
         return None
     except Exception as e:
         if oqs is not None and isinstance(e, getattr(oqs, "MechanismNotEnabledError", ())):
-            logger.error(f"KEM algorithm '{kem_alg}' is not enabled during encryption.")
+            logger.error("ML-KEM is not enabled during encryption.")
             return None
         logger.exception(f"Unexpected error during encryption: {e}")
         return None
     finally:
         # Drop local references. Python bytes are not securely zeroized by reassignment/deletion.
         del aes_key
-        del shared_secret_sender
+        del mlkem_shared_secret
+        del x25519_shared_secret
         if "ciphertext_kem" in locals():
             del ciphertext_kem
         if "nonce" in locals():
@@ -1045,9 +1172,10 @@ def decrypt_file_pro(
     secret_key_bytes: bytes,
     expected_kem_alg: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
-    """Decrypts data using PQC KEM + AES-GCM and defined file format."""
+    """Decrypt v4 hybrid containers and authenticated legacy v3 containers."""
     logger.info("Starting decryption process.")
-    shared_secret_receiver = None
+    mlkem_shared_secret = None
+    x25519_shared_secret = None
     aes_key = None
     kem_alg_from_file = None
 
@@ -1061,13 +1189,24 @@ def decrypt_file_pro(
             logger.error("Private key algorithm does not match encrypted file algorithm.")
             return None, kem_alg_from_file
 
-        # 3. KEM Decapsulation
-        logger.debug(f"Performing KEM decapsulation with {kem_alg_from_file}...")
+        if parts.metadata.version == cfg.FORMAT_VERSION:
+            x25519_private_bytes, mlkem_private_key = unpack_hybrid_key(secret_key_bytes, "private")
+            x25519_private_key = x25519.X25519PrivateKey.from_private_bytes(x25519_private_bytes)
+            x25519_recipient_public = x25519_private_key.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            x25519_ephemeral_public = x25519.X25519PublicKey.from_public_bytes(parts.x25519_ephemeral_public)
+            x25519_shared_secret = x25519_private_key.exchange(x25519_ephemeral_public)
+            resolved_kem_alg = resolve_kem_algorithm(cfg.KEM_ALG)
+        else:
+            mlkem_private_key = secret_key_bytes
+            resolved_kem_alg = resolve_kem_algorithm(kem_alg_from_file)
+
+        logger.debug("Performing ML-KEM decapsulation with %s...", resolved_kem_alg)
         oqs_module = _require_oqs()
-        resolved_kem_alg = resolve_kem_algorithm(kem_alg_from_file)
         with oqs_module.KeyEncapsulation(resolved_kem_alg) as kem:
-            # Verify secret key length matches the algorithm expectation?
-            if len(secret_key_bytes) != kem.details["length_secret_key"]:
+            if len(mlkem_private_key) != kem.details["length_secret_key"]:
                 logger.error("Provided secret key length does not match the encrypted file's KEM algorithm.")
                 return None, kem_alg_from_file
             expected_ciphertext_len = kem.details.get("length_ciphertext")
@@ -1075,18 +1214,28 @@ def decrypt_file_pro(
                 logger.error("KEM ciphertext length does not match the encrypted file's KEM algorithm.")
                 return None, kem_alg_from_file
 
-            shared_secret_receiver = _decapsulate_shared_secret(
+            mlkem_shared_secret = _decapsulate_shared_secret(
                 oqs_module,
                 resolved_kem_alg,
-                secret_key_bytes,
+                mlkem_private_key,
                 parts.ciphertext_kem,
             )
             logger.debug("KEM decapsulation successful.")
 
-        # 4. Derive AES Key securely
-        aes_key = derive_symmetric_key_hkdf(shared_secret_receiver)
-        # Drop the local shared-secret reference. Python bytes are not securely zeroized.
-        shared_secret_receiver = None
+        if parts.metadata.version == cfg.FORMAT_VERSION:
+            if x25519_shared_secret is None:
+                raise CryptoCoreError("X25519 key establishment did not produce a shared secret.")
+            aes_key = derive_hybrid_symmetric_key(
+                mlkem_shared_secret,
+                x25519_shared_secret,
+                parts.x25519_ephemeral_public,
+                x25519_recipient_public,
+                kem_alg_from_file,
+            )
+        else:
+            aes_key = derive_symmetric_key_hkdf(mlkem_shared_secret)
+        mlkem_shared_secret = None
+        x25519_shared_secret = None
 
         # 5. AES-GCM Decryption
         logger.debug("Performing AES-GCM decryption...")
@@ -1103,7 +1252,7 @@ def decrypt_file_pro(
             logger.exception(f"AES-GCM decryption failed unexpectedly: {e_aes}")
             return None, kem_alg_from_file
 
-    except (FileFormatError, UnsupportedAlgorithmError, SizeLimitError) as e_val:
+    except (FileFormatError, InvalidKeyFormatError, UnsupportedAlgorithmError, SizeLimitError, ValueError) as e_val:
         logger.error(f"Invalid or truncated file header: {e_val}")
         return None, kem_alg_from_file
     except CryptoDependencyError as e:
@@ -1118,6 +1267,7 @@ def decrypt_file_pro(
     finally:
         # Drop local references. Python bytes are not securely zeroized by reassignment/deletion.
         del aes_key
-        del shared_secret_receiver
+        del mlkem_shared_secret
+        del x25519_shared_secret
         if "parts" in locals():
             del parts

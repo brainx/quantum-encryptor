@@ -4,6 +4,18 @@ All notable changes to this project will be documented here.
 
 This project follows a practical semantic-versioning style.
 
+## [Unreleased]
+
+### Added
+
+- ML-KEM-768 + X25519 composite key generation and format-v4 encrypted containers.
+- SHA3-256 hybrid key combiner binding both key shares, X25519 context, suite identifier, and application domain.
+
+### Security
+
+- New encryption requires composite public keys and cannot silently downgrade to the legacy single-KEM format.
+- Authenticated format-v3 containers and v2 ML-KEM private keys remain decrypt-only for migration.
+
 ## [1.0.1] - 2026-06-21
 
 ### Added

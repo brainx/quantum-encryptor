@@ -3,10 +3,15 @@ Unit tests for crypto_core module functionality.
 """
 
 import base64
+import hashlib
 import os
 import struct
 import pytest
 from typing import Tuple
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Import module to test
 from crypto_config import cfg
@@ -22,11 +27,14 @@ def _encrypted_blob_offsets(encrypted_data: bytes) -> dict[str, int]:
     kem_ct_len_offset = alg_offset + alg_len
     kem_ct_len = struct.unpack(">I", encrypted_data[kem_ct_len_offset : kem_ct_len_offset + 4])[0]
     kem_ct_offset = kem_ct_len_offset + 4
-    nonce_offset = kem_ct_offset + kem_ct_len
+    version = struct.unpack(">H", encrypted_data[len(cfg.MAGIC_BYTES) : fixed_header_size])[0]
+    x25519_offset = kem_ct_offset + kem_ct_len
+    nonce_offset = x25519_offset + (cfg.X25519_KEY_BYTES if version == cfg.FORMAT_VERSION else 0)
     payload_offset = nonce_offset + cfg.AES_NONCE_BYTES
     return {
         "version": len(cfg.MAGIC_BYTES),
         "kem_ct": kem_ct_offset,
+        "x25519_ct": x25519_offset,
         "nonce": nonce_offset,
         "payload": payload_offset,
         "tag": len(encrypted_data) - 1,
@@ -40,7 +48,8 @@ def _tamper(data: bytes, offset: int) -> bytes:
 
 
 def _syntactic_encrypted_blob(version: int = cfg.FORMAT_VERSION) -> bytes:
-    alg = cfg.KEM_ALG.encode("utf-8")
+    alg = (cfg.HYBRID_KEM_ALG if version == 4 else cfg.KEM_ALG).encode("utf-8")
+    x25519_ciphertext = b"X" * cfg.X25519_KEY_BYTES if version == 4 else b""
     return (
         cfg.MAGIC_BYTES
         + version.to_bytes(2, "big")
@@ -48,9 +57,89 @@ def _syntactic_encrypted_blob(version: int = cfg.FORMAT_VERSION) -> bytes:
         + alg
         + (1).to_bytes(4, "big")
         + b"x"
+        + x25519_ciphertext
         + os.urandom(cfg.AES_NONCE_BYTES)
         + b"ciphertext-and-tag"
     )
+
+
+def _fake_hybrid_keys() -> tuple[bytes, bytes, bytes, bytes]:
+    """Return matching composite keys plus their ML-KEM components for fake-backend tests."""
+    mlkem_private = b"M" * 32
+    mlkem_public = hashlib.sha256(mlkem_private).digest()
+    x25519_private_key = x25519.X25519PrivateKey.generate()
+    x25519_private = x25519_private_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    )
+    x25519_public = x25519_private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    return (
+        core.pack_hybrid_key(x25519_public, mlkem_public),
+        core.pack_hybrid_key(x25519_private, mlkem_private),
+        mlkem_public,
+        mlkem_private,
+    )
+
+
+@pytest.fixture
+def fake_oqs_backend(monkeypatch):
+    """Provide deterministic KEM behavior without requiring a native liboqs installation."""
+
+    class FakeKEM:
+        def __init__(self, algorithm, secret_key=None):
+            assert algorithm in {cfg.KEM_ALG, "Kyber768"}
+            self.secret_key = secret_key
+            self.details = {
+                "length_public_key": 32,
+                "length_secret_key": 32,
+                "length_ciphertext": 32,
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            return None
+
+        def encap_secret(self, public_key):
+            ciphertext = b"C" * 32
+            return ciphertext, hashlib.sha256(b"mlkem-share" + public_key + ciphertext).digest()
+
+        def decap_secret(self, ciphertext):
+            public_key = hashlib.sha256(self.secret_key).digest()
+            return hashlib.sha256(b"mlkem-share" + public_key + ciphertext).digest()
+
+    class FakeOQS:
+        KeyEncapsulation = FakeKEM
+
+        @staticmethod
+        def get_enabled_kem_mechanisms():
+            return [cfg.KEM_ALG]
+
+    monkeypatch.setattr(core, "oqs", FakeOQS)
+    return FakeOQS
+
+
+def _legacy_v3_blob(plaintext: bytes, mlkem_public: bytes) -> bytes:
+    """Build a valid legacy v3 container using the deterministic fake backend."""
+    ciphertext_kem = b"C" * 32
+    shared_secret = hashlib.sha256(b"mlkem-share" + mlkem_public + ciphertext_kem).digest()
+    aes_key = core.derive_symmetric_key_hkdf(shared_secret)
+    algorithm = cfg.KEM_ALG.encode("utf-8")
+    nonce = b"N" * cfg.AES_NONCE_BYTES
+    header = (
+        struct.pack(cfg.HEADER_BASE_FORMAT, cfg.MAGIC_BYTES, 3)
+        + struct.pack(">H", len(algorithm))
+        + algorithm
+        + struct.pack(">I", len(ciphertext_kem))
+        + ciphertext_kem
+        + nonce
+    )
+    return header + AESGCM(aes_key).encrypt(nonce, plaintext, header)
 
 
 # Test fixtures
@@ -67,6 +156,15 @@ def kem_algorithm():
 def key_pair(kem_algorithm) -> Tuple[bytes, bytes]:
     """Generate a test key pair."""
     public_key, private_key = core.generate_oqs_keys(kem_algorithm)
+    assert public_key is not None
+    assert private_key is not None
+    return public_key, private_key
+
+
+@pytest.fixture
+def hybrid_key_pair(kem_algorithm) -> Tuple[bytes, bytes]:
+    """Generate an ML-KEM-768 + X25519 composite key pair."""
+    public_key, private_key = core.generate_hybrid_keys(kem_algorithm)
     assert public_key is not None
     assert private_key is not None
     return public_key, private_key
@@ -150,6 +248,31 @@ class TestKeyGeneration:
         public_key, private_key = core.generate_oqs_keys("InvalidAlgorithm")
         assert public_key is None
         assert private_key is None
+
+    def test_generate_hybrid_keys_combines_independent_x25519_and_ml_kem_keys(self, monkeypatch):
+        """Composite keys contain independently generated X25519 and ML-KEM components."""
+        monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: (b"mlkem-public", b"mlkem-private"))
+
+        public_key, private_key = core.generate_hybrid_keys(cfg.KEM_ALG)
+
+        assert public_key is not None
+        assert private_key is not None
+        x25519_public, mlkem_public = core.unpack_hybrid_key(public_key, "public")
+        x25519_private, mlkem_private = core.unpack_hybrid_key(private_key, "private")
+        derived_public = (
+            x25519.X25519PrivateKey.from_private_bytes(x25519_private)
+            .public_key()
+            .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        )
+        assert derived_public == x25519_public
+        assert mlkem_public == b"mlkem-public"
+        assert mlkem_private == b"mlkem-private"
+
+    @pytest.mark.parametrize("key_type", ["public", "private"])
+    def test_unpack_hybrid_key_rejects_missing_component(self, key_type):
+        """Composite keys fail closed unless both components are present."""
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.unpack_hybrid_key(b"x" * cfg.X25519_KEY_BYTES, key_type)
 
     def test_resolve_invalid_algorithm_raises_typed_error(self):
         """Unsupported KEM names raise the typed core exception."""
@@ -304,6 +427,25 @@ class TestKeyDerivation:
         assert isinstance(derived_key, bytes)
         assert len(derived_key) == cfg.AES_KEY_BYTES
 
+    def test_hybrid_combiner_matches_stable_reference_vector(self):
+        """The v4 combiner is deterministic and binds both shares plus X25519 context."""
+        mlkem_share = bytes(range(32))
+        x25519_share = bytes(range(32, 64))
+        ephemeral_public = b"E" * cfg.X25519_KEY_BYTES
+        recipient_public = b"R" * cfg.X25519_KEY_BYTES
+        expected = bytes.fromhex("e36c7ca1c6e4da6fd77989e52b576558d9fe5b6ef72fa119964bd8b3a8b3b298")
+
+        combined = core.derive_hybrid_symmetric_key(
+            mlkem_share,
+            x25519_share,
+            ephemeral_public,
+            recipient_public,
+            cfg.HYBRID_KEM_ALG,
+        )
+
+        assert combined == expected
+        assert len(combined) == cfg.AES_KEY_BYTES
+
     def test_derive_key_from_password(self):
         """Test password-based key derivation."""
         test_password = "secure-test-password"
@@ -443,8 +585,8 @@ class TestPEMKeyFormat:
 
         assert loaded_key_wrong is None  # Decryption failed
 
-    def test_save_load_private_key_pem_v2_with_authenticated_metadata(self):
-        """Private-key PEM v2 authenticates metadata and round-trips."""
+    def test_save_load_current_private_key_pem_with_authenticated_metadata(self):
+        """The current private-key PEM envelope authenticates metadata and round-trips."""
         password = "river metal orbit cactus 47"
         raw_private_key = b"private-key-bytes"
 
@@ -456,6 +598,61 @@ class TestPEMKeyFormat:
         assert loaded_key == raw_private_key
         assert loaded_alg == cfg.KEM_ALG
         assert loaded_type == "private"
+
+    def test_save_load_hybrid_key_pem_uses_v3_authenticated_envelope(self):
+        """New composite keys use the authenticated v3 private-key envelope."""
+        password = "river metal orbit cactus 47"
+        raw_public_key = core.pack_hybrid_key(b"P" * cfg.X25519_KEY_BYTES, b"mlkem-public")
+        raw_private_key = core.pack_hybrid_key(b"S" * cfg.X25519_KEY_BYTES, b"mlkem-private")
+
+        public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
+        private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
+
+        assert cfg.PEM_PRIVATE_KEY_FORMAT_VERSION == 3
+        assert public_pem is not None
+        assert private_pem is not None
+        assert f"{cfg.PEM_ALGORITHM_HEADER}{cfg.HYBRID_KEM_ALG}" in public_pem
+        assert f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}3" in private_pem
+        assert core.load_key_pem(public_pem) == (raw_public_key, cfg.HYBRID_KEM_ALG, "public")
+        assert core.load_key_pem(private_pem, password=password) == (
+            raw_private_key,
+            cfg.HYBRID_KEM_ALG,
+            "private",
+        )
+
+        tampered = private_pem.replace(
+            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.HYBRID_KEM_ALG}",
+            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+        )
+        assert core.load_key_pem(tampered, password=password) == (None, None, None)
+
+    def test_hybrid_pem_rejects_payload_missing_ml_kem_component(self):
+        """PEM serialization cannot bless a partial composite key as valid."""
+        partial_key = b"X" * cfg.X25519_KEY_BYTES
+        encoded = base64.b64encode(partial_key).decode("ascii")
+        malformed_public_pem = "\n".join(
+            [
+                cfg.PEM_PUBLIC_HEADER,
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.HYBRID_KEM_ALG}",
+                encoded,
+                cfg.PEM_PUBLIC_FOOTER,
+            ]
+        )
+
+        assert core.save_key_pem(partial_key, cfg.HYBRID_KEM_ALG, "public") is None
+        assert core.load_key_pem(malformed_public_pem) == (None, None, None)
+
+    def test_load_key_pem_accepts_authenticated_v2_private_key_for_legacy_decryption(self, monkeypatch):
+        """Authenticated v2 ML-KEM private keys remain usable for decrypting v3 containers."""
+        password = "river metal orbit cactus 47"
+        monkeypatch.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 2)
+        legacy_pem = core.save_key_pem(b"legacy-private", cfg.KEM_ALG, "private", password=password)
+        assert legacy_pem is not None
+
+        monkeypatch.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 3)
+        loaded = core.load_key_pem(legacy_pem, password=password)
+
+        assert loaded == (b"legacy-private", cfg.KEM_ALG, "private")
 
     def test_load_key_pem_rejects_oversized_public_key_payload(self, monkeypatch):
         """Decoded PEM key payloads are capped before acceptance."""
@@ -694,10 +891,84 @@ class TestPEMKeyFormat:
 class TestFileEncryption:
     """Tests for file encryption/decryption."""
 
-    def test_encrypt_decrypt_file(self, key_pair, kem_algorithm):
+    def test_hybrid_v4_roundtrip_uses_both_key_establishment_components(self, fake_oqs_backend):
+        """New encryption emits v4 and requires matching ML-KEM and X25519 private components."""
+        public_key, private_key, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
+
+        encrypted_data = core.encrypt_file_pro(b"hybrid authenticated data", public_key, cfg.HYBRID_KEM_ALG)
+
+        assert encrypted_data is not None
+        metadata = core.inspect_encrypted_file_strict(encrypted_data)
+        assert metadata.version == 4
+        assert metadata.kem_alg == cfg.HYBRID_KEM_ALG
+        assert metadata.kem_ciphertext_bytes == 32
+        assert metadata.x25519_ciphertext_bytes == cfg.X25519_KEY_BYTES
+        assert core.decrypt_file_pro(
+            encrypted_data,
+            private_key,
+            expected_kem_alg=cfg.HYBRID_KEM_ALG,
+        ) == (b"hybrid authenticated data", cfg.HYBRID_KEM_ALG)
+
+        _wrong_public, wrong_private, _wrong_mlkem_public, _wrong_mlkem_private = _fake_hybrid_keys()
+        wrong_x25519_private, _ = core.unpack_hybrid_key(wrong_private, "private")
+        _correct_x25519_private, correct_mlkem_private = core.unpack_hybrid_key(private_key, "private")
+        mixed_private = core.pack_hybrid_key(wrong_x25519_private, correct_mlkem_private)
+        assert (
+            core.decrypt_file_pro(
+                encrypted_data,
+                mixed_private,
+                expected_kem_alg=cfg.HYBRID_KEM_ALG,
+            )[0]
+            is None
+        )
+
+    def test_hybrid_v4_rejects_wrong_ml_kem_component(self, fake_oqs_backend):
+        """A matching X25519 key cannot compensate for the wrong ML-KEM private component."""
+        public_key, private_key, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
+        encrypted_data = core.encrypt_file_pro(b"two component secret", public_key, cfg.HYBRID_KEM_ALG)
+        assert encrypted_data is not None
+
+        x25519_private, _correct_mlkem_private = core.unpack_hybrid_key(private_key, "private")
+        wrong_private = core.pack_hybrid_key(x25519_private, b"W" * 32)
+
+        assert (
+            core.decrypt_file_pro(
+                encrypted_data,
+                wrong_private,
+                expected_kem_alg=cfg.HYBRID_KEM_ALG,
+            )[0]
+            is None
+        )
+
+    def test_encrypt_refuses_legacy_v3_but_decrypt_accepts_authenticated_v3(self, fake_oqs_backend):
+        """Legacy containers are decrypt-only so encryption cannot silently downgrade."""
+        public_key, _private_key, mlkem_public, mlkem_private = _fake_hybrid_keys()
+        legacy_blob = _legacy_v3_blob(b"legacy plaintext", mlkem_public)
+
+        assert core.encrypt_file_pro(b"new plaintext", public_key, cfg.KEM_ALG) is None
+        assert core.decrypt_file_pro(
+            legacy_blob,
+            mlkem_private,
+            expected_kem_alg=cfg.KEM_ALG,
+        ) == (b"legacy plaintext", cfg.KEM_ALG)
+
+    def test_hybrid_v4_rejects_suite_downgrade_before_backend_use(self, monkeypatch):
+        """A v4 container cannot relabel itself as the legacy single-KEM suite."""
+        downgraded = _syntactic_encrypted_blob(version=4).replace(
+            cfg.HYBRID_KEM_ALG.encode("utf-8"),
+            cfg.KEM_ALG.encode("utf-8").ljust(len(cfg.HYBRID_KEM_ALG), b" "),
+        )
+        monkeypatch.setattr(core, "_require_oqs", lambda: pytest.fail("backend must not be reached"))
+
+        decrypted, detected = core.decrypt_file_pro(downgraded, b"not-a-key")
+
+        assert decrypted is None
+        assert detected is None
+
+    def test_encrypt_decrypt_file(self, hybrid_key_pair):
         """Test encrypting and decrypting a file."""
-        public_key, private_key = key_pair
-        kem_alg = kem_algorithm
+        public_key, private_key = hybrid_key_pair
+        kem_alg = cfg.HYBRID_KEM_ALG
 
         # Test data
         test_data = b"This is test data to encrypt and decrypt."
@@ -714,25 +985,25 @@ class TestFileEncryption:
         assert decrypted_data == test_data
         assert detected_alg == kem_alg
 
-    def test_encrypt_decrypt_empty_file(self, key_pair, kem_algorithm):
+    def test_encrypt_decrypt_empty_file(self, hybrid_key_pair):
         """Empty file content still round trips with authenticated metadata."""
-        public_key, private_key = key_pair
+        public_key, private_key = hybrid_key_pair
 
-        encrypted_data = core.encrypt_file_pro(b"", public_key, kem_algorithm)
+        encrypted_data = core.encrypt_file_pro(b"", public_key, cfg.HYBRID_KEM_ALG)
         assert encrypted_data is not None
 
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_data, private_key)
 
         assert decrypted_data == b""
-        assert detected_alg == kem_algorithm
+        assert detected_alg == cfg.HYBRID_KEM_ALG
 
-    def test_decrypt_with_wrong_key(self, key_pair, kem_algorithm):
+    def test_decrypt_with_wrong_key(self, hybrid_key_pair, kem_algorithm):
         """Test decrypting with wrong private key."""
-        public_key, _ = key_pair
-        kem_alg = kem_algorithm
+        public_key, _ = hybrid_key_pair
+        kem_alg = cfg.HYBRID_KEM_ALG
 
         # Generate a different key pair
-        _, wrong_private_key = core.generate_oqs_keys(kem_alg)
+        _, wrong_private_key = core.generate_hybrid_keys(kem_algorithm)
 
         # Test data
         test_data = b"This is test data to encrypt and decrypt."
@@ -746,11 +1017,11 @@ class TestFileEncryption:
         # Should fail to decrypt
         assert decrypted_data is None
 
-    @pytest.mark.parametrize("field", ["version", "kem_ct", "nonce", "payload", "tag"])
-    def test_decrypt_rejects_tampered_encrypted_blob(self, key_pair, kem_algorithm, field):
+    @pytest.mark.parametrize("field", ["version", "kem_ct", "x25519_ct", "nonce", "payload", "tag"])
+    def test_decrypt_rejects_tampered_encrypted_blob(self, hybrid_key_pair, field):
         """Tampering with authenticated header or ciphertext fields fails decryption."""
-        public_key, private_key = key_pair
-        encrypted_data = core.encrypt_file_pro(b"authenticated test data", public_key, kem_algorithm)
+        public_key, private_key = hybrid_key_pair
+        encrypted_data = core.encrypt_file_pro(b"authenticated test data", public_key, cfg.HYBRID_KEM_ALG)
         assert encrypted_data is not None
         offsets = _encrypted_blob_offsets(encrypted_data)
 
@@ -786,7 +1057,7 @@ class TestFileEncryption:
         )
 
         assert decrypted_data is None
-        assert detected_alg == cfg.KEM_ALG
+        assert detected_alg == cfg.HYBRID_KEM_ALG
 
     def test_canonical_kem_algorithm_treats_kyber768_as_ml_kem_768(self):
         """Configured ML-KEM/Kyber aliases remain compatible."""
@@ -809,8 +1080,9 @@ class TestFileEncryption:
         metadata = core.inspect_encrypted_file_strict(_syntactic_encrypted_blob())
 
         assert metadata.version == cfg.FORMAT_VERSION
-        assert metadata.kem_alg == cfg.KEM_ALG
+        assert metadata.kem_alg == cfg.HYBRID_KEM_ALG
         assert metadata.kem_ciphertext_bytes == 1
+        assert metadata.x25519_ciphertext_bytes == cfg.X25519_KEY_BYTES
 
     def test_inspect_encrypted_file_rejects_payload_shorter_than_gcm_tag(self):
         """A container cannot authenticate when its AES section lacks a full GCM tag."""

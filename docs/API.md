@@ -47,8 +47,8 @@ Successful command output:
 {
   "ok": true,
   "operation": "encrypt",
-  "format_version": 3,
-  "kem": "ML-KEM-768",
+  "format_version": 4,
+  "kem": "ML-KEM-768+X25519",
   "output": "data/plain.pqc"
 }
 ```
@@ -74,6 +74,15 @@ Exit codes:
 - `5`: workspace path boundary violation
 
 ### Key Generation
+
+New application keys are composite payloads with fixed-width X25519 material followed by ML-KEM material. The component key pairs are generated independently.
+
+```python
+def generate_hybrid_keys(kem_alg: str = cfg.KEM_ALG) -> Tuple[Optional[bytes], Optional[bytes]]:
+    """Generate independent X25519 and ML-KEM key pairs and return composite key payloads."""
+```
+
+`generate_oqs_keys` remains the low-level ML-KEM component generator used by `generate_hybrid_keys` and legacy compatibility code.
 
 ```python
 def generate_oqs_keys(kem_alg: str = cfg.KEM_ALG) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -125,6 +134,19 @@ def is_kem_available(kem_alg: Optional[str] = None) -> bool:
 ### Key Derivation
 
 ```python
+def derive_hybrid_symmetric_key(
+    mlkem_shared_secret: bytes,
+    x25519_shared_secret: bytes,
+    x25519_ephemeral_public: bytes,
+    x25519_recipient_public: bytes,
+    suite: str = cfg.HYBRID_KEM_ALG,
+) -> bytes:
+    """Combine ML-KEM and X25519 shares using an RFC 9980-inspired binding pattern."""
+```
+
+The SHA3-256 input binds both shared secrets, the ephemeral and recipient X25519 public keys, the suite identifier, and the `QuantumEncryptorCompositeKDFv1` domain separator.
+
+```python
 def derive_symmetric_key_hkdf(shared_secret: bytes) -> bytes:
     """
     Derives AES key from KEM shared secret using HKDF-SHA256.
@@ -157,7 +179,7 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
 
 ### Private Key Encryption/Decryption
 
-Encrypted private-key PEM files use format version 2 metadata. The AES-GCM tag authenticates the private-key format version, KEM algorithm, scrypt KDF name and parameters, salt, and nonce as associated data. Salt and nonce are serialized as base64 in the PEM text but represented as bytes in `PrivateKeyPemMetadata`.
+New encrypted private-key PEM files use format version 3 metadata. The AES-GCM tag authenticates the private-key format version, hybrid suite, scrypt KDF name and parameters, salt, and nonce as associated data. Authenticated format-v2 ML-KEM private keys remain loadable for legacy v3 decryption. Salt and nonce are serialized as base64 in the PEM text but represented as bytes in `PrivateKeyPemMetadata`.
 
 ```python
 @dataclass(frozen=True)
@@ -219,7 +241,7 @@ def save_key_pem(
 ) -> Optional[str]:
     """
     Saves key data (raw bytes) in PEM format. Private keys require password protection
-    and include PQC-Key-Format: 2 metadata.
+    and include PQC-Key-Format: 3 metadata.
     
     Args:
         key_bytes: Raw key bytes to save.
@@ -239,7 +261,7 @@ def load_key_pem(
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
     Loads key data from PEM string. Private-key PEMs must be encrypted with
-    PQC-Key-Format: 2 and the required authenticated scrypt metadata.
+    PQC-Key-Format: 3 or authenticated legacy version 2 and the required scrypt metadata.
     
     Args:
         pem_content: The PEM-formatted key data.
@@ -257,22 +279,22 @@ def load_key_pem(
 def encrypt_file_pro(
     input_data: bytes,
     public_key_bytes: bytes,
-    kem_alg: str = cfg.KEM_ALG
+    kem_alg: str = cfg.HYBRID_KEM_ALG
 ) -> Optional[bytes]:
     """
-    Encrypts file data using KEM+DEM hybrid encryption.
+    Encrypts file data using ML-KEM-768 + X25519 and AES-256-GCM.
     
     Args:
         input_data: Raw file bytes to encrypt.
         public_key_bytes: Recipient's public key bytes.
-        kem_alg: The KEM algorithm to use.
+        kem_alg: Must be the configured hybrid suite.
         
     Returns:
         Encrypted file bytes, or None on error.
     """
 ```
 
-`encrypt_file_pro` rejects plaintext inputs larger than `cfg.MAX_FILE_BYTES`. Format version 3 authenticates the full encrypted-file header as AES-GCM associated data.
+`encrypt_file_pro` rejects plaintext inputs larger than `cfg.MAX_FILE_BYTES`, refuses legacy single-KEM public keys, and emits format version 4. The complete header—including the ML-KEM ciphertext and ephemeral X25519 public key—is AES-GCM associated data.
 
 ```python
 def decrypt_file_pro(
@@ -281,7 +303,7 @@ def decrypt_file_pro(
     expected_kem_alg: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
-    Decrypts file data using KEM+DEM hybrid decryption.
+    Decrypts hybrid v4 files and authenticated legacy v3 files.
     
     Args:
         encrypted_data: Encrypted file bytes.
@@ -295,7 +317,7 @@ def decrypt_file_pro(
     """
 ```
 
-Only format version 3 encrypted containers are accepted. Older file formats are rejected.
+Format version 4 is the only encryption format. Authenticated format version 3 remains decrypt-only; older formats are rejected.
 
 ```python
 def inspect_encrypted_file_strict(encrypted_blob: bytes) -> EncryptedFileMetadata:
@@ -311,6 +333,7 @@ The `crypto_config` module provides configuration constants used by the cryptogr
 ### Important Constants
 
 - `KEM_ALG`: The post-quantum KEM algorithm used (default: "ML-KEM-768")
+- `HYBRID_KEM_ALG`: The required new key/encryption suite (`ML-KEM-768+X25519`)
 - `ALLOWED_KEM_ALGS`: Accepted KEM identifiers (`ML-KEM-768` and legacy `Kyber768`)
 - `AES_KEY_BYTES`: Size of AES key in bytes (32 for AES-256)
 - `PRIVATE_KEY_MIN_PASSWORD_CHARS`: Minimum private-key password length
@@ -332,13 +355,18 @@ The `crypto_config` module provides configuration constants used by the cryptogr
 from crypto_config import cfg
 import crypto_core as core
 
-# Generate key pair
+# Generate independent composite key pair
 kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
-public_key, private_key = core.generate_oqs_keys(kem_alg)
+public_key, private_key = core.generate_hybrid_keys(kem_alg)
 
 # Save keys in PEM format
-public_pem = core.save_key_pem(public_key, kem_alg, "public")
-private_pem = core.save_key_pem(private_key, kem_alg, "private", password="river-metal-orbit-cactus-47")
+public_pem = core.save_key_pem(public_key, cfg.HYBRID_KEM_ALG, "public")
+private_pem = core.save_key_pem(
+    private_key,
+    cfg.HYBRID_KEM_ALG,
+    "private",
+    password="river-metal-orbit-cactus-47",
+)
 
 # Write PEM files
 with open("public_key.pem", "w") as f:

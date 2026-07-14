@@ -74,7 +74,7 @@ pip install -r requirements-dev.txt
 
 Native `liboqs` is required for the key generation and end-to-end file encryption tests. When native `liboqs` is unavailable, those tests skip and the non-backend validation still runs.
 
-Security-critical tests cover encrypted private-key PEM v2 metadata authentication, legacy encrypted private-key PEM rejection, password policy enforcement, encrypted-container KEM mismatch rejection, malformed AES-GCM payload bounds, race-resistant bounded workspace reads, oversized input rejection, and no-overwrite output safety.
+Security-critical tests cover composite ML-KEM/X25519 key generation, hybrid combiner binding, encrypted private-key PEM v3 metadata authentication, authenticated-v2 migration, version-downgrade and component-substitution rejection, malformed AES-GCM payload bounds, race-resistant bounded workspace reads, oversized input rejection, and no-overwrite output safety.
 
 ## Continuous Integration
 

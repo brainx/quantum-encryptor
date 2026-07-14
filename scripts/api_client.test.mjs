@@ -24,8 +24,9 @@ function healthPayload(apiToken) {
     ok: true,
     backendReady: true,
     backendMessage: "Post-quantum backend ready.",
-    formatVersion: 3,
-    kem: "ML-KEM-768",
+    formatVersion: 4,
+    kem: "ML-KEM-768+X25519",
+    kemComponent: "ML-KEM-768",
     configuredKem: "ML-KEM-768",
     dem: "AES-256-GCM",
     maxFileBytes: 104857600,
@@ -42,7 +43,7 @@ function healthPayload(apiToken) {
 function generatedKeysPayload() {
   return {
     ok: true,
-    kem: "ML-KEM-768",
+    kem: "ML-KEM-768+X25519",
     publicPem: "PUBLIC PEM",
     privatePem: "PRIVATE PEM",
     publicFilename: "quantum_public_key.pem",

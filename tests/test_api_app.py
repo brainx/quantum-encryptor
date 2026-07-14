@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+import pytest
+
 from crypto_config import cfg
 import crypto_core as core
 import api_app
@@ -27,6 +29,7 @@ def test_health_payload_is_safe_without_required_native_backend():
 
     assert payload["formatVersion"] == cfg.FORMAT_VERSION
     assert payload["configuredKem"] == cfg.KEM_ALG
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
     assert payload["dem"] == "AES-256-GCM"
     assert payload["apiToken"] == api_app.LOCAL_API_TOKEN
     assert payload["maxFileBytes"] == cfg.MAX_FILE_BYTES
@@ -40,7 +43,8 @@ def test_health_payload_reports_ready_backend(monkeypatch):
 
     assert payload["backendReady"] is True
     assert payload["backendMessage"] == "Post-quantum backend ready."
-    assert payload["kem"] == "ML-KEM-768"
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
+    assert payload["kemComponent"] == "ML-KEM-768"
 
 
 def test_content_disposition_quotes_download_filename():
@@ -379,10 +383,10 @@ def test_generate_keys_rejects_weak_password():
 def test_generate_keys_returns_pem_payloads(monkeypatch):
     body, headers = _urlencoded_body({"password": "correct horse battery staple"})
     monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem: cfg.KEM_ALG)
-    monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: (b"public", b"private"))
+    monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: (b"public", b"private"))
 
     def save_key(raw_key: bytes, kem_alg: str, key_type: str, password: str | None = None) -> str:
-        assert kem_alg == cfg.KEM_ALG
+        assert kem_alg == cfg.HYBRID_KEM_ALG
         if key_type == "private":
             assert password == "correct horse battery staple"
         return f"{key_type}:{raw_key.decode('ascii')}"
@@ -394,12 +398,13 @@ def test_generate_keys_returns_pem_payloads(monkeypatch):
     assert status == 200
     assert payload["publicPem"] == "public:public"
     assert payload["privatePem"] == "private:private"
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
 
 
 def test_generate_keys_reports_backend_unavailable(monkeypatch):
     body, headers = _urlencoded_body({"password": "correct horse battery staple"})
     monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem: cfg.KEM_ALG)
-    monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: (None, None))
+    monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: (None, None))
 
     status, payload = asyncio.run(_call_app("/api/keys/generate", body=body, headers=_with_api_token(headers)))
 
@@ -431,9 +436,24 @@ def test_encrypt_file_rejects_invalid_public_key(monkeypatch):
     assert payload["error_code"] == "invalid_public_key"
 
 
-def test_encrypt_file_returns_download(monkeypatch):
+def test_encrypt_file_rejects_legacy_single_kem_public_key(monkeypatch):
     body, headers = _file_workflow_body()
     monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(
+        core,
+        "encrypt_file_pro",
+        lambda *_args: pytest.fail("legacy key must be rejected before encryption"),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/files/encrypt", body=body, headers=_with_api_token(headers)))
+
+    assert status == 400
+    assert payload["error_code"] == "legacy_public_key"
+
+
+def test_encrypt_file_returns_download(monkeypatch):
+    body, headers = _file_workflow_body()
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(core, "encrypt_file_pro", lambda data, _public_key, _kem: b"encrypted:" + data)
 
     status, response_headers, response_body = asyncio.run(
@@ -448,7 +468,7 @@ def test_encrypt_file_returns_download(monkeypatch):
 
 def test_encrypt_file_reports_crypto_dependency_error(monkeypatch):
     body, headers = _file_workflow_body()
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
 
     def fail_encrypt(_data: bytes, _public_key: bytes, _kem: str) -> bytes:
         raise core.CryptoDependencyError("missing")
@@ -463,7 +483,7 @@ def test_encrypt_file_reports_crypto_dependency_error(monkeypatch):
 
 def test_encrypt_file_reports_encryption_failure(monkeypatch):
     body, headers = _file_workflow_body()
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(core, "encrypt_file_pro", lambda _data, _public_key, _kem: None)
 
     status, payload = asyncio.run(_call_app("/api/files/encrypt", body=body, headers=_with_api_token(headers)))
@@ -485,7 +505,11 @@ def test_decrypt_file_rejects_public_key_upload(monkeypatch):
 def test_decrypt_file_returns_download(monkeypatch):
     body, headers = _decrypt_workflow_body()
     monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: {"key_type": "private"})
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
+    monkeypatch.setattr(
+        core,
+        "load_key_pem",
+        lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
+    )
     monkeypatch.setattr(
         core,
         "decrypt_file_pro",
@@ -515,7 +539,11 @@ def test_decrypt_file_reports_failed_private_key_unlock(monkeypatch):
 def test_decrypt_file_reports_failed_ciphertext_authentication(monkeypatch):
     body, headers = _decrypt_workflow_body()
     monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: {"key_type": "private"})
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
+    monkeypatch.setattr(
+        core,
+        "load_key_pem",
+        lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
+    )
     monkeypatch.setattr(core, "decrypt_file_pro", lambda _data, _private_key, expected_kem_alg=None: (None, None))
 
     status, payload = asyncio.run(_call_app("/api/files/decrypt", body=body, headers=_with_api_token(headers)))

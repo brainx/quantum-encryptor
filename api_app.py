@@ -301,11 +301,11 @@ async def _read_upload_text(upload: UploadFile, max_bytes: int, label: str) -> s
 
 def _health_payload() -> dict[str, Any]:
     try:
-        active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
+        active_kem_component = core.resolve_kem_algorithm(cfg.KEM_ALG)
         backend_ready = True
         backend_message = "Post-quantum backend ready."
     except Exception as exc:
-        active_kem_alg = cfg.KEM_ALG
+        active_kem_component = cfg.KEM_ALG
         backend_ready = False
         backend_message = (
             "Post-quantum backend is not ready. Install native liboqs before generating keys or processing files."
@@ -316,7 +316,8 @@ def _health_payload() -> dict[str, Any]:
         "backendReady": backend_ready,
         "backendMessage": backend_message,
         "formatVersion": cfg.FORMAT_VERSION,
-        "kem": active_kem_alg,
+        "kem": cfg.HYBRID_KEM_ALG,
+        "kemComponent": active_kem_component,
         "configuredKem": cfg.KEM_ALG,
         "dem": "AES-256-GCM",
         "maxFileBytes": cfg.MAX_FILE_BYTES,
@@ -367,12 +368,12 @@ async def generate_keys(request: Request) -> JSONResponse:
             raise ApiError(400, "weak_password", str(exc)) from exc
 
         active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
-        raw_public_key, raw_private_key = core.generate_oqs_keys(active_kem_alg)
+        raw_public_key, raw_private_key = core.generate_hybrid_keys(active_kem_alg)
         if not raw_public_key or not raw_private_key:
-            raise ApiError(503, "backend_unavailable", "Could not generate a post-quantum key pair.")
+            raise ApiError(503, "backend_unavailable", "Could not generate a hybrid key pair.")
 
-        public_pem = core.save_key_pem(raw_public_key, active_kem_alg, "public")
-        private_pem = core.save_key_pem(raw_private_key, active_kem_alg, "private", password=password)
+        public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
+        private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
         del raw_public_key
         del raw_private_key
         if not public_pem or not private_pem:
@@ -380,11 +381,11 @@ async def generate_keys(request: Request) -> JSONResponse:
 
         return _success_json(
             {
-                "kem": active_kem_alg,
+                "kem": cfg.HYBRID_KEM_ALG,
                 "publicPem": public_pem,
                 "privatePem": private_pem,
-                "publicFilename": f"{active_kem_alg.lower()}_public.pem",
-                "privateFilename": f"{active_kem_alg.lower()}_private.pem",
+                "publicFilename": "ml-kem-768_x25519_public.pem",
+                "privateFilename": "ml-kem-768_x25519_private.pem",
             }
         )
     except ApiError as exc:
@@ -411,6 +412,8 @@ async def encrypt_file(request: Request) -> Response:
         public_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(public_pem)
         if not public_key_bytes or not kem_alg_from_key or key_type != "public":
             raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
+        if kem_alg_from_key != cfg.HYBRID_KEM_ALG:
+            raise ApiError(400, "legacy_public_key", "Generate a new ML-KEM-768+X25519 public key for encryption.")
 
         encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
         del input_data

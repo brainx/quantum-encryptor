@@ -27,7 +27,7 @@ def _valid_public_pem() -> str:
     return "\n".join(
         [
             cfg.PEM_PUBLIC_HEADER,
-            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.HYBRID_KEM_ALG}",
             key_data,
             cfg.PEM_PUBLIC_FOOTER,
             "",
@@ -41,7 +41,7 @@ def _valid_private_pem(encrypted: bool = True) -> str:
         return "\n".join(
             [
                 cfg.PEM_PRIVATE_HEADER,
-                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.HYBRID_KEM_ALG}",
                 key_data,
                 cfg.PEM_PRIVATE_FOOTER,
                 "",
@@ -57,7 +57,7 @@ def _valid_private_pem(encrypted: bool = True) -> str:
             cfg.PEM_PROC_TYPE_HEADER,
             f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
             f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
-            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.HYBRID_KEM_ALG}",
             key_data,
             cfg.PEM_PRIVATE_FOOTER,
             "",
@@ -66,7 +66,7 @@ def _valid_private_pem(encrypted: bool = True) -> str:
 
 
 def _syntactic_encrypted_blob() -> bytes:
-    alg = cfg.KEM_ALG.encode("utf-8")
+    alg = cfg.HYBRID_KEM_ALG.encode("utf-8")
     return (
         cfg.MAGIC_BYTES
         + cfg.FORMAT_VERSION.to_bytes(2, "big")
@@ -74,6 +74,7 @@ def _syntactic_encrypted_blob() -> bytes:
         + alg
         + (1).to_bytes(4, "big")
         + b"x"
+        + b"X" * cfg.X25519_KEY_BYTES
         + b"1" * cfg.AES_NONCE_BYTES
         + b"ciphertext-and-tag"
     )
@@ -110,7 +111,7 @@ def test_inspect_key_returns_public_key_metadata(monkeypatch, tmp_path, capsys):
         "format_version": cfg.FORMAT_VERSION,
         "key": "recipient.pem",
         "key_type": "public",
-        "kem": cfg.KEM_ALG,
+        "kem": cfg.HYBRID_KEM_ALG,
     }
 
 
@@ -265,7 +266,7 @@ def test_encrypt_rejects_existing_output_without_overwrite(monkeypatch, tmp_path
     output_path = tmp_path / "message.pqc"
     output_path.write_bytes(b"existing")
 
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     monkeypatch.setattr(core, "encrypt_file_pro", lambda _data, _public_key, _kem: b"encrypted")
 
@@ -516,10 +517,10 @@ def test_generate_keys_uses_password_env_without_printing_key_material(monkeypat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
-    monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: (b"public", b"private"))
+    monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: (b"public", b"private"))
 
     def save_key_pem(key_bytes, kem_alg, key_type, password=None):
-        assert kem_alg == cfg.KEM_ALG
+        assert kem_alg == cfg.HYBRID_KEM_ALG
         if key_type == "public":
             assert key_bytes == b"public"
             return "PUBLIC PEM\n"
@@ -536,6 +537,7 @@ def test_generate_keys_uses_password_env_without_printing_key_material(monkeypat
 
     assert code == tools.EXIT_SUCCESS
     assert payload["private_key_encrypted"] is True
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
     assert payload["private_key_kdf"] == cfg.PRIVATE_KEY_KDF_ALG
     assert payload["public_key"] == "agent-public.pem"
     assert payload["private_key"] == "agent-private.pem"
@@ -566,7 +568,7 @@ def test_generate_keys_rejects_weak_password_env(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "aaaaaaaaaaaaaaaa")
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
-    monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: pytest.fail("key generation should not run"))
+    monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: pytest.fail("key generation should not run"))
 
     code, payload = _run_agent(
         ["generate-keys", "--public-out", "agent-public.pem", "--private-out", "agent-private.pem"],
@@ -583,7 +585,7 @@ def test_encrypt_mocked_flow_writes_encrypted_file(monkeypatch, tmp_path, capsys
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.txt").write_bytes(b"hello")
     (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     monkeypatch.setattr(core, "encrypt_file_pro", lambda data, _public_key, _kem: b"encrypted:" + data)
 
@@ -593,8 +595,30 @@ def test_encrypt_mocked_flow_writes_encrypted_file(monkeypatch, tmp_path, capsys
     )
 
     assert code == tools.EXIT_SUCCESS
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
     assert payload["output"] == "message.pqc"
     assert (tmp_path / "message.pqc").read_bytes() == b"encrypted:hello"
+
+
+def test_encrypt_rejects_legacy_single_kem_public_key(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "message.txt").write_bytes(b"hello")
+    (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(
+        tools,
+        "_resolve_backend",
+        lambda *_args, **_kwargs: pytest.fail("legacy key must be rejected before backend resolution"),
+    )
+
+    code, payload = _run_agent(
+        ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "message.pqc"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "legacy_public_key"
+    assert not (tmp_path / "message.pqc").exists()
 
 
 def test_inspect_file_returns_encrypted_container_metadata(monkeypatch, tmp_path, capsys):
@@ -606,8 +630,9 @@ def test_inspect_file_returns_encrypted_container_metadata(monkeypatch, tmp_path
     assert code == tools.EXIT_SUCCESS
     assert payload["input"] == "message.pqc"
     assert payload["encrypted_format_version"] == cfg.FORMAT_VERSION
-    assert payload["kem"] == cfg.KEM_ALG
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
     assert payload["kem_ciphertext_bytes"] == 1
+    assert payload["x25519_ciphertext_bytes"] == cfg.X25519_KEY_BYTES
 
 
 def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_path, capsys):
@@ -616,11 +641,15 @@ def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_pa
     (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
     monkeypatch.setenv("AGENT_SECRET", "correct horse battery staple")
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
+    monkeypatch.setattr(
+        core,
+        "load_key_pem",
+        lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
+    )
 
     def decrypt_file(_blob, _private_key, expected_kem_alg=None):
-        assert expected_kem_alg == cfg.KEM_ALG
-        return b"plaintext", cfg.KEM_ALG
+        assert expected_kem_alg == cfg.HYBRID_KEM_ALG
+        return b"plaintext", cfg.HYBRID_KEM_ALG
 
     monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
 
@@ -662,7 +691,8 @@ def test_health_reports_backend_available(monkeypatch, tmp_path, capsys):
 
     assert code == tools.EXIT_SUCCESS
     assert payload["backend_available"] is True
-    assert payload["kem"] == cfg.KEM_ALG
+    assert payload["kem"] == cfg.HYBRID_KEM_ALG
+    assert payload["kem_component"] == cfg.KEM_ALG
     assert payload["workspace"] == tmp_path.name
 
 

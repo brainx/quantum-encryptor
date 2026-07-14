@@ -425,11 +425,12 @@ def _resolve_backend(operation: str, kem_alg: str = cfg.KEM_ALG) -> str:
 def handle_health(_args: argparse.Namespace, workspace: Path) -> int:
     operation = "health"
     try:
-        kem = _resolve_backend(operation)
+        kem_component = _resolve_backend(operation)
         return _success(
             operation,
             backend_available=True,
-            kem=kem,
+            kem=cfg.HYBRID_KEM_ALG,
+            kem_component=kem_component,
             workspace=workspace.name,
         )
     except AgentCommandError as exc:
@@ -440,7 +441,8 @@ def handle_health(_args: argparse.Namespace, workspace: Path) -> int:
                     "operation": operation,
                     "format_version": cfg.FORMAT_VERSION,
                     "backend_available": False,
-                    "kem": cfg.KEM_ALG,
+                    "kem": cfg.HYBRID_KEM_ALG,
+                    "kem_component": cfg.KEM_ALG,
                     "backend_error_code": exc.error_code,
                     "message": exc.message,
                     "workspace": workspace.name,
@@ -464,7 +466,7 @@ def handle_inspect_key(args: argparse.Namespace, workspace: Path) -> int:
 
 def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
     operation = "generate-keys"
-    kem = _resolve_backend(operation)
+    kem_component = _resolve_backend(operation)
     password = _password_from_env(args.password_env, operation, required=True)
 
     public_out = _resolve_output_path(args.public_out, workspace, args.overwrite)
@@ -475,12 +477,12 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
         )
 
     with _suppress_library_output():
-        public_key, private_key = core.generate_oqs_keys(kem)
+        public_key, private_key = core.generate_hybrid_keys(kem_component)
     if not public_key or not private_key:
         raise AgentCommandError("key_generation_failed", "Key generation failed.", EXIT_BACKEND_UNAVAILABLE, operation)
 
-    public_pem = core.save_key_pem(public_key, kem, "public")
-    private_pem = core.save_key_pem(private_key, kem, "private", password=password)
+    public_pem = core.save_key_pem(public_key, cfg.HYBRID_KEM_ALG, "public")
+    private_pem = core.save_key_pem(private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
     del public_key
     del private_key
 
@@ -498,7 +500,8 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
     )
     return _success(
         operation,
-        kem=kem,
+        kem=cfg.HYBRID_KEM_ALG,
+        kem_component=kem_component,
         public_key=_relative_to_workspace(public_path, workspace),
         private_key=_relative_to_workspace(private_path, workspace),
         private_key_encrypted=True,
@@ -517,10 +520,17 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
         raise AgentCommandError(
             "invalid_key", "Public key file is invalid or has the wrong key type.", EXIT_INVALID_INPUT, operation
         )
+    if kem_alg != cfg.HYBRID_KEM_ALG:
+        raise AgentCommandError(
+            "legacy_public_key",
+            "Generate a new ML-KEM-768+X25519 public key for encryption.",
+            EXIT_INVALID_INPUT,
+            operation,
+        )
 
-    kem = _resolve_backend(operation, kem_alg)
+    _resolve_backend(operation)
     with _suppress_library_output():
-        encrypted_blob = core.encrypt_file_pro(input_data, public_key, kem)
+        encrypted_blob = core.encrypt_file_pro(input_data, public_key, cfg.HYBRID_KEM_ALG)
     del input_data
     del public_key
 
@@ -530,7 +540,7 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     _write_workspace_file(args.output, workspace, encrypted_blob, args.overwrite, operation)
     return _success(
         operation,
-        kem=kem,
+        kem=cfg.HYBRID_KEM_ALG,
         input=_relative_to_workspace(input_path, workspace),
         public_key=_relative_to_workspace(public_key_path, workspace),
         output=_relative_to_workspace(output_path, workspace),
@@ -553,6 +563,7 @@ def handle_inspect_file(args: argparse.Namespace, workspace: Path) -> int:
         kem=metadata.kem_alg,
         header_bytes=metadata.header_bytes,
         kem_ciphertext_bytes=metadata.kem_ciphertext_bytes,
+        x25519_ciphertext_bytes=metadata.x25519_ciphertext_bytes,
         encrypted_payload_bytes=metadata.encrypted_payload_bytes,
         total_bytes=metadata.total_bytes,
     )
@@ -596,7 +607,7 @@ def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
         operation,
     )
 
-    _resolve_backend(operation, kem_alg)
+    _resolve_backend(operation)
     with _suppress_library_output():
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
     del encrypted_blob
@@ -638,7 +649,7 @@ def handle_verify_file(args: argparse.Namespace, workspace: Path) -> int:
         operation,
     )
 
-    _resolve_backend(operation, kem_alg)
+    _resolve_backend(operation)
     with _suppress_library_output():
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
     del encrypted_blob
