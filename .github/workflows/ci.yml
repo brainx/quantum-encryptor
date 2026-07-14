@@ -140,7 +140,7 @@ jobs:
           cache: npm
 
       - name: Install security tooling
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install --require-hashes -r requirements-dev-lock.txt
 
       - name: Audit runtime dependency spec
         run: python -m pip_audit -r requirements.txt
