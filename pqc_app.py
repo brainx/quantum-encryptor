@@ -91,10 +91,10 @@ def validate_private_key_password_for_ui(password: str) -> tuple[bool, str | Non
 # --- Main Application UI ---
 
 try:
-    active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
+    active_kem_component = core.resolve_kem_algorithm(cfg.KEM_ALG)
     kem_status_message = None
 except Exception as exc:
-    active_kem_alg = cfg.KEM_ALG
+    active_kem_component = cfg.KEM_ALG
     kem_status_message = (
         "Post-quantum backend is not ready. Check dependency installation before generating keys or processing files."
     )
@@ -102,7 +102,7 @@ except Exception as exc:
 
 st.title("🛡️ PQC Pro File Encryption / Decryption")
 st.markdown(f"""
-Utilizes **{active_kem_alg}** + **AES-256-GCM** hybrid encryption.
+Utilizes **{cfg.HYBRID_KEM_ALG}** + **AES-256-GCM** hybrid encryption.
 Supports password-protected private keys (PEM format).
 """)
 
@@ -114,7 +114,10 @@ operation = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.info(f"Version: {cfg.FORMAT_VERSION}.0\nKEM: {active_kem_alg}\nDEM: AES-256-GCM")
+st.sidebar.info(
+    f"Version: {cfg.FORMAT_VERSION}.0\nSuite: {cfg.HYBRID_KEM_ALG}\n"
+    f"ML-KEM backend: {active_kem_component}\nDEM: AES-256-GCM"
+)
 if kem_status_message:
     st.sidebar.warning(kem_status_message)
 
@@ -130,8 +133,8 @@ if "password_decrypt" not in st.session_state:
 # === Key Generation ===
 if operation == "Generate Keys":
     st.header("🔑 Generate PQC Key Pair")
-    st.markdown(f"Generates a **{active_kem_alg}** public/private key pair (PEM format).")
-    st.info(f"Using KEM Algorithm: **{active_kem_alg}**")
+    st.markdown(f"Generates a **{cfg.HYBRID_KEM_ALG}** public/private key pair (PEM format).")
+    st.info(f"Using hybrid suite: **{cfg.HYBRID_KEM_ALG}**")
 
     st.subheader("Private Key Password")
     password_valid = False
@@ -154,24 +157,29 @@ if operation == "Generate Keys":
 
     st.markdown("---")
     if st.button(
-        f"Generate {active_kem_alg} Key Pair",
+        f"Generate {cfg.HYBRID_KEM_ALG} Key Pair",
         key="gen_button",
         disabled=disable_gen_button or bool(kem_status_message),
     ):
         final_password = st.session_state.password_gen if password_valid else None
 
-        with st.status(f"Generating {active_kem_alg} keys...", expanded=True) as status:
-            st.write("Generating raw OQS key pair...")
-            raw_pub_key, raw_priv_key = core.generate_oqs_keys(active_kem_alg)
+        with st.status(f"Generating {cfg.HYBRID_KEM_ALG} keys...", expanded=True) as status:
+            st.write("Generating independent X25519 and ML-KEM key pairs...")
+            raw_pub_key, raw_priv_key = core.generate_hybrid_keys(active_kem_component)
 
             if raw_pub_key and raw_priv_key:
                 st.write("Raw keys generated.")
                 st.write("Formatting Public Key (PEM)...")
-                pub_pem = core.save_key_pem(raw_pub_key, active_kem_alg, "public")
+                pub_pem = core.save_key_pem(raw_pub_key, cfg.HYBRID_KEM_ALG, "public")
 
                 st.write("Formatting Private Key (PEM)...")
                 st.write("(Encrypting private key with password...)")
-                priv_pem = core.save_key_pem(raw_priv_key, active_kem_alg, "private", password=final_password)
+                priv_pem = core.save_key_pem(
+                    raw_priv_key,
+                    cfg.HYBRID_KEM_ALG,
+                    "private",
+                    password=final_password,
+                )
 
                 # Cleanup raw keys immediately after PEM generation
                 del raw_pub_key
@@ -187,8 +195,8 @@ if operation == "Generate Keys":
                         "Remember the password. Loss = permanent data loss."
                     )
 
-                    pub_filename = f"{active_kem_alg.lower()}_public.pem"
-                    priv_filename = f"{active_kem_alg.lower()}_private.pem"
+                    pub_filename = "ml-kem-768_x25519_public.pem"
+                    priv_filename = "ml-kem-768_x25519_private.pem"
 
                     col1, col2 = st.columns(2)
                     with col1:
@@ -205,7 +213,7 @@ if operation == "Generate Keys":
                     status.update(label=err_msg, state="error")
                     st.error(err_msg)
             else:
-                err_msg = f"Failed to generate raw keys for {active_kem_alg}."
+                err_msg = f"Failed to generate raw keys for {cfg.HYBRID_KEM_ALG}."
                 logger.error(err_msg)
                 status.update(label=err_msg, state="error")
                 st.error(err_msg + " Check logs for details. Is liboqs working?")
@@ -246,7 +254,7 @@ elif operation == "Encrypt File":
             # Load public key (password ignored by load_key_pem for public keys)
             pub_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(pub_pem_content)
 
-            if pub_key_bytes and kem_alg_from_key is not None and key_type == "public":
+            if pub_key_bytes and kem_alg_from_key == cfg.HYBRID_KEM_ALG and key_type == "public":
                 st.success(f"Public Key loaded successfully (Algorithm: {kem_alg_from_key}).")
 
                 original_filename = Path(uploaded_file.name)
@@ -274,7 +282,7 @@ elif operation == "Encrypt File":
                     with st.status(f"Encrypting '{uploaded_file.name}'...", expanded=False) as status:
                         try:
                             status.write("Reading input file...")  # Already done by getvalue()
-                            status.write(f"Performing {kem_alg_from_key} + AES-GCM encryption...")
+                            status.write(f"Performing {cfg.HYBRID_KEM_ALG} + AES-GCM encryption...")
                             encrypted_blob = core.encrypt_file_pro(input_data, pub_key_bytes, kem_alg_from_key)
                             status.write("Cleaning up...")
                             del input_data

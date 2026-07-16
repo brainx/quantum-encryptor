@@ -1,6 +1,6 @@
 # Quantum Encryptor
 
-A post-quantum cryptography tool for file encryption using quantum-resistant algorithms. This application combines post-quantum Key Encapsulation Mechanisms (KEM) with classical symmetric encryption to protect files against future quantum computer threats.
+A post-quantum cryptography tool for file encryption. New files combine ML-KEM-768 and X25519 key establishment with AES-256-GCM so confidentiality does not depend on either key-establishment component alone.
 
 ![Quantum Encryption](https://img.shields.io/badge/Encryption-Post--Quantum-blue)
 ![Python Version](https://img.shields.io/badge/Python-3.10--3.13-green)
@@ -17,13 +17,13 @@ A post-quantum cryptography tool for file encryption using quantum-resistant alg
 </p>
 
 <p align="center">
-  <strong>Dark local web interface for ML-KEM-768 key generation, file encryption, decryption, and PEM key inspection.</strong>
+  <strong>Dark local web interface for ML-KEM-768 + X25519 key generation, file encryption, decryption, and PEM key inspection.</strong>
 </p>
 
 ## Features
 
-- **Post-Quantum Security**: Uses ML-KEM-768, with Kyber768 retained as a legacy compatibility alias
-- **Hybrid Encryption**: Combines quantum-resistant key exchange with AES-256-GCM symmetric encryption
+- **Post-Quantum/Traditional Security**: Combines ML-KEM-768 with X25519 so confidentiality does not depend on one key-establishment algorithm
+- **Authenticated File Encryption**: Derives AES-256-GCM keys from both ML-KEM and X25519 shared secrets
 - **Password-Protected Keys**: Private keys are always encrypted with scrypt-derived AES-256-GCM keys
 - **User-Friendly Interface**: Custom local web UI with a Python ASGI API
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
@@ -216,11 +216,13 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 
 ## Security Considerations
 
-- Encrypted files use KEM-derived AES-256-GCM keys, require format version 3, and authenticate file header metadata as associated data
-- Encrypted private-key PEM files require `PQC-Key-Format: 2`; private-key metadata, KEM algorithm, KDF parameters, salt, and nonce are authenticated as AES-GCM associated data
+- New encrypted files use format version 4 with ML-KEM-768 + X25519-derived AES-256-GCM keys and authenticate the complete file header as associated data
+- New encrypted private-key PEM files require `PQC-Key-Format: 3`; private-key metadata, hybrid suite, KDF parameters, salt, and nonce are authenticated as AES-GCM associated data
+- Authenticated format-v3 files and `PQC-Key-Format: 2` ML-KEM private keys remain decrypt-only for migration; encryption never silently downgrades
 - Private keys must be password protected with scrypt-derived AES-256-GCM keys; unencrypted private keys and legacy encrypted private-key PEM metadata are rejected by default
 - Private-key passwords require at least 16 characters, at least 5 unique characters, and must not match known weak values
-- Decryption checks encrypted-file KEM metadata against the private-key KEM metadata, with `ML-KEM-768` and `Kyber768` treated as compatibility aliases
+- Decryption checks encrypted-file suite metadata against the private-key metadata; v4 requires `ML-KEM-768+X25519`, while v3 accepts the `ML-KEM-768`/`Kyber768` compatibility aliases
+- Existing v2 ML-KEM private keys can decrypt authenticated v3 files, but creating new encrypted files requires generating a new composite key pair; re-encrypt migrated data with that new public key
 - PEM/key reads are capped at 128 KiB before parsing; POSIX workspace inputs use descriptor-anchored, no-follow reads, and reads remain bounded even if a file changes during the operation
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
 - State-changing local web API requests require a per-process API token and reject non-local browser origins when an `Origin` header is present

@@ -10,6 +10,9 @@ class CryptoConfig:
     KEM_ALG = "ML-KEM-768"
     LEGACY_KEM_ALGS = ("Kyber768",)
     ALLOWED_KEM_ALGS = (KEM_ALG, *LEGACY_KEM_ALGS)
+    HYBRID_KEM_ALG = "ML-KEM-768+X25519"
+    ALLOWED_KEY_ALGS = (HYBRID_KEM_ALG, *ALLOWED_KEM_ALGS)
+    X25519_KEY_BYTES = 32
 
     # --- Data Encryption (DEM) ---
     AES_KEY_BYTES = 32  # AES-256
@@ -20,6 +23,7 @@ class CryptoConfig:
     # For deriving AES key from KEM shared secret
     HKDF_SALT = b"pqc-file-enc-hkdf-salt"  # Optional salt for HKDF
     HKDF_INFO_AES = b"pqc-file-enc-aes-key-derivation"  # Context for AES key derivation
+    HYBRID_KDF_DOMAIN = b"QuantumEncryptorCompositeKDFv1"
 
     # For deriving keys from passwords for private key encryption
     PRIVATE_KEY_MIN_PASSWORD_CHARS = 16
@@ -34,12 +38,15 @@ class CryptoConfig:
 
     # --- File Format ---
     MAGIC_BYTES = b"PQCENC"
-    FORMAT_VERSION = 3  # v3 authenticates encrypted-file header metadata as AAD
+    LEGACY_FORMAT_VERSION = 3
+    FORMAT_VERSION = 4  # v4 adds X25519 to ML-KEM key establishment
+    SUPPORTED_FORMAT_VERSIONS = (LEGACY_FORMAT_VERSION, FORMAT_VERSION)
 
     # Header structure (fixed part): Magic(6s), Version(H=ushort)
     HEADER_BASE_FORMAT = ">6s H"
     # Variable parts (lengths determined at runtime):
-    # KEM Algo Len(H), KEM Algo(s), KEM CT Len(I=uint), KEM CT(s), Nonce(s)
+    # Suite Len(H), Suite(s), ML-KEM CT Len(I=uint), ML-KEM CT(s),
+    # X25519 ephemeral public key(s, v4 only), Nonce(s)
 
     # --- PEM Key Format ---
     PEM_PUBLIC_HEADER = "-----BEGIN PQC PUBLIC KEY-----"
@@ -47,7 +54,8 @@ class CryptoConfig:
     PEM_PRIVATE_HEADER = "-----BEGIN PQC PRIVATE KEY-----"
     PEM_PRIVATE_FOOTER = "-----END PQC PRIVATE KEY-----"
     PEM_PRIVATE_KEY_FORMAT_HEADER = "PQC-Key-Format: "
-    PEM_PRIVATE_KEY_FORMAT_VERSION = 2
+    PEM_PRIVATE_KEY_FORMAT_VERSION = 3
+    SUPPORTED_PRIVATE_KEY_FORMAT_VERSIONS = (2, PEM_PRIVATE_KEY_FORMAT_VERSION)
     ALLOW_LEGACY_PRIVATE_KEY_PEM = False
     PEM_ALGORITHM_HEADER = "Algorithm: "
     PEM_KDF_HEADER = "KDF: "
@@ -69,6 +77,7 @@ class CryptoConfig:
         + MAX_KEM_ALG_NAME_BYTES
         + 4  # KEM ciphertext length
         + MAX_KEM_CIPHERTEXT_BYTES
+        + X25519_KEY_BYTES
         + AES_NONCE_BYTES
         + AES_TAG_BYTES
     )
