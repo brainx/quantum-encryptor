@@ -436,9 +436,10 @@ def test_encrypt_file_rejects_invalid_public_key(monkeypatch):
     assert payload["error_code"] == "invalid_public_key"
 
 
-def test_encrypt_file_rejects_legacy_single_kem_public_key(monkeypatch):
+@pytest.mark.parametrize("legacy_kem", [cfg.KEM_ALG, cfg.LEGACY_HYBRID_KEM_ALG])
+def test_encrypt_file_rejects_legacy_public_key(monkeypatch, legacy_kem):
     body, headers = _file_workflow_body()
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", legacy_kem, "public"))
     monkeypatch.setattr(
         core,
         "encrypt_file_pro",
@@ -510,6 +511,7 @@ def test_decrypt_file_returns_download(monkeypatch):
         "load_key_pem",
         lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
     )
+    monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", lambda _suite: (cfg.KEM_ALG,))
     monkeypatch.setattr(
         core,
         "decrypt_file_pro",
@@ -544,12 +546,38 @@ def test_decrypt_file_reports_failed_ciphertext_authentication(monkeypatch):
         "load_key_pem",
         lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
     )
+    monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", lambda _suite: (cfg.KEM_ALG,))
     monkeypatch.setattr(core, "decrypt_file_pro", lambda _data, _private_key, expected_kem_alg=None: (None, None))
 
     status, payload = asyncio.run(_call_app("/api/files/decrypt", body=body, headers=_with_api_token(headers)))
 
     assert status == 400
     assert payload["error_code"] == "decryption_failed"
+
+
+def test_decrypt_file_reports_suite_aware_backend_unavailable(monkeypatch):
+    body, headers = _decrypt_workflow_body()
+    monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: {"key_type": "private"})
+    monkeypatch.setattr(
+        core,
+        "load_key_pem",
+        lambda _pem, password=None: (b"private", cfg.LEGACY_HYBRID_KEM_ALG, "private"),
+    )
+
+    def missing_backend(_suite):
+        raise core.CryptoDependencyError("legacy backends missing")
+
+    monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", missing_backend, raising=False)
+    monkeypatch.setattr(
+        core,
+        "decrypt_file_pro",
+        lambda *_args, **_kwargs: pytest.fail("decryption must not run without a compatible backend"),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/files/decrypt", body=body, headers=_with_api_token(headers)))
+
+    assert status == 503
+    assert payload["error_code"] == "backend_unavailable"
 
 
 def test_decrypt_file_rejects_unsupported_private_key(monkeypatch):

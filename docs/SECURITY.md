@@ -8,7 +8,7 @@ The application uses post-quantum/traditional hybrid key establishment followed 
 
 1. **Post-Quantum Component**: ML-KEM-768
    - NIST-selected post-quantum cryptographic algorithm
-   - `Kyber768` is accepted as a legacy compatibility alias for older OQS builds
+   - `Kyber768` is a distinct legacy algorithm accepted only where authenticated archive migration requires it
    - Designed to resist attacks from both classical and quantum computers
 
 2. **Traditional Key-Establishment Component**: X25519
@@ -66,13 +66,14 @@ The application is designed to protect against the following threats:
 
 - Native `liboqs` is loaded lazily and missing backend support is treated as an unavailable dependency, not a process exit during import.
 - Encrypted-file headers include magic bytes, version, suite name length, ML-KEM ciphertext length, X25519 ephemeral public key, and nonce validation.
-- New encryption emits only format version 4 and requires composite ML-KEM-768 + X25519 public keys.
+- New encryption emits only format version 4 with the unambiguous `ML-KEM-768+X25519-v2` suite and requires exact ML-KEM-768 support.
 - Authenticated format version 3 is accepted only for decryption; older unauthenticated formats remain rejected.
 - Format versions 3 and 4 use the complete header as AES-GCM associated data, so header tampering fails authentication.
 - New encrypted private-key PEM parsing requires `PQC-Key-Format: 3`; authenticated v2 ML-KEM keys remain decrypt-only for migration.
 - PEM private-key encryption authenticates the private-key format version, suite, KDF parameters, salt, and nonce as AES-GCM associated data.
 - PEM parsing uses strict base64 decoding and validates encrypted private-key salt, nonce, scrypt KDF metadata, maximum PEM size, and maximum raw key payload size.
-- File decryption verifies that private-key suite metadata matches encrypted-container metadata; v4 requires `ML-KEM-768+X25519`, while v3 normalizes the `ML-KEM-768` and `Kyber768` compatibility aliases.
+- File decryption requires an exact private-key/container suite label match. The legacy `ML-KEM-768+X25519` label is decrypt-only; its bounded ML-KEM/Kyber migration fallback accepts a candidate only after AES-GCM authentication succeeds. Format-v3 containers use their exact stored KEM identity.
+- Legacy hybrid public keys are rejected for encryption and must be regenerated under the current suite.
 - The UI and core encryption path enforce a 100 MiB plaintext in-memory file limit; decryption accepts only the bounded encrypted-container size needed for header, KEM ciphertext, nonce, and tag overhead.
 - The local web API requires a per-process `X-Quantum-Encryptor-Token` for state-changing `/api/*` requests and rejects non-local browser origins when an `Origin` header is present.
 - Download filenames are reduced to local filenames before being passed to Streamlit.

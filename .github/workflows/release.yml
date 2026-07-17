@@ -190,6 +190,19 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -r requirements-dev.txt
 
+      - name: Verify migration backends are active
+        run: |
+          python - <<'PY'
+          import oqs
+
+          getter = getattr(oqs, "get_enabled_kem_mechanisms", None)
+          if getter is None:
+              getter = oqs.get_enabled_KEM_mechanisms
+
+          enabled = set(getter())
+          assert {"ML-KEM-768", "Kyber768"}.issubset(enabled), sorted(enabled)[:20]
+          PY
+
       - name: Run native-backed test suite
         run: PYTHON=python ./test.sh
 

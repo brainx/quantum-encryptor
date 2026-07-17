@@ -96,7 +96,8 @@ try:
 except Exception as exc:
     active_kem_component = cfg.KEM_ALG
     kem_status_message = (
-        "Post-quantum backend is not ready. Check dependency installation before generating keys or processing files."
+        "The ML-KEM backend is not ready, so new keys and ciphertexts cannot be created. "
+        "Compatible legacy archives may still be decryptable."
     )
     logger.warning("Unable to resolve configured KEM algorithm: %s", exc)
 

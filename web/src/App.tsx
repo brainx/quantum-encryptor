@@ -21,7 +21,7 @@ const DEFAULT_HEALTH: Health = {
   backendReady: false,
   backendMessage: "Checking backend readiness.",
   formatVersion: 4,
-  kem: "ML-KEM-768+X25519",
+  kem: "ML-KEM-768+X25519-v2",
   kemComponent: "ML-KEM-768",
   configuredKem: "ML-KEM-768",
   dem: "AES-256-GCM",
@@ -324,7 +324,8 @@ function EncryptView({ health, readinessNotice }: { health: Health; readinessNot
     setDownloadReady(false);
   }, [file]);
 
-  const publicKeyReady = keyInspection.result?.keyInfo.key_type === "public";
+  const publicKeyReady =
+    keyInspection.result?.keyInfo.key_type === "public" && keyInspection.result.keyInfo.kem === health.kem;
   const fileSizeNotice = sizeNotice(file, health.maxFileBytes, "Input file");
   const keySizeNotice = sizeNotice(publicKey, health.maxPemBytes, "Public key file");
   const activeIndex = downloadReady ? 4 : publicKeyReady && outputName ? 3 : file && publicKey ? 2 : file ? 1 : 0;
@@ -412,7 +413,6 @@ function DecryptView({ health, readinessNotice }: { health: Health; readinessNot
   const keySizeNotice = sizeNotice(privateKey, health.maxPemBytes, "Private key file");
   const activeIndex = downloadReady ? 4 : privateKeyReady && password && outputName ? 3 : file && privateKey ? 2 : file ? 1 : 0;
   const canDecrypt =
-    health.backendReady &&
     !!file &&
     !fileSizeNotice &&
     privateKeyReady &&
