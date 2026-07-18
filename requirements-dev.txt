@@ -2,7 +2,7 @@
 pytest>=9.1.1
 pytest-cov>=4.0.0
 black>=23.0.0
-mypy>=2.2.0
+mypy>=2.3.0
 flake8>=6.0.0
 bandit>=1.8.0
 pip-audit>=2.8.0
@@ -16,6 +16,6 @@ setuptools>=69.0.0
 wheel>=0.42.0
 sphinx>=6.0.0
 # Sphinx 9.1 still caps docutils below 0.23; keep the dev lock resolvable.
-docutils<0.23
+docutils<0.24
 sphinx-rtd-theme>=1.2.0
 sphinx-autodoc-typehints>=1.22.0
