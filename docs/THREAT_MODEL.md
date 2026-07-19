@@ -39,8 +39,9 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 
 - Private keys are never saved or accepted unless encrypted with the required scrypt KDF metadata.
 - New encrypted private-key PEM files must include `PQC-Key-Format: 3`, and private-key metadata must be authenticated as AES-GCM associated data.
-- New encryption must require a composite `ML-KEM-768+X25519` public key and must never fall back to legacy single-KEM encryption.
-- File decryption must reject a private-key suite label that does not match the encrypted-container suite label after legacy compatibility alias normalization.
+- New encryption must require a composite `ML-KEM-768+X25519-v2` public key backed by exact ML-KEM-768 and must never fall back to Kyber or legacy single-KEM encryption.
+- File decryption must reject a private-key suite label that does not exactly match the encrypted-container suite label.
+- The ambiguous legacy `ML-KEM-768+X25519` suite is decrypt-only; ML-KEM/Kyber fallback is bounded and a candidate is accepted only after AES-GCM authentication succeeds.
 - Encrypted files must be authenticated format version 4 or decrypt-only version 3 and must authenticate the complete header as AES-GCM associated data.
 - Version 4 AES keys must bind both key shares, both X25519 public values, the suite identifier, and the application domain separator.
 - PEM, plaintext, and encrypted-container inputs must be bounded before expensive parsing or cryptographic work.

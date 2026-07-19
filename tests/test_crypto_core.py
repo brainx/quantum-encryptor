@@ -17,6 +17,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from crypto_config import cfg
 import crypto_core as core
 
+LEGACY_HYBRID_SUITE = cfg.LEGACY_HYBRID_KEM_ALG
+
 
 def _encrypted_blob_offsets(encrypted_data: bytes) -> dict[str, int]:
     """Return useful offsets for the project encrypted-file format."""
@@ -124,6 +126,43 @@ def fake_oqs_backend(monkeypatch):
     return FakeOQS
 
 
+def _algorithm_sensitive_fake_oqs(decapsulation_attempts=None):
+    """Model ML-KEM and Kyber as distinct same-size KEM implementations."""
+
+    class FakeKEM:
+        def __init__(self, algorithm, secret_key=None):
+            assert algorithm in {cfg.KEM_ALG, "Kyber768"}
+            self.algorithm = algorithm
+            self.secret_key = secret_key
+            if secret_key is not None and decapsulation_attempts is not None:
+                decapsulation_attempts.append(algorithm)
+            self.details = {
+                "length_public_key": 32,
+                "length_secret_key": 32,
+                "length_ciphertext": 32,
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback):
+            return None
+
+        def encap_secret(self, public_key):
+            ciphertext = b"C" * 32
+            shared_secret = hashlib.sha256(self.algorithm.encode("ascii") + public_key + ciphertext).digest()
+            return ciphertext, shared_secret
+
+        def decap_secret(self, ciphertext):
+            public_key = hashlib.sha256(self.secret_key).digest()
+            return hashlib.sha256(self.algorithm.encode("ascii") + public_key + ciphertext).digest()
+
+    class FakeOQS:
+        KeyEncapsulation = FakeKEM
+
+    return FakeOQS
+
+
 def _legacy_v3_blob(plaintext: bytes, mlkem_public: bytes) -> bytes:
     """Build a valid legacy v3 container using the deterministic fake backend."""
     ciphertext_kem = b"C" * 32
@@ -164,6 +203,8 @@ def key_pair(kem_algorithm) -> Tuple[bytes, bytes]:
 @pytest.fixture
 def hybrid_key_pair(kem_algorithm) -> Tuple[bytes, bytes]:
     """Generate an ML-KEM-768 + X25519 composite key pair."""
+    if kem_algorithm != cfg.KEM_ALG:
+        pytest.skip("Exact ML-KEM-768 support is required for new hybrid keys.")
     public_key, private_key = core.generate_hybrid_keys(kem_algorithm)
     assert public_key is not None
     assert private_key is not None
@@ -268,6 +309,16 @@ class TestKeyGeneration:
         assert mlkem_public == b"mlkem-public"
         assert mlkem_private == b"mlkem-private"
 
+    def test_generate_hybrid_keys_rejects_legacy_kyber(self, monkeypatch):
+        """New composite keys must use exact standardized ML-KEM, never legacy Kyber."""
+        monkeypatch.setattr(
+            core,
+            "generate_oqs_keys",
+            lambda _kem: pytest.fail("legacy Kyber must be rejected before key generation"),
+        )
+
+        assert core.generate_hybrid_keys("Kyber768") == (None, None)
+
     @pytest.mark.parametrize("key_type", ["public", "private"])
     def test_unpack_hybrid_key_rejects_missing_component(self, key_type):
         """Composite keys fail closed unless both components are present."""
@@ -327,20 +378,30 @@ class TestKeyGeneration:
         with pytest.raises(core.CryptoDependencyError):
             core._enabled_kem_mechanisms()
 
-    def test_kem_aliases_and_resolve_alias_fallback(self, monkeypatch):
-        """ML-KEM and Kyber aliases resolve to whichever compatible backend is enabled."""
-        assert core._kem_aliases("ML-KEM-768") == ("ML-KEM-768", "Kyber768")
-        assert core._kem_aliases("Kyber768") == ("Kyber768", "ML-KEM-768")
-        assert core._kem_aliases("Other") == ("Other",)
-
+    def test_kem_resolution_keeps_ml_kem_and_kyber_distinct(self, monkeypatch):
+        """A Kyber-only backend must not satisfy an exact ML-KEM request."""
         monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: ("Kyber768",))
-        assert core.resolve_kem_algorithm("ML-KEM-768") == "Kyber768"
-        assert core.is_kem_available("ML-KEM-768") is True
+        with pytest.raises(core.CryptoDependencyError):
+            core.resolve_kem_algorithm(cfg.KEM_ALG)
+        assert core.is_kem_available(cfg.KEM_ALG) is False
+
+    def test_decryption_backend_resolution_is_suite_aware(self, monkeypatch):
+        """Legacy decryption can use Kyber without making it an ML-KEM alias."""
+        monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: ("Kyber768",))
+
+        assert core.resolve_decryption_kem_algorithms(cfg.LEGACY_HYBRID_KEM_ALG) == ("Kyber768",)
+        assert core.resolve_decryption_kem_algorithms("Kyber768") == ("Kyber768",)
+        with pytest.raises(core.CryptoDependencyError):
+            core.resolve_decryption_kem_algorithms(cfg.HYBRID_KEM_ALG)
+        assert core.resolve_kem_algorithm("Kyber768") == "Kyber768"
+
+        monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: (cfg.KEM_ALG, "Kyber768"))
+        assert core.resolve_kem_algorithm(cfg.KEM_ALG) == cfg.KEM_ALG
 
         monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: ())
         with pytest.raises(core.CryptoDependencyError):
-            core.resolve_kem_algorithm("ML-KEM-768")
-        assert core.is_kem_available("ML-KEM-768") is False
+            core.resolve_kem_algorithm(cfg.KEM_ALG)
+        assert core.is_kem_available(cfg.KEM_ALG) is False
 
 
 class TestOQSCompatibility:
@@ -427,20 +488,27 @@ class TestKeyDerivation:
         assert isinstance(derived_key, bytes)
         assert len(derived_key) == cfg.AES_KEY_BYTES
 
-    def test_hybrid_combiner_matches_stable_reference_vector(self):
-        """The v4 combiner is deterministic and binds both shares plus X25519 context."""
+    @pytest.mark.parametrize(
+        ("suite", "expected_hex"),
+        [
+            (cfg.HYBRID_KEM_ALG, "cc85fdc1244824a650da33a0ccb1fa472c07d3e06a25d0e0da140a64f94411f4"),
+            (LEGACY_HYBRID_SUITE, "e36c7ca1c6e4da6fd77989e52b576558d9fe5b6ef72fa119964bd8b3a8b3b298"),
+        ],
+    )
+    def test_hybrid_combiner_matches_stable_reference_vector(self, suite, expected_hex):
+        """Each hybrid suite has a stable, domain-separated combiner vector."""
         mlkem_share = bytes(range(32))
         x25519_share = bytes(range(32, 64))
         ephemeral_public = b"E" * cfg.X25519_KEY_BYTES
         recipient_public = b"R" * cfg.X25519_KEY_BYTES
-        expected = bytes.fromhex("e36c7ca1c6e4da6fd77989e52b576558d9fe5b6ef72fa119964bd8b3a8b3b298")
+        expected = bytes.fromhex(expected_hex)
 
         combined = core.derive_hybrid_symmetric_key(
             mlkem_share,
             x25519_share,
             ephemeral_public,
             recipient_public,
-            cfg.HYBRID_KEM_ALG,
+            suite,
         )
 
         assert combined == expected
@@ -625,6 +693,30 @@ class TestPEMKeyFormat:
             f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
         )
         assert core.load_key_pem(tampered, password=password) == (None, None, None)
+
+    def test_legacy_hybrid_pem_remains_loadable_but_cannot_encrypt(self):
+        """Legacy composite PEMs remain readable only for authenticated archive recovery."""
+        password = "river metal orbit cactus 47"
+        raw_public_key = core.pack_hybrid_key(b"P" * cfg.X25519_KEY_BYTES, b"legacy-kem-public")
+        raw_private_key = core.pack_hybrid_key(b"S" * cfg.X25519_KEY_BYTES, b"legacy-kem-private")
+
+        public_pem = core.save_key_pem(raw_public_key, cfg.LEGACY_HYBRID_KEM_ALG, "public")
+        private_pem = core.save_key_pem(
+            raw_private_key,
+            cfg.LEGACY_HYBRID_KEM_ALG,
+            "private",
+            password=password,
+        )
+
+        assert public_pem is not None
+        assert private_pem is not None
+        assert core.load_key_pem(public_pem) == (raw_public_key, cfg.LEGACY_HYBRID_KEM_ALG, "public")
+        assert core.load_key_pem(private_pem, password=password) == (
+            raw_private_key,
+            cfg.LEGACY_HYBRID_KEM_ALG,
+            "private",
+        )
+        assert core.encrypt_file_pro(b"must not encrypt", raw_public_key, cfg.LEGACY_HYBRID_KEM_ALG) is None
 
     def test_hybrid_pem_rejects_payload_missing_ml_kem_component(self):
         """PEM serialization cannot bless a partial composite key as valid."""
@@ -891,6 +983,11 @@ class TestPEMKeyFormat:
 class TestFileEncryption:
     """Tests for file encryption/decryption."""
 
+    def test_current_hybrid_suite_is_distinct_from_ambiguous_legacy_suite(self):
+        """New public keys and containers must carry an unambiguous suite identifier."""
+        assert cfg.HYBRID_KEM_ALG != LEGACY_HYBRID_SUITE
+        assert LEGACY_HYBRID_SUITE in cfg.ALLOWED_KEY_ALGS
+
     def test_hybrid_v4_roundtrip_uses_both_key_establishment_components(self, fake_oqs_backend):
         """New encryption emits v4 and requires matching ML-KEM and X25519 private components."""
         public_key, private_key, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
@@ -939,6 +1036,114 @@ class TestFileEncryption:
             )[0]
             is None
         )
+
+    @pytest.mark.parametrize("legacy_kem", [cfg.KEM_ALG, "Kyber768"])
+    def test_legacy_hybrid_v4_decrypts_with_authenticated_kem_selection(self, monkeypatch, legacy_kem):
+        """Ambiguous v4 archives recover through tag-verified KEM selection."""
+        decapsulation_attempts = []
+        monkeypatch.setattr(core, "oqs", _algorithm_sensitive_fake_oqs(decapsulation_attempts))
+        monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: (cfg.KEM_ALG, "Kyber768"))
+        public_key, private_key, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
+
+        current_suite = cfg.HYBRID_KEM_ALG
+        exact_resolver = core.resolve_kem_algorithm
+        monkeypatch.setattr(cfg, "HYBRID_KEM_ALG", LEGACY_HYBRID_SUITE)
+        monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem=None: legacy_kem)
+        encrypted_data = core.encrypt_file_pro(b"migration probe", public_key, LEGACY_HYBRID_SUITE)
+        assert encrypted_data is not None
+        private_pem = core.save_key_pem(
+            private_key,
+            LEGACY_HYBRID_SUITE,
+            "private",
+            password="river metal orbit cactus 47",
+        )
+        assert private_pem is not None
+
+        monkeypatch.setattr(cfg, "HYBRID_KEM_ALG", current_suite)
+        monkeypatch.setattr(core, "resolve_kem_algorithm", exact_resolver)
+        loaded_private, loaded_suite, loaded_type = core.load_key_pem(
+            private_pem,
+            password="river metal orbit cactus 47",
+        )
+        assert loaded_private is not None
+        assert loaded_suite == LEGACY_HYBRID_SUITE
+        assert loaded_type == "private"
+        decrypted_data, detected_alg = core.decrypt_file_pro(
+            encrypted_data,
+            loaded_private,
+            expected_kem_alg=loaded_suite,
+        )
+
+        assert decrypted_data == b"migration probe"
+        assert detected_alg == LEGACY_HYBRID_SUITE
+        assert decapsulation_attempts == ([cfg.KEM_ALG] if legacy_kem == cfg.KEM_ALG else [cfg.KEM_ALG, "Kyber768"])
+
+    def test_tampered_legacy_hybrid_v4_exhausts_candidates_without_plaintext(self, monkeypatch):
+        """Legacy fallback remains fail-closed when no candidate authenticates the container."""
+        decapsulation_attempts = []
+        monkeypatch.setattr(core, "oqs", _algorithm_sensitive_fake_oqs(decapsulation_attempts))
+        monkeypatch.setattr(core, "_enabled_kem_mechanisms", lambda: (cfg.KEM_ALG, "Kyber768"))
+        public_key, private_key, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
+
+        current_suite = cfg.HYBRID_KEM_ALG
+        exact_resolver = core.resolve_kem_algorithm
+        monkeypatch.setattr(cfg, "HYBRID_KEM_ALG", LEGACY_HYBRID_SUITE)
+        monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem=None: "Kyber768")
+        encrypted_data = core.encrypt_file_pro(b"authenticated migration data", public_key, LEGACY_HYBRID_SUITE)
+        assert encrypted_data is not None
+
+        monkeypatch.setattr(cfg, "HYBRID_KEM_ALG", current_suite)
+        monkeypatch.setattr(core, "resolve_kem_algorithm", exact_resolver)
+        tampered = _tamper(encrypted_data, _encrypted_blob_offsets(encrypted_data)["payload"])
+
+        assert core.decrypt_file_pro(tampered, private_key, expected_kem_alg=LEGACY_HYBRID_SUITE) == (
+            None,
+            LEGACY_HYBRID_SUITE,
+        )
+        assert decapsulation_attempts == [cfg.KEM_ALG, "Kyber768"]
+
+    def test_native_legacy_kyber_hybrid_v4_decrypts_after_ml_kem_upgrade(self, monkeypatch):
+        """The real liboqs backends preserve archives created through the old fallback."""
+        try:
+            enabled = set(core._enabled_kem_mechanisms())
+        except core.CryptoDependencyError:
+            pytest.skip("Native liboqs is unavailable.")
+        if not {cfg.KEM_ALG, "Kyber768"}.issubset(enabled):
+            pytest.skip("Native ML-KEM-768 and Kyber768 are both required.")
+
+        mlkem_public, mlkem_private = core.generate_oqs_keys("Kyber768")
+        assert mlkem_public is not None
+        assert mlkem_private is not None
+        x25519_private_key = x25519.X25519PrivateKey.generate()
+        x25519_public = x25519_private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        x25519_private = x25519_private_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        public_key = core.pack_hybrid_key(x25519_public, mlkem_public)
+        private_key = core.pack_hybrid_key(x25519_private, mlkem_private)
+
+        current_suite = cfg.HYBRID_KEM_ALG
+        exact_resolver = core.resolve_kem_algorithm
+        monkeypatch.setattr(cfg, "HYBRID_KEM_ALG", LEGACY_HYBRID_SUITE)
+        monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem=None: "Kyber768")
+        encrypted_data = core.encrypt_file_pro(b"native migration probe", public_key, LEGACY_HYBRID_SUITE)
+        assert encrypted_data is not None
+
+        monkeypatch.setattr(cfg, "HYBRID_KEM_ALG", current_suite)
+        monkeypatch.setattr(core, "resolve_kem_algorithm", exact_resolver)
+        decrypted_data, detected_alg = core.decrypt_file_pro(
+            encrypted_data,
+            private_key,
+            expected_kem_alg=LEGACY_HYBRID_SUITE,
+        )
+
+        assert decrypted_data == b"native migration probe"
+        assert detected_alg == LEGACY_HYBRID_SUITE
 
     def test_encrypt_refuses_legacy_v3_but_decrypt_accepts_authenticated_v3(self, fake_oqs_backend):
         """Legacy containers are decrypt-only so encryption cannot silently downgrade."""
@@ -1059,9 +1264,9 @@ class TestFileEncryption:
         assert decrypted_data is None
         assert detected_alg == cfg.HYBRID_KEM_ALG
 
-    def test_canonical_kem_algorithm_treats_kyber768_as_ml_kem_768(self):
-        """Configured ML-KEM/Kyber aliases remain compatible."""
-        assert core.canonical_kem_algorithm("Kyber768") == "ML-KEM-768"
+    def test_canonical_kem_algorithm_preserves_distinct_kem_identities(self):
+        """Kyber and standardized ML-KEM must never compare as the same KEM."""
+        assert core.canonical_kem_algorithm("Kyber768") == "Kyber768"
         assert core.canonical_kem_algorithm("ML-KEM-768") == "ML-KEM-768"
         assert core.canonical_kem_algorithm("Other-KEM") == "Other-KEM"
 

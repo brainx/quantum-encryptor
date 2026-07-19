@@ -65,7 +65,7 @@ jobs:
           cache: pip
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -134,7 +134,7 @@ jobs:
           cache: pip
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -172,7 +172,7 @@ jobs:
           cache: pip
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -285,7 +285,7 @@ jobs:
               getter = oqs.get_enabled_KEM_mechanisms
 
           enabled = set(getter())
-          assert {"ML-KEM-768", "Kyber768"} & enabled, sorted(enabled)[:20]
+          assert {"ML-KEM-768", "Kyber768"}.issubset(enabled), sorted(enabled)[:20]
           PY
 
       - name: OQS-backed test suite

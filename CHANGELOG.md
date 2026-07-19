@@ -15,6 +15,8 @@ This project follows a practical semantic-versioning style.
 
 - New encryption requires composite public keys and cannot silently downgrade to the legacy single-KEM format.
 - Authenticated format-v3 containers and v2 ML-KEM private keys remain decrypt-only for migration.
+- New keys and ciphertexts use the unambiguous `ML-KEM-768+X25519-v2` suite and require exact ML-KEM-768 support; Kyber768 is no longer treated as an interchangeable alias.
+- Legacy hybrid archives remain recoverable through a bounded ML-KEM/Kyber fallback whose result is accepted only after AES-GCM authentication; legacy hybrid public keys are rejected for new encryption.
 
 ## [1.0.1] - 2026-06-21
 

@@ -308,7 +308,8 @@ def _health_payload() -> dict[str, Any]:
         active_kem_component = cfg.KEM_ALG
         backend_ready = False
         backend_message = (
-            "Post-quantum backend is not ready. Install native liboqs before generating keys or processing files."
+            "The ML-KEM backend is not ready, so new keys and ciphertexts cannot be created. "
+            "Compatible legacy archives may still be decryptable."
         )
         logger.warning("Post-quantum backend readiness check failed: %s", exc)
 
@@ -413,7 +414,11 @@ async def encrypt_file(request: Request) -> Response:
         if not public_key_bytes or not kem_alg_from_key or key_type != "public":
             raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
         if kem_alg_from_key != cfg.HYBRID_KEM_ALG:
-            raise ApiError(400, "legacy_public_key", "Generate a new ML-KEM-768+X25519 public key for encryption.")
+            raise ApiError(
+                400,
+                "legacy_public_key",
+                "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
+            )
 
         encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
         del input_data
@@ -456,6 +461,7 @@ async def decrypt_file(request: Request) -> Response:
                 400, "private_key_failed", "Could not unlock the private key. Check the password and key file."
             )
 
+        core.resolve_decryption_kem_algorithms(kem_alg_key)
         decrypted_data, _detected_alg = core.decrypt_file_pro(
             encrypted_blob,
             private_key_bytes,

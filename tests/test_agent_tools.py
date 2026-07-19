@@ -416,7 +416,16 @@ def test_decrypt_uses_password_env_and_writes_plaintext_file(monkeypatch, tmp_pa
     (tmp_path / "message.pqc").write_bytes(b"encrypted")
     (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
     monkeypatch.setenv("AGENT_SECRET", "correct horse battery staple")
-    monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
+    monkeypatch.setattr(
+        tools,
+        "_resolve_backend",
+        lambda *_args, **_kwargs: pytest.fail("decryption must defer backend selection to the container"),
+    )
+    monkeypatch.setattr(
+        tools,
+        "_resolve_decryption_backends",
+        lambda _operation, suite: (cfg.KEM_ALG,) if suite == cfg.KEM_ALG else pytest.fail("unexpected suite"),
+    )
 
     def load_private_key(_pem, password=None):
         assert password == "correct horse battery staple"
@@ -453,6 +462,37 @@ def test_decrypt_uses_password_env_and_writes_plaintext_file(monkeypatch, tmp_pa
         assert stat.S_IMODE((tmp_path / "message.txt").stat().st_mode) == 0o600
 
 
+def test_decrypt_reports_suite_aware_backend_unavailable(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "message.pqc").write_bytes(b"encrypted")
+    (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
+    monkeypatch.setattr(
+        core,
+        "load_key_pem",
+        lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
+    )
+
+    def missing_backend(_suite):
+        raise core.CryptoDependencyError("exact backend missing")
+
+    monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", missing_backend, raising=False)
+    monkeypatch.setattr(
+        core,
+        "decrypt_file_pro",
+        lambda *_args, **_kwargs: pytest.fail("decryption must not run without a compatible backend"),
+    )
+
+    code, payload = _run_agent(
+        ["decrypt", "--input", "message.pqc", "--private-key", "private.pem", "--output", "message.txt"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_BACKEND_UNAVAILABLE
+    assert payload["error_code"] == "backend_unavailable"
+    assert not (tmp_path / "message.txt").exists()
+
+
 def test_decrypt_allows_ciphertext_overhead_above_plaintext_limit(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cfg, "MAX_FILE_BYTES", 3)
@@ -460,7 +500,7 @@ def test_decrypt_allows_ciphertext_overhead_above_plaintext_limit(monkeypatch, t
     (tmp_path / "message.pqc").write_bytes(b"encrypted-container")
     (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
-    monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
+    monkeypatch.setattr(tools, "_resolve_decryption_backends", lambda _operation, suite: (suite,))
     monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
 
     def decrypt_file(_blob, _private_key, expected_kem_alg=None):
@@ -600,11 +640,12 @@ def test_encrypt_mocked_flow_writes_encrypted_file(monkeypatch, tmp_path, capsys
     assert (tmp_path / "message.pqc").read_bytes() == b"encrypted:hello"
 
 
-def test_encrypt_rejects_legacy_single_kem_public_key(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("legacy_kem", [cfg.KEM_ALG, cfg.LEGACY_HYBRID_KEM_ALG])
+def test_encrypt_rejects_legacy_public_key(monkeypatch, tmp_path, capsys, legacy_kem):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.txt").write_bytes(b"hello")
     (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.KEM_ALG, "public"))
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", legacy_kem, "public"))
     monkeypatch.setattr(
         tools,
         "_resolve_backend",
@@ -640,7 +681,16 @@ def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_pa
     (tmp_path / "message.pqc").write_bytes(_syntactic_encrypted_blob())
     (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
     monkeypatch.setenv("AGENT_SECRET", "correct horse battery staple")
-    monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
+    monkeypatch.setattr(
+        tools,
+        "_resolve_backend",
+        lambda *_args, **_kwargs: pytest.fail("verification must defer backend selection to the container"),
+    )
+    monkeypatch.setattr(
+        tools,
+        "_resolve_decryption_backends",
+        lambda _operation, suite: (cfg.KEM_ALG,) if suite == cfg.HYBRID_KEM_ALG else pytest.fail("unexpected suite"),
+    )
     monkeypatch.setattr(
         core,
         "load_key_pem",
