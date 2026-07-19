@@ -124,7 +124,9 @@ getter = getattr(oqs, "get_enabled_kem_mechanisms", None)
 if getter is None:
     getter = oqs.get_enabled_KEM_mechanisms
 
-print("ML-KEM-768" in getter() or "Kyber768" in getter())
+enabled = set(getter())
+print("new encryption ready:", "ML-KEM-768" in enabled)
+print("legacy Kyber archive support:", "Kyber768" in enabled)
 ```
 
 ## Troubleshooting
@@ -139,4 +141,4 @@ If the app reports that the post-quantum backend is not ready:
 
 ### Unsupported Algorithm
 
-The application accepts `ML-KEM-768` and the legacy compatibility alias `Kyber768`. If neither is enabled in your `liboqs` build, rebuild or install a `liboqs` version that includes ML-KEM/Kyber KEM support.
+New key generation and encryption require exact `ML-KEM-768` support. `Kyber768` is distinct and optional; it is used only to recover authenticated archives written through the older ambiguous hybrid-suite label. If ML-KEM-768 is unavailable, rebuild or install a `liboqs` version that enables it.

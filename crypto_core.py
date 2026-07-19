@@ -184,14 +184,6 @@ def _enabled_kem_mechanisms() -> Tuple[str, ...]:
     return tuple(getter())
 
 
-def _kem_aliases(kem_alg: str) -> Tuple[str, ...]:
-    if kem_alg == "ML-KEM-768":
-        return ("ML-KEM-768", "Kyber768")
-    if kem_alg == "Kyber768":
-        return ("Kyber768", "ML-KEM-768")
-    return (kem_alg,)
-
-
 def is_allowed_kem_algorithm(kem_alg: Optional[str]) -> bool:
     """Return whether a KEM identifier is supported by this application."""
     return bool(kem_alg) and kem_alg in cfg.ALLOWED_KEM_ALGS
@@ -202,10 +194,13 @@ def is_allowed_key_algorithm(key_alg: Optional[str]) -> bool:
     return bool(key_alg) and key_alg in cfg.ALLOWED_KEY_ALGS
 
 
+def is_hybrid_key_algorithm(key_alg: Optional[str]) -> bool:
+    """Return whether a key/container identifier is a supported hybrid suite."""
+    return bool(key_alg) and key_alg in cfg.ALLOWED_HYBRID_KEM_ALGS
+
+
 def canonical_kem_algorithm(kem_alg: str) -> str:
-    """Normalize KEM aliases that are equivalent for this application."""
-    if kem_alg in {"ML-KEM-768", "Kyber768"}:
-        return "ML-KEM-768"
+    """Return the exact KEM identity; ML-KEM and Kyber are not aliases."""
     return kem_alg
 
 
@@ -216,13 +211,30 @@ def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
         raise UnsupportedAlgorithmError(f"Unsupported KEM algorithm: {requested!r}")
 
     enabled = set(_enabled_kem_mechanisms())
-    for candidate in _kem_aliases(requested):
-        if candidate in enabled:
-            return candidate
+    if requested in enabled:
+        return requested
 
     raise CryptoDependencyError(
-        f"No supported KEM implementation is enabled. Requested {requested!r}; "
-        f"allowed algorithms are {', '.join(cfg.ALLOWED_KEM_ALGS)}."
+        f"The exact KEM implementation {requested!r} is not enabled. "
+        f"Available compatibility identifiers are {', '.join(cfg.ALLOWED_KEM_ALGS)}."
+    )
+
+
+def resolve_decryption_kem_algorithms(suite: str) -> Tuple[str, ...]:
+    """Resolve exact KEM identities allowed to decrypt a key/container suite."""
+    if suite == cfg.HYBRID_KEM_ALG:
+        return (resolve_kem_algorithm(cfg.KEM_ALG),)
+    if is_allowed_kem_algorithm(suite):
+        return (resolve_kem_algorithm(suite),)
+    if suite != cfg.LEGACY_HYBRID_KEM_ALG:
+        raise UnsupportedAlgorithmError(f"Unsupported key or container suite: {suite!r}")
+
+    enabled = set(_enabled_kem_mechanisms())
+    candidates = tuple(candidate for candidate in (cfg.KEM_ALG, *cfg.LEGACY_KEM_ALGS) if candidate in enabled)
+    if candidates:
+        return candidates
+    raise CryptoDependencyError(
+        "Neither ML-KEM-768 nor the legacy Kyber768 implementation is enabled for archive decryption."
     )
 
 
@@ -327,6 +339,9 @@ def unpack_hybrid_key(key_bytes: bytes, key_type: str) -> Tuple[bytes, bytes]:
 
 def generate_hybrid_keys(kem_alg: str = cfg.KEM_ALG) -> Tuple[Optional[bytes], Optional[bytes]]:
     """Generate independent X25519 and ML-KEM key pairs and return composite key payloads."""
+    if kem_alg != cfg.KEM_ALG:
+        logger.error("New hybrid keys require exact standardized ML-KEM-768 support.")
+        return None, None
     mlkem_public, mlkem_private = generate_oqs_keys(kem_alg)
     if not mlkem_public or not mlkem_private:
         return None, None
@@ -381,7 +396,7 @@ def derive_hybrid_symmetric_key(
         raise ValueError("X25519 ephemeral public key must be 32 bytes.")
     if len(x25519_recipient_public) != cfg.X25519_KEY_BYTES:
         raise ValueError("X25519 recipient public key must be 32 bytes.")
-    if suite != cfg.HYBRID_KEM_ALG:
+    if not is_hybrid_key_algorithm(suite):
         raise UnsupportedAlgorithmError(f"Unsupported hybrid suite: {suite!r}")
 
     domain = cfg.HYBRID_KDF_DOMAIN
@@ -643,7 +658,7 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
     if not is_allowed_key_algorithm(kem_alg):
         logger.error("Unsupported KEM algorithm specified for PEM saving.")
         return None
-    if kem_alg == cfg.HYBRID_KEM_ALG:
+    if is_hybrid_key_algorithm(kem_alg):
         try:
             unpack_hybrid_key(key_bytes, key_type)
         except InvalidKeyFormatError as exc:
@@ -841,7 +856,7 @@ def load_key_pem(
             return None, None, None
         else:
             logger.info(f"Successfully loaded and decrypted private key for algorithm {kem_alg}.")
-            if kem_alg == cfg.HYBRID_KEM_ALG:
+            if is_hybrid_key_algorithm(kem_alg):
                 try:
                     unpack_hybrid_key(raw_key_bytes, "private")
                 except InvalidKeyFormatError as exc:
@@ -856,7 +871,7 @@ def load_key_pem(
         logger.error("Unencrypted private keys are rejected by the current security policy.")
         return None, None, None
     else:  # Public key
-        if kem_alg == cfg.HYBRID_KEM_ALG:
+        if is_hybrid_key_algorithm(kem_alg):
             try:
                 unpack_hybrid_key(raw_or_encrypted_bytes, "public")
             except InvalidKeyFormatError as exc:
@@ -975,8 +990,8 @@ def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
         except UnicodeDecodeError as exc:
             raise FileFormatError("KEM algorithm name is not valid UTF-8.") from exc
         if version == cfg.FORMAT_VERSION:
-            if kem_alg_from_file != cfg.HYBRID_KEM_ALG:
-                raise UnsupportedAlgorithmError("Version 4 requires the configured hybrid suite.")
+            if not is_hybrid_key_algorithm(kem_alg_from_file):
+                raise UnsupportedAlgorithmError("Version 4 requires a supported hybrid suite.")
         elif not is_allowed_kem_algorithm(kem_alg_from_file):
             raise UnsupportedAlgorithmError("Unsupported legacy KEM algorithm in encrypted file.")
 
@@ -1076,7 +1091,7 @@ def encrypt_file_pro(
 
     try:
         if kem_alg != cfg.HYBRID_KEM_ALG:
-            raise UnsupportedAlgorithmError("New encryption requires the ML-KEM-768+X25519 suite.")
+            raise UnsupportedAlgorithmError("New encryption requires the ML-KEM-768+X25519-v2 suite.")
 
         x25519_recipient_public_bytes, mlkem_public_key = unpack_hybrid_key(public_key_bytes, "public")
         x25519_recipient_public = x25519.X25519PublicKey.from_public_bytes(x25519_recipient_public_bytes)
@@ -1172,7 +1187,7 @@ def decrypt_file_pro(
     secret_key_bytes: bytes,
     expected_kem_alg: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
-    """Decrypt v4 hybrid containers and authenticated legacy v3 containers."""
+    """Decrypt current/legacy hybrid containers and authenticated legacy v3 containers."""
     logger.info("Starting decryption process.")
     mlkem_shared_secret = None
     x25519_shared_secret = None
@@ -1198,21 +1213,21 @@ def decrypt_file_pro(
             )
             x25519_ephemeral_public = x25519.X25519PublicKey.from_public_bytes(parts.x25519_ephemeral_public)
             x25519_shared_secret = x25519_private_key.exchange(x25519_ephemeral_public)
-            resolved_kem_alg = resolve_kem_algorithm(cfg.KEM_ALG)
         else:
             mlkem_private_key = secret_key_bytes
-            resolved_kem_alg = resolve_kem_algorithm(kem_alg_from_file)
 
-        logger.debug("Performing ML-KEM decapsulation with %s...", resolved_kem_alg)
+        kem_candidates = resolve_decryption_kem_algorithms(kem_alg_from_file)
         oqs_module = _require_oqs()
-        with oqs_module.KeyEncapsulation(resolved_kem_alg) as kem:
-            if len(mlkem_private_key) != kem.details["length_secret_key"]:
-                logger.error("Provided secret key length does not match the encrypted file's KEM algorithm.")
-                return None, kem_alg_from_file
-            expected_ciphertext_len = kem.details.get("length_ciphertext")
-            if expected_ciphertext_len and parts.metadata.kem_ciphertext_bytes != expected_ciphertext_len:
-                logger.error("KEM ciphertext length does not match the encrypted file's KEM algorithm.")
-                return None, kem_alg_from_file
+        found_compatible_lengths = False
+        for resolved_kem_alg in kem_candidates:
+            logger.debug("Performing KEM decapsulation with exact identity %s...", resolved_kem_alg)
+            with oqs_module.KeyEncapsulation(resolved_kem_alg) as kem:
+                if len(mlkem_private_key) != kem.details["length_secret_key"]:
+                    continue
+                expected_ciphertext_len = kem.details.get("length_ciphertext")
+                if expected_ciphertext_len and parts.metadata.kem_ciphertext_bytes != expected_ciphertext_len:
+                    continue
+                found_compatible_lengths = True
 
             mlkem_shared_secret = _decapsulate_shared_secret(
                 oqs_module,
@@ -1220,37 +1235,42 @@ def decrypt_file_pro(
                 mlkem_private_key,
                 parts.ciphertext_kem,
             )
-            logger.debug("KEM decapsulation successful.")
+            logger.debug("KEM decapsulation completed with %s.", resolved_kem_alg)
 
-        if parts.metadata.version == cfg.FORMAT_VERSION:
-            if x25519_shared_secret is None:
-                raise CryptoCoreError("X25519 key establishment did not produce a shared secret.")
-            aes_key = derive_hybrid_symmetric_key(
-                mlkem_shared_secret,
-                x25519_shared_secret,
-                parts.x25519_ephemeral_public,
-                x25519_recipient_public,
-                kem_alg_from_file,
-            )
-        else:
-            aes_key = derive_symmetric_key_hkdf(mlkem_shared_secret)
-        mlkem_shared_secret = None
-        x25519_shared_secret = None
+            if parts.metadata.version == cfg.FORMAT_VERSION:
+                if x25519_shared_secret is None:
+                    raise CryptoCoreError("X25519 key establishment did not produce a shared secret.")
+                aes_key = derive_hybrid_symmetric_key(
+                    mlkem_shared_secret,
+                    x25519_shared_secret,
+                    parts.x25519_ephemeral_public,
+                    x25519_recipient_public,
+                    kem_alg_from_file,
+                )
+            else:
+                aes_key = derive_symmetric_key_hkdf(mlkem_shared_secret)
+            mlkem_shared_secret = None
 
-        # 5. AES-GCM Decryption
-        logger.debug("Performing AES-GCM decryption...")
-        aesgcm = AESGCM(aes_key)
-        try:
-            decrypted_data = aesgcm.decrypt(parts.nonce, parts.encrypted_data_aes, parts.header_aad)
+            logger.debug("Performing AES-GCM decryption...")
+            aesgcm = AESGCM(aes_key)
+            try:
+                decrypted_data = aesgcm.decrypt(parts.nonce, parts.encrypted_data_aes, parts.header_aad)
+            except InvalidTag:
+                aes_key = None
+                logger.debug("Authentication failed with KEM identity %s.", resolved_kem_alg)
+                continue
+            except Exception as e_aes:
+                logger.exception(f"AES-GCM decryption failed unexpectedly: {e_aes}")
+                return None, kem_alg_from_file
+
             logger.info("AES-GCM decryption and authentication successful.")
             return decrypted_data, kem_alg_from_file
-        except InvalidTag:
+
+        if not found_compatible_lengths:
+            logger.error("Provided key or KEM ciphertext length does not match the encrypted-file suite.")
+        else:
             logger.error("AES-GCM decryption failed: Authentication tag mismatch.")
-            # This is a critical failure - indicates corruption, tampering, or wrong key
-            return None, kem_alg_from_file
-        except Exception as e_aes:
-            logger.exception(f"AES-GCM decryption failed unexpectedly: {e_aes}")
-            return None, kem_alg_from_file
+        return None, kem_alg_from_file
 
     except (FileFormatError, InvalidKeyFormatError, UnsupportedAlgorithmError, SizeLimitError, ValueError) as e_val:
         logger.error(f"Invalid or truncated file header: {e_val}")

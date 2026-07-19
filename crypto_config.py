@@ -6,12 +6,15 @@ class CryptoConfig:
 
     # --- KEM Algorithm ---
     # Choose a NIST standard KEM. Ensure it's enabled in your liboqs build.
-    # `Kyber768` is retained as a legacy alias for older liboqs builds.
+    # `Kyber768` remains decrypt-only compatibility material and is not
+    # interchangeable with standardized ML-KEM-768.
     KEM_ALG = "ML-KEM-768"
     LEGACY_KEM_ALGS = ("Kyber768",)
     ALLOWED_KEM_ALGS = (KEM_ALG, *LEGACY_KEM_ALGS)
-    HYBRID_KEM_ALG = "ML-KEM-768+X25519"
-    ALLOWED_KEY_ALGS = (HYBRID_KEM_ALG, *ALLOWED_KEM_ALGS)
+    LEGACY_HYBRID_KEM_ALG = "ML-KEM-768+X25519"
+    HYBRID_KEM_ALG = "ML-KEM-768+X25519-v2"
+    ALLOWED_HYBRID_KEM_ALGS = (HYBRID_KEM_ALG, LEGACY_HYBRID_KEM_ALG)
+    ALLOWED_KEY_ALGS = (*ALLOWED_HYBRID_KEM_ALGS, *ALLOWED_KEM_ALGS)
     X25519_KEY_BYTES = 32
 
     # --- Data Encryption (DEM) ---

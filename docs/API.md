@@ -48,7 +48,7 @@ Successful command output:
   "ok": true,
   "operation": "encrypt",
   "format_version": 4,
-  "kem": "ML-KEM-768+X25519",
+  "kem": "ML-KEM-768+X25519-v2",
   "output": "data/plain.pqc"
 }
 ```
@@ -308,16 +308,15 @@ def decrypt_file_pro(
     Args:
         encrypted_data: Encrypted file bytes.
         private_key: Private key bytes for decryption.
-        expected_kem_alg: Optional KEM algorithm from the private key. If provided,
-            it must match the encrypted container KEM metadata after compatibility
-            alias normalization.
+        expected_kem_alg: Optional suite/KEM identity from the private key. If
+            provided, it must exactly match the encrypted-container metadata.
         
     Returns:
         Tuple (decrypted_data, kem_algorithm), or (None, None) on error.
     """
 ```
 
-Format version 4 is the only encryption format. Authenticated format version 3 remains decrypt-only; older formats are rejected.
+Format version 4 is the only encryption format. The current `ML-KEM-768+X25519-v2` suite is the only write path. The ambiguous legacy `ML-KEM-768+X25519` suite and authenticated format version 3 remain decrypt-only; older formats are rejected. Legacy hybrid decryption tries only enabled ML-KEM-768/Kyber768 candidates and accepts one only after AES-GCM authentication succeeds.
 
 ```python
 def inspect_encrypted_file_strict(encrypted_blob: bytes) -> EncryptedFileMetadata:
@@ -333,8 +332,9 @@ The `crypto_config` module provides configuration constants used by the cryptogr
 ### Important Constants
 
 - `KEM_ALG`: The post-quantum KEM algorithm used (default: "ML-KEM-768")
-- `HYBRID_KEM_ALG`: The required new key/encryption suite (`ML-KEM-768+X25519`)
-- `ALLOWED_KEM_ALGS`: Accepted KEM identifiers (`ML-KEM-768` and legacy `Kyber768`)
+- `HYBRID_KEM_ALG`: The required new key/encryption suite (`ML-KEM-768+X25519-v2`)
+- `LEGACY_HYBRID_KEM_ALG`: The decrypt-only ambiguous hybrid suite (`ML-KEM-768+X25519`)
+- `ALLOWED_KEM_ALGS`: Exact KEM identifiers (`ML-KEM-768` and decrypt-only migration support for legacy `Kyber768`)
 - `AES_KEY_BYTES`: Size of AES key in bytes (32 for AES-256)
 - `PRIVATE_KEY_MIN_PASSWORD_CHARS`: Minimum private-key password length
 - `PRIVATE_KEY_MIN_UNIQUE_CHARS`: Minimum private-key password character variety

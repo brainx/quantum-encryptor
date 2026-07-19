@@ -422,6 +422,17 @@ def _resolve_backend(operation: str, kem_alg: str = cfg.KEM_ALG) -> str:
         raise AgentCommandError("unsupported_algorithm", str(exc), EXIT_INVALID_INPUT, operation) from exc
 
 
+def _resolve_decryption_backends(operation: str, suite: str) -> tuple[str, ...]:
+    """Preflight only the exact backend identities applicable to a decryption suite."""
+    try:
+        with _suppress_library_output():
+            return core.resolve_decryption_kem_algorithms(suite)
+    except core.CryptoDependencyError as exc:
+        raise AgentCommandError("backend_unavailable", str(exc), EXIT_BACKEND_UNAVAILABLE, operation) from exc
+    except core.UnsupportedAlgorithmError as exc:
+        raise AgentCommandError("unsupported_algorithm", str(exc), EXIT_INVALID_INPUT, operation) from exc
+
+
 def handle_health(_args: argparse.Namespace, workspace: Path) -> int:
     operation = "health"
     try:
@@ -523,7 +534,7 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     if kem_alg != cfg.HYBRID_KEM_ALG:
         raise AgentCommandError(
             "legacy_public_key",
-            "Generate a new ML-KEM-768+X25519 public key for encryption.",
+            "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
             EXIT_INVALID_INPUT,
             operation,
         )
@@ -607,7 +618,7 @@ def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
         operation,
     )
 
-    _resolve_backend(operation)
+    _resolve_decryption_backends(operation, kem_alg)
     with _suppress_library_output():
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
     del encrypted_blob
@@ -649,7 +660,7 @@ def handle_verify_file(args: argparse.Namespace, workspace: Path) -> int:
         operation,
     )
 
-    _resolve_backend(operation)
+    _resolve_decryption_backends(operation, kem_alg)
     with _suppress_library_output():
         decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
     del encrypted_blob

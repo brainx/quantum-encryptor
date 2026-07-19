@@ -285,7 +285,7 @@ jobs:
               getter = oqs.get_enabled_KEM_mechanisms
 
           enabled = set(getter())
-          assert {"ML-KEM-768", "Kyber768"} & enabled, sorted(enabled)[:20]
+          assert {"ML-KEM-768", "Kyber768"}.issubset(enabled), sorted(enabled)[:20]
           PY
 
       - name: OQS-backed test suite

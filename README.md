@@ -216,13 +216,14 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 
 ## Security Considerations
 
-- New encrypted files use format version 4 with ML-KEM-768 + X25519-derived AES-256-GCM keys and authenticate the complete file header as associated data
+- New encrypted files use format version 4 with the `ML-KEM-768+X25519-v2` suite and authenticate the complete file header as AES-GCM associated data
 - New encrypted private-key PEM files require `PQC-Key-Format: 3`; private-key metadata, hybrid suite, KDF parameters, salt, and nonce are authenticated as AES-GCM associated data
 - Authenticated format-v3 files and `PQC-Key-Format: 2` ML-KEM private keys remain decrypt-only for migration; encryption never silently downgrades
 - Private keys must be password protected with scrypt-derived AES-256-GCM keys; unencrypted private keys and legacy encrypted private-key PEM metadata are rejected by default
 - Private-key passwords require at least 16 characters, at least 5 unique characters, and must not match known weak values
-- Decryption checks encrypted-file suite metadata against the private-key metadata; v4 requires `ML-KEM-768+X25519`, while v3 accepts the `ML-KEM-768`/`Kyber768` compatibility aliases
+- Decryption requires an exact private-key/container suite match. The ambiguous legacy `ML-KEM-768+X25519` suite is decrypt-only and selects ML-KEM or Kyber only after AES-GCM authentication succeeds; v3 uses its exact stored KEM identity
 - Existing v2 ML-KEM private keys can decrypt authenticated v3 files, but creating new encrypted files requires generating a new composite key pair; re-encrypt migrated data with that new public key
+- Legacy hybrid public keys must be regenerated before encryption; they are never relabeled or reused as current-suite keys
 - PEM/key reads are capped at 128 KiB before parsing; POSIX workspace inputs use descriptor-anchored, no-follow reads, and reads remain bounded even if a file changes during the operation
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
 - State-changing local web API requests require a per-process API token and reject non-local browser origins when an `Origin` header is present
