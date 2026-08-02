@@ -223,11 +223,7 @@ def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
 def available_decryption_kem_algorithms() -> Tuple[str, ...]:
     """Return enabled, application-supported KEM identities in preference order."""
     enabled = set(_enabled_kem_mechanisms())
-    return tuple(
-        candidate
-        for candidate in (cfg.KEM_ALG, *cfg.LEGACY_KEM_ALGS)
-        if candidate in enabled
-    )
+    return tuple(candidate for candidate in (cfg.KEM_ALG, *cfg.LEGACY_KEM_ALGS) if candidate in enabled)
 
 
 def resolve_decryption_kem_algorithms(suite: str) -> Tuple[str, ...]:
