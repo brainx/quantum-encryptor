@@ -85,7 +85,9 @@ async function run() {
     await page.getByRole("heading", { name: "Decrypt a file" }).waitFor();
     await page.getByLabel("Encrypted file").setInputFiles(encryptedPath);
     await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
-    await page.getByText("Compatible private key", { exact: true }).waitFor({ state: "visible" });
+    await page
+      .getByText("Supported encrypted private key; match not yet verified", { exact: true })
+      .waitFor({ state: "visible" });
     await page.getByLabel("Private key password", { exact: true }).fill(password);
     const decryptedDownload = page.waitForEvent("download");
     await page.getByRole("button", { name: "Decrypt file" }).click();
