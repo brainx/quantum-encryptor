@@ -1,47 +1,4 @@
-export type Health = {
-  ok: boolean;
-  backendReady: boolean;
-  backendMessage: string;
-  formatVersion: number;
-  kem: string;
-  kemComponent: string;
-  configuredKem: string;
-  dem: string;
-  maxFileBytes: number;
-  maxEncryptedFileBytes: number;
-  maxPemBytes: number;
-  apiToken: string;
-  passwordPolicy: {
-    minChars: number;
-    minUniqueChars: number;
-  };
-};
-
-export type KeyInspectResult = {
-  ok: boolean;
-  keyInfo: {
-    kem: string;
-    key_type: "public" | "private";
-    private_key_encrypted?: boolean;
-    private_key_format_version?: number;
-    private_key_kdf?: string;
-  };
-  display: Record<string, string>;
-};
-
-export type GeneratedKeys = {
-  ok: boolean;
-  kem: string;
-  publicPem: string;
-  privatePem: string;
-  publicFilename: string;
-  privateFilename: string;
-};
-
-export type DownloadResult = {
-  blob: Blob;
-  filename: string;
-};
+import type { DownloadResult, GeneratedKeys, Health, KeyInspectResult } from "./contracts";
 
 type ApiErrorPayload = {
   ok: false;
@@ -138,28 +95,37 @@ export async function fetchHealth(): Promise<Health> {
   return healthRequest;
 }
 
-export async function inspectKey(file: File): Promise<KeyInspectResult> {
+export async function inspectKey(file: File, signal?: AbortSignal): Promise<KeyInspectResult> {
   const form = new FormData();
   form.append("key", file);
-  const response = await fetchWithApiToken("/api/keys/inspect", { method: "POST", body: form });
+  const response = await fetchWithApiToken("/api/keys/inspect", {
+    method: "POST",
+    body: form,
+    signal
+  });
   if (!response.ok) await parseError(response);
   return (await response.json()) as KeyInspectResult;
 }
 
-export async function generateKeys(password: string): Promise<GeneratedKeys> {
+export async function generateKeys(password: string, signal?: AbortSignal): Promise<GeneratedKeys> {
   const form = new FormData();
   form.append("password", password);
-  const response = await fetchWithApiToken("/api/keys/generate", { method: "POST", body: form });
+  const response = await fetchWithApiToken("/api/keys/generate", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return (await response.json()) as GeneratedKeys;
 }
 
-export async function encryptFile(file: File, publicKey: File, outputFilename: string): Promise<DownloadResult> {
+export async function encryptFile(
+  file: File,
+  publicKey: File,
+  outputFilename: string,
+  signal?: AbortSignal
+): Promise<DownloadResult> {
   const form = new FormData();
   form.append("file", file);
   form.append("public_key", publicKey);
   form.append("output_filename", outputFilename);
-  const response = await fetchWithApiToken("/api/files/encrypt", { method: "POST", body: form });
+  const response = await fetchWithApiToken("/api/files/encrypt", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),
@@ -171,14 +137,15 @@ export async function decryptFile(
   file: File,
   privateKey: File,
   password: string,
-  outputFilename: string
+  outputFilename: string,
+  signal?: AbortSignal
 ): Promise<DownloadResult> {
   const form = new FormData();
   form.append("file", file);
   form.append("private_key", privateKey);
   form.append("password", password);
   form.append("output_filename", outputFilename);
-  const response = await fetchWithApiToken("/api/files/decrypt", { method: "POST", body: form });
+  const response = await fetchWithApiToken("/api/files/decrypt", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),

@@ -76,7 +76,7 @@ The application is designed to protect against the following threats:
 - Legacy hybrid public keys are rejected for encryption and must be regenerated under the current suite.
 - The UI and core encryption path enforce a 100 MiB plaintext in-memory file limit; decryption accepts only the bounded encrypted-container size needed for header, KEM ciphertext, nonce, and tag overhead.
 - The local web API requires a per-process `X-Quantum-Encryptor-Token` for state-changing `/api/*` requests and rejects non-local browser origins when an `Origin` header is present.
-- Download filenames are reduced to local filenames before being passed to Streamlit.
+- Download filenames are reduced to local filenames before the API returns them to the browser.
 - Private-key password protection requires at least 16 characters, at least 5 unique characters, and rejects known weak values in the core, UI, and agent CLI.
 - Unencrypted private keys are rejected in the core, UI, and agent CLI.
 - The core module defines its own logger but leaves root logging configuration to application entry points.

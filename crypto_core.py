@@ -220,6 +220,16 @@ def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
     )
 
 
+def available_decryption_kem_algorithms() -> Tuple[str, ...]:
+    """Return enabled, application-supported KEM identities in preference order."""
+    enabled = set(_enabled_kem_mechanisms())
+    return tuple(
+        candidate
+        for candidate in (cfg.KEM_ALG, *cfg.LEGACY_KEM_ALGS)
+        if candidate in enabled
+    )
+
+
 def resolve_decryption_kem_algorithms(suite: str) -> Tuple[str, ...]:
     """Resolve exact KEM identities allowed to decrypt a key/container suite."""
     if suite == cfg.HYBRID_KEM_ALG:
@@ -229,8 +239,7 @@ def resolve_decryption_kem_algorithms(suite: str) -> Tuple[str, ...]:
     if suite != cfg.LEGACY_HYBRID_KEM_ALG:
         raise UnsupportedAlgorithmError(f"Unsupported key or container suite: {suite!r}")
 
-    enabled = set(_enabled_kem_mechanisms())
-    candidates = tuple(candidate for candidate in (cfg.KEM_ALG, *cfg.LEGACY_KEM_ALGS) if candidate in enabled)
+    candidates = available_decryption_kem_algorithms()
     if candidates:
         return candidates
     raise CryptoDependencyError(

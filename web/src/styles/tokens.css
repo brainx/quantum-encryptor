@@ -1,0 +1,50 @@
+:root {
+  color-scheme: dark;
+  --color-canvas: #090909;
+  --color-rail: #0d0d0d;
+  --color-surface: #141414;
+  --color-surface-raised: #1b1b1b;
+  --color-border: #343434;
+  --color-border-strong: #555555;
+  --color-text: #f2f2ee;
+  --color-text-muted: #aaa9a3;
+  --color-text-subtle: #8a8a85;
+  --color-action: #f2f2ee;
+  --color-action-text: #0b0b0b;
+  --color-success: #78b86b;
+  --color-warning: #d3a24c;
+  --color-error: #d66a63;
+  --focus-ring: #f2f2ee;
+  --radius: 10px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --transition-fast: 140ms ease;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
+button,
+input,
+summary,
+.file-picker {
+  min-height: 44px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

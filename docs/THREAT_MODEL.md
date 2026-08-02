@@ -15,7 +15,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 
 ## Trust Boundaries
 
-- Streamlit uploads are untrusted user-controlled files.
+- Browser uploads to the local web API are untrusted user-controlled files.
 - Agent CLI arguments and environment variables are untrusted automation inputs.
 - Public/private PEM files and `.pqc` files are attacker-controlled until parsed and authenticated.
 - Native `liboqs` and Python `cryptography` are trusted dependencies but may be unavailable or misconfigured.

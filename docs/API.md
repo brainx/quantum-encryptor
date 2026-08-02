@@ -39,6 +39,23 @@ The custom web UI is served by `api_app.py` on `127.0.0.1` by default. `GET /api
 
 When a browser sends an `Origin` header on a state-changing API request, the server only accepts local origins beginning with `http://127.0.0.1:` or `http://localhost:`. Requests without the local API token are rejected before route handlers parse uploaded files or form data.
 
+### Health capability contract
+
+`GET /api/health` includes additive, operation-specific readiness information. New clients should use these capabilities to decide whether to enable each workflow:
+
+```
+{
+  "capabilities": {
+    "inspect": { "available": true, "reason": "" },
+    "generate": { "available": true, "reason": "" },
+    "encrypt": { "available": true, "reason": "" },
+    "decrypt": { "available": true, "reason": "" }
+  }
+}
+```
+
+`backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception. The health response is marked `Cache-Control: no-store` and `Pragma: no-cache` because it includes the per-process local API token.
+
 ### Agent JSON Contract
 
 Successful command output:

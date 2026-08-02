@@ -26,8 +26,8 @@ Use this checklist before publishing a new release.
 python -m pip install -r requirements-dev.txt
 npm ci
 python -m black --check .
-python -m flake8 api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py setup.py tests
-python -m mypy api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py tests
+python -m flake8 api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py ui_helpers.py setup.py tests
+python -m mypy api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py ui_helpers.py tests
 ./test.sh --cov=crypto_core --cov=pqc_agent_tools --cov=ui_helpers --cov=api_app --cov-report=term-missing --cov-fail-under=80
 npm run build
 npm run check

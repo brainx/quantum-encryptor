@@ -47,6 +47,31 @@ def test_health_payload_reports_ready_backend(monkeypatch):
     assert payload["kemComponent"] == "ML-KEM-768"
 
 
+def test_health_payload_reports_partial_capabilities(monkeypatch):
+    def missing_current_backend(_kem):
+        raise core.CryptoDependencyError("private backend detail")
+
+    monkeypatch.setattr(core, "resolve_kem_algorithm", missing_current_backend)
+    monkeypatch.setattr(core, "available_decryption_kem_algorithms", lambda: ("Kyber768",))
+
+    payload = api_app._health_payload()
+
+    assert payload["backendReady"] is False
+    assert payload["capabilities"] == {
+        "inspect": {"available": True, "reason": ""},
+        "generate": {
+            "available": False,
+            "reason": "ML-KEM-768 is unavailable for new key generation.",
+        },
+        "encrypt": {
+            "available": False,
+            "reason": "ML-KEM-768 is unavailable for new encryption.",
+        },
+        "decrypt": {"available": True, "reason": ""},
+    }
+    assert "private backend detail" not in str(payload)
+
+
 def test_content_disposition_quotes_download_filename():
     header = api_app._content_disposition("encrypted file.pqc")
 

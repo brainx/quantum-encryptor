@@ -84,7 +84,7 @@ By participating in this project, you agree to abide by our Code of Conduct.
 - Run mypy to check static typing:
   ```bash
   .venv/bin/python -m mypy \
-    crypto_config.py crypto_core.py pqc_agent_tools.py pqc_app.py \
+    api_app.py crypto_config.py crypto_core.py pqc_agent_tools.py ui_helpers.py \
     tests/test_agent_tools.py tests/test_crypto_core.py
   ```
 

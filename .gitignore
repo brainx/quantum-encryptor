@@ -108,11 +108,6 @@ ENV/
 env.bak/
 venv.bak/
 
-# Streamlit local state and secrets. Keep committed UI theme config.
-.streamlit/*
-!.streamlit/
-!.streamlit/config.toml
-
 # Spyder project settings
 .spyderproject
 .spyproject

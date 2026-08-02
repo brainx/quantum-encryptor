@@ -10,6 +10,17 @@ This project follows a practical semantic-versioning style.
 
 - ML-KEM-768 + X25519 composite key generation and format-v4 encrypted containers.
 - SHA3-256 hybrid key combiner binding both key shares, X25519 context, suite identifier, and application domain.
+- Polished monochrome local web workflows with progressive technical details,
+  responsive navigation, component tests, accessibility checks, and a native
+  browser encryption round trip.
+
+### Changed
+
+- Retired the Streamlit application, temporary startup fallback, packaging
+  surface, and superseded reference screenshots. `./start.sh` now serves the
+  React/Vite interface through the loopback-only Python API as the sole GUI.
+- Preserved decrypt-only compatibility for authenticated earlier containers and
+  private-key formats, including the bounded ML-KEM/Kyber migration path.
 
 ### Security
 

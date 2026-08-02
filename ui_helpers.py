@@ -19,7 +19,7 @@ def guess_decrypted_filename(encrypted_filename: Path) -> str:
 
 
 def format_key_info_for_display(key_info: dict[str, object]) -> dict[str, str]:
-    """Format strict key-inspection metadata for Streamlit display."""
+    """Format strict key-inspection metadata for local web display."""
     display = {
         "Key Type": str(key_info["key_type"]).title(),
         "Algorithm": str(key_info["kem"]),
