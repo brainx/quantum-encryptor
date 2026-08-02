@@ -44,7 +44,7 @@ jobs:
         run: python -m pip_audit -r requirements-dev-lock.txt
 
       - name: Run Python security lint
-        run: python -m bandit -q -r crypto_core.py pqc_agent_tools.py pqc_app.py ui_helpers.py api_app.py
+        run: python -m bandit -q -r crypto_core.py pqc_agent_tools.py ui_helpers.py api_app.py
 
       - name: Install frontend dependencies
         run: npm ci
@@ -82,15 +82,21 @@ jobs:
           /tmp/qe-release-test/bin/quantum-encryptor-agent health --json
           /tmp/qe-release-test/bin/python -I - <<'PY'
           from pathlib import Path
+          from importlib.metadata import requires
+          from importlib.util import find_spec
           import sys
 
           import api_app
           import pqc_agent_tools
+          import ui_helpers
 
           prefix = Path(sys.prefix).resolve()
-          for module in (api_app, pqc_agent_tools):
+          for module in (api_app, pqc_agent_tools, ui_helpers):
               module_path = Path(module.__file__).resolve()
               assert module_path.is_relative_to(prefix), (module.__name__, module_path, prefix)
+          assert find_spec("pqc_app") is None
+          package_requirements = requires("quantum-encryptor") or ()
+          assert all(not requirement.lower().startswith("streamlit") for requirement in package_requirements)
           PY
 
       - name: Smoke installed web UI
@@ -177,9 +183,9 @@ jobs:
         run: |
           git init .ci/liboqs
           git -C .ci/liboqs remote add origin https://github.com/open-quantum-safe/liboqs.git
-          # liboqs 0.15.0
-          git -C .ci/liboqs fetch --depth=1 origin 97f6b86b1b6d109cfd43cf276ae39c2e776aed80
-          git -C .ci/liboqs checkout --detach 97f6b86b1b6d109cfd43cf276ae39c2e776aed80
+          # liboqs 0.16.0
+          git -C .ci/liboqs fetch --depth=1 origin 5a1a854b0dc9f2141bdc771c555ee60c37950183
+          git -C .ci/liboqs checkout --detach 5a1a854b0dc9f2141bdc771c555ee60c37950183
           cmake -S .ci/liboqs -B .ci/liboqs/build \
             -GNinja \
             -DBUILD_SHARED_LIBS=ON \
@@ -188,7 +194,7 @@ jobs:
           cmake --install .ci/liboqs/build
 
       - name: Install Python dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install --require-hashes -r requirements-dev-lock.txt
 
       - name: Verify migration backends are active
         run: |

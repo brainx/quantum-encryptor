@@ -163,6 +163,17 @@ def _algorithm_sensitive_fake_oqs(decapsulation_attempts=None):
     return FakeOQS
 
 
+def test_available_decryption_kem_algorithms_preserves_exact_identities(monkeypatch):
+    """Archive availability lists exact current and legacy KEM identities."""
+    monkeypatch.setattr(
+        core,
+        "_enabled_kem_mechanisms",
+        lambda: ("Kyber768", "ML-KEM-768", "Other"),
+    )
+
+    assert core.available_decryption_kem_algorithms() == ("ML-KEM-768", "Kyber768")
+
+
 def _legacy_v3_blob(plaintext: bytes, mlkem_public: bytes) -> bytes:
     """Build a valid legacy v3 container using the deterministic fake backend."""
     ciphertext_kem = b"C" * 32

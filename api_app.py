@@ -299,23 +299,53 @@ async def _read_upload_text(upload: UploadFile, max_bytes: int, label: str) -> s
         raise ApiError(400, "invalid_text", f"{label} must be a UTF-8 text file.") from exc
 
 
+def _capability(available: bool, reason: str = "") -> dict[str, bool | str]:
+    return {"available": available, "reason": "" if available else reason}
+
+
 def _health_payload() -> dict[str, Any]:
     try:
         active_kem_component = core.resolve_kem_algorithm(cfg.KEM_ALG)
-        backend_ready = True
-        backend_message = "Post-quantum backend ready."
+        current_backend_ready = True
     except Exception as exc:
         active_kem_component = cfg.KEM_ALG
-        backend_ready = False
-        backend_message = (
-            "The ML-KEM backend is not ready, so new keys and ciphertexts cannot be created. "
-            "Compatible legacy archives may still be decryptable."
-        )
+        current_backend_ready = False
         logger.warning("Post-quantum backend readiness check failed: %s", exc)
 
+    try:
+        decrypt_ready = bool(core.available_decryption_kem_algorithms())
+    except Exception as exc:
+        decrypt_ready = False
+        logger.warning("Decryption backend readiness check failed: %s", exc)
+
+    capabilities = {
+        "inspect": _capability(True),
+        "generate": _capability(
+            current_backend_ready,
+            "ML-KEM-768 is unavailable for new key generation.",
+        ),
+        "encrypt": _capability(
+            current_backend_ready,
+            "ML-KEM-768 is unavailable for new encryption.",
+        ),
+        "decrypt": _capability(
+            decrypt_ready,
+            "No supported post-quantum decryption backend is available.",
+        ),
+    }
+    backend_message = (
+        "Post-quantum backend ready."
+        if current_backend_ready
+        else (
+            "The ML-KEM backend is not ready, so new keys and ciphertexts cannot be created. "
+            "Compatible encrypted archives may still be decryptable."
+        )
+    )
+
     return {
-        "backendReady": backend_ready,
+        "backendReady": current_backend_ready,
         "backendMessage": backend_message,
+        "capabilities": capabilities,
         "formatVersion": cfg.FORMAT_VERSION,
         "kem": cfg.HYBRID_KEM_ALG,
         "kemComponent": active_kem_component,

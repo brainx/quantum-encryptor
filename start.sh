@@ -22,12 +22,6 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 127
 fi
 
-if [ "${LEGACY_STREAMLIT:-0}" = "1" ]; then
-  exec "$PYTHON_BIN" -m streamlit run pqc_app.py \
-    --server.address 127.0.0.1 \
-    --server.port "$APP_PORT"
-fi
-
 if [ "${SKIP_WEB_BUILD:-0}" != "1" ]; then
   if [ ! -x "node_modules/.bin/vite" ]; then
     echo "Frontend dependencies are missing. Run npm install before ./start.sh." >&2

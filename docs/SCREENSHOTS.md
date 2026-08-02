@@ -1,31 +1,11 @@
 # Application Screenshots
 
-These screenshots show the custom local web UI. They were captured from the local app with native `liboqs` unavailable, so the backend readiness warning and disabled key generation or file processing controls are expected.
+These screenshots show the current monochrome custom local web UI. The interface uses progressive disclosure: plain-language task guidance appears first, while suite, format, and key-policy information stays inside **Technical details** until it is needed. The desktop Encrypt capture shows format version 4 and the `ML-KEM-768+X25519-v2` hybrid suite; the mobile Inspect key capture shows responsive workflow navigation and public-key metadata only.
 
 ## Custom Web Encrypt Workflow
 
-![Custom web encrypt workflow with backend readiness warning](screenshots/custom-web-encrypt-workflow.png)
+![Custom web encrypt workflow with local engine ready and technical details expanded](screenshots/custom-web-encrypt-workflow.png)
 
 ## Custom Web Mobile Inspect
 
 ![Custom web mobile key inspection workflow](screenshots/custom-web-mobile-inspect.png)
-
-## Legacy Streamlit Reference
-
-The default `./start.sh` path serves the custom local web UI. These older screenshots remain as a reference for the legacy Streamlit interface available through `LEGACY_STREAMLIT=1 ./start.sh`.
-
-### Generate Keys
-
-![Legacy generate keys workflow with backend readiness warning](screenshots/generate-keys-backend-warning.jpg)
-
-### Encrypt File
-
-![Legacy encrypt file workflow](screenshots/encrypt-file-workflow.jpg)
-
-### Decrypt File
-
-![Legacy decrypt file workflow](screenshots/decrypt-file-workflow.jpg)
-
-### Key Utilities
-
-![Legacy key utilities workflow](screenshots/key-utilities-workflow.jpg)
