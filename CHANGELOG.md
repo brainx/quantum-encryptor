@@ -28,6 +28,8 @@ This project follows a practical semantic-versioning style.
 - Authenticated format-v3 containers and v2 ML-KEM private keys remain decrypt-only for migration.
 - New keys and ciphertexts use the unambiguous `ML-KEM-768+X25519-v2` suite and require exact ML-KEM-768 support; Kyber768 is no longer treated as an interchangeable alias.
 - Legacy hybrid archives remain recoverable through a bounded ML-KEM/Kyber fallback whose result is accepted only after AES-GCM authentication; legacy hybrid public keys are rejected for new encryption.
+- The per-process local API token is no longer disclosed in the `GET /api/health` response body; it is delivered only as an `HttpOnly`, `SameSite=Strict` cookie, with the `X-Quantum-Encryptor-Token` header retained for programmatic clients configured via `QUANTUM_ENCRYPTOR_API_TOKEN`.
+- All local web responses now include a restrictive Content Security Policy (including `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
 
 ## [1.0.1] - 2026-06-21
 

@@ -35,9 +35,9 @@ Private-key operations read passwords from an environment variable. The default 
 
 ## Local Web API
 
-The custom web UI is served by `api_app.py` on `127.0.0.1` by default. `GET /api/health` returns a per-process `apiToken` used by the same-origin frontend. Every state-changing `/api/*` request must include that value in the `X-Quantum-Encryptor-Token` header.
+The custom web UI is served by `api_app.py` on `127.0.0.1` by default. `GET /api/health` sets the per-process local API token as an `HttpOnly`, `SameSite=Strict` cookie used by the same-origin frontend; the token is never disclosed in API response bodies. Every state-changing `/api/*` request must carry that cookie, or present the token in the `X-Quantum-Encryptor-Token` header (for programmatic clients configured with `QUANTUM_ENCRYPTOR_API_TOKEN`).
 
-When a browser sends an `Origin` header on a state-changing API request, the server only accepts local origins beginning with `http://127.0.0.1:` or `http://localhost:`. Requests without the local API token are rejected before route handlers parse uploaded files or form data.
+When a browser sends an `Origin` header on a state-changing API request, the server only accepts local origins beginning with `http://127.0.0.1:` or `http://localhost:`. Requests without the local API token are rejected before route handlers parse uploaded files or form data. All responses include a restrictive `Content-Security-Policy` (including `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
 
 ### Health capability contract
 
@@ -54,7 +54,7 @@ When a browser sends an `Origin` header on a state-changing API request, the ser
 }
 ```
 
-`backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception. The health response is marked `Cache-Control: no-store` and `Pragma: no-cache` because it includes the per-process local API token.
+`backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception. The health response is marked `Cache-Control: no-store` and `Pragma: no-cache` because it sets the per-process local API token cookie.
 
 ### Agent JSON Contract
 

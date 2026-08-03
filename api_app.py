@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sys
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -30,9 +31,21 @@ APP_ROOT = Path(__file__).resolve().parent
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 SMALL_FORM_MAX_BYTES = 64 * 1024
 LOCAL_API_TOKEN = os.environ.get("QUANTUM_ENCRYPTOR_API_TOKEN") or secrets.token_urlsafe(32)
+LOCAL_API_TOKEN_COOKIE = "qe_api_token"
 ALLOWED_ORIGIN_PREFIXES = (
     "http://127.0.0.1:",
     "http://localhost:",
+)
+SECURITY_HEADERS = (
+    (
+        b"content-security-policy",
+        b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        b"img-src 'self' data:; connect-src 'self'; font-src 'self' data:; "
+        b"object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    ),
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
 )
 
 
@@ -158,6 +171,19 @@ def _header_value(scope: Scope, name: bytes) -> str | None:
     return None
 
 
+def _cookie_value(scope: Scope, name: str) -> str | None:
+    cookie_header = _header_value(scope, b"cookie")
+    if not cookie_header:
+        return None
+    jar = SimpleCookie()
+    try:
+        jar.load(cookie_header)
+    except Exception:
+        return None
+    morsel = jar.get(name)
+    return morsel.value if morsel is not None else None
+
+
 def _is_state_changing_api(scope: Scope) -> bool:
     method = str(scope.get("method", "GET")).upper()
     path = str(scope.get("path", ""))
@@ -177,7 +203,12 @@ def _has_valid_local_api_token(token: str | None) -> bool:
 
 
 class LocalApiGuardMiddleware:
-    """Require local browser context plus per-process token for state-changing API requests."""
+    """Require local browser context plus per-process token for state-changing API requests.
+
+    The token is accepted from the HttpOnly auth cookie set by ``GET /api/health`` or from
+    the ``X-Quantum-Encryptor-Token`` header for clients configured with
+    ``QUANTUM_ENCRYPTOR_API_TOKEN``. It is never disclosed in API response bodies.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -192,7 +223,7 @@ class LocalApiGuardMiddleware:
             await _json_error(ApiError(403, "forbidden_origin", "Request origin is not allowed."))(scope, receive, send)
             return
 
-        token = _header_value(scope, b"x-quantum-encryptor-token")
+        token = _header_value(scope, b"x-quantum-encryptor-token") or _cookie_value(scope, LOCAL_API_TOKEN_COOKIE)
         if not _has_valid_local_api_token(token):
             await _json_error(ApiError(403, "missing_api_token", "Missing or invalid local API token."))(
                 scope, receive, send
@@ -200,6 +231,29 @@ class LocalApiGuardMiddleware:
             return
 
         await self.app(scope, receive, send)
+
+
+class SecurityHeadersMiddleware:
+    """Apply browser hardening headers to every HTTP response, including middleware errors."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_security_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                existing = {name.lower() for name, _value in headers}
+                for name, value in SECURITY_HEADERS:
+                    if name not in existing:
+                        headers.append((name, value))
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
 
 
 class ApiBodyLimitMiddleware:
@@ -354,7 +408,6 @@ def _health_payload() -> dict[str, Any]:
         "maxFileBytes": cfg.MAX_FILE_BYTES,
         "maxEncryptedFileBytes": cfg.MAX_ENCRYPTED_FILE_BYTES,
         "maxPemBytes": cfg.MAX_PEM_BYTES,
-        "apiToken": LOCAL_API_TOKEN,
         "passwordPolicy": {
             "minChars": cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS,
             "minUniqueChars": cfg.PRIVATE_KEY_MIN_UNIQUE_CHARS,
@@ -364,6 +417,15 @@ def _health_payload() -> dict[str, Any]:
 
 async def health(_request: Request) -> JSONResponse:
     response = _success_json(_health_payload())
+    # Deliver the per-process API token only as an HttpOnly, SameSite=Strict cookie so it
+    # is never exposed in response bodies or to JavaScript, and is not sent cross-site.
+    response.set_cookie(
+        LOCAL_API_TOKEN_COOKIE,
+        LOCAL_API_TOKEN,
+        path="/",
+        httponly=True,
+        samesite="strict",
+    )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     return response
@@ -542,6 +604,7 @@ def create_app() -> Starlette:
     app = Starlette(debug=False, routes=routes)
     app.add_middleware(ApiBodyLimitMiddleware)
     app.add_middleware(LocalApiGuardMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
     return app
 
 

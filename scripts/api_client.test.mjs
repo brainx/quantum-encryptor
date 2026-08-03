@@ -33,7 +33,7 @@ async function loadApiModule() {
   return import(`${pathToFileURL(fileURLToPath(clientPath)).href}#${moduleSequence}`);
 }
 
-function healthPayload(apiToken) {
+function healthPayload() {
   return {
     ok: true,
     backendReady: true,
@@ -52,7 +52,6 @@ function healthPayload(apiToken) {
     maxFileBytes: 104857600,
     maxEncryptedFileBytes: 104989748,
     maxPemBytes: 131072,
-    apiToken,
     passwordPolicy: {
       minChars: 16,
       minUniqueChars: 5
@@ -85,38 +84,38 @@ test("a token rejection refreshes health and retries the state-changing request 
   });
 
   const calls = [];
-  let healthRequests = 0;
+  let generateRequests = 0;
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
-    const token = new Headers(init.headers).get("X-Quantum-Encryptor-Token");
-    calls.push({ url, token });
+    calls.push({ url, headers: new Headers(init.headers) });
 
     if (url === "/api/health") {
-      healthRequests += 1;
-      return jsonResponse(healthPayload(healthRequests === 1 ? "stale-token" : "fresh-token"));
+      return jsonResponse(healthPayload());
     }
-    if (url === "/api/keys/generate" && token === "stale-token") {
-      return jsonResponse(
-        { ok: false, error_code: "missing_api_token", message: "Local API token is invalid." },
-        403
-      );
-    }
-    if (url === "/api/keys/generate" && token === "fresh-token") {
+    if (url === "/api/keys/generate") {
+      generateRequests += 1;
+      if (generateRequests === 1) {
+        return jsonResponse(
+          { ok: false, error_code: "missing_api_token", message: "Local API token is invalid." },
+          403
+        );
+      }
       return jsonResponse(generatedKeysPayload());
     }
-    throw new Error(`Unexpected request: ${url} (${token})`);
+    throw new Error(`Unexpected request: ${url}`);
   };
 
   const api = await loadApiModule();
   const result = await api.generateKeys("correct horse battery staple");
 
   assert.equal(result.publicFilename, "quantum_public_key.pem");
-  assert.deepEqual(calls, [
-    { url: "/api/health", token: null },
-    { url: "/api/keys/generate", token: "stale-token" },
-    { url: "/api/health", token: null },
-    { url: "/api/keys/generate", token: "fresh-token" }
-  ]);
+  assert.deepEqual(
+    calls.map(({ url }) => url),
+    ["/api/health", "/api/keys/generate", "/api/health", "/api/keys/generate"]
+  );
+  for (const { headers } of calls) {
+    assert.equal(headers.get("X-Quantum-Encryptor-Token"), null);
+  }
 });
 
 test("an unrelated authorization rejection is not retried", async (t) => {
@@ -128,13 +127,12 @@ test("an unrelated authorization rejection is not retried", async (t) => {
   const calls = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
-    const token = new Headers(init.headers).get("X-Quantum-Encryptor-Token");
-    calls.push({ url, token });
-    if (url === "/api/health") return jsonResponse(healthPayload("current-token"));
+    calls.push({ url });
+    if (url === "/api/health") return jsonResponse(healthPayload());
     if (url === "/api/keys/generate") {
       return jsonResponse({ ok: false, error_code: "origin_forbidden", message: "Origin is not allowed." }, 403);
     }
-    throw new Error(`Unexpected request: ${url} (${token})`);
+    throw new Error(`Unexpected request: ${url}`);
   };
 
   const api = await loadApiModule();
@@ -143,10 +141,10 @@ test("an unrelated authorization rejection is not retried", async (t) => {
     api.generateKeys("correct horse battery staple"),
     (error) => error instanceof api.ApiError && error.code === "origin_forbidden"
   );
-  assert.deepEqual(calls, [
-    { url: "/api/health", token: null },
-    { url: "/api/keys/generate", token: "current-token" }
-  ]);
+  assert.deepEqual(
+    calls.map(({ url }) => url),
+    ["/api/health", "/api/keys/generate"]
+  );
 });
 
 test("sensitive operation signals reach each state-changing fetch", async (t) => {
@@ -159,7 +157,7 @@ test("sensitive operation signals reach each state-changing fetch", async (t) =>
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
     calls.push({ url, signal: init.signal });
-    if (url === "/api/health") return jsonResponse(healthPayload("current-token"));
+    if (url === "/api/health") return jsonResponse(healthPayload());
     if (url === "/api/keys/generate") return jsonResponse(generatedKeysPayload());
     if (url === "/api/files/encrypt" || url === "/api/files/decrypt") {
       return new Response(new Blob([url]), {
@@ -187,4 +185,5 @@ test("sensitive operation signals reach each state-changing fetch", async (t) =>
       { url: "/api/files/decrypt", signal: controller.signal }
     ]
   );
+  assert.equal(calls.filter(({ url }) => url === "/api/health").length, 1);
 });

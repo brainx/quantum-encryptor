@@ -18,7 +18,6 @@ export type Health = {
   maxFileBytes: number;
   maxEncryptedFileBytes: number;
   maxPemBytes: number;
-  apiToken: string;
   passwordPolicy: {
     minChars: number;
     minUniqueChars: number;

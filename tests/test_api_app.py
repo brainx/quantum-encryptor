@@ -31,7 +31,7 @@ def test_health_payload_is_safe_without_required_native_backend():
     assert payload["configuredKem"] == cfg.KEM_ALG
     assert payload["kem"] == cfg.HYBRID_KEM_ALG
     assert payload["dem"] == "AES-256-GCM"
-    assert payload["apiToken"] == api_app.LOCAL_API_TOKEN
+    assert "apiToken" not in payload
     assert payload["maxFileBytes"] == cfg.MAX_FILE_BYTES
     assert payload["passwordPolicy"]["minChars"] == cfg.PRIVATE_KEY_MIN_PASSWORD_CHARS
 
@@ -266,15 +266,53 @@ def test_read_upload_bytes_rejects_oversized_upload():
         asyncio.run(upload.close())
 
 
-def test_health_route_returns_local_api_token():
+def test_health_route_sets_auth_cookie_without_disclosing_token():
     status, response_headers, response_body = asyncio.run(_call_app_raw("/api/health", method="GET"))
     payload = json.loads(response_body.decode("utf-8"))
 
     assert status == 200
     assert payload["ok"] is True
-    assert payload["apiToken"] == api_app.LOCAL_API_TOKEN
+    assert "apiToken" not in payload
+    set_cookie = _header(response_headers, b"set-cookie")
+    assert set_cookie is not None
+    assert f"{api_app.LOCAL_API_TOKEN_COOKIE}={api_app.LOCAL_API_TOKEN}" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=strict" in set_cookie
     assert _header(response_headers, b"cache-control") == "no-store"
     assert _header(response_headers, b"pragma") == "no-cache"
+
+
+def test_security_headers_are_applied_to_api_responses():
+    status, response_headers, _body = asyncio.run(_call_app_raw("/api/health", method="GET"))
+
+    assert status == 200
+    csp = _header(response_headers, b"content-security-policy")
+    assert csp is not None
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert _header(response_headers, b"x-content-type-options") == "nosniff"
+    assert _header(response_headers, b"x-frame-options") == "DENY"
+    assert _header(response_headers, b"referrer-policy") == "no-referrer"
+
+
+def test_security_headers_cover_middleware_rejections():
+    body, headers = _multipart_body("key", "bad.pem", b"not a supported key")
+
+    status, response_headers, _body = asyncio.run(_call_app_raw("/api/keys/inspect", body=body, headers=headers))
+
+    assert status == 403
+    assert _header(response_headers, b"x-content-type-options") == "nosniff"
+    assert _header(response_headers, b"content-security-policy") is not None
+
+
+def test_post_api_accepts_auth_cookie():
+    body, headers = _multipart_body("key", "bad.pem", b"not a supported key")
+    headers.append((b"cookie", f"{api_app.LOCAL_API_TOKEN_COOKIE}={api_app.LOCAL_API_TOKEN}".encode("ascii")))
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers))
+
+    assert status == 400
+    assert payload["error_code"] == "unsupported_key"
 
 
 def test_post_api_rejects_missing_local_api_token():

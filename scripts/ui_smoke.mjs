@@ -9,7 +9,6 @@ import { chromium } from "playwright";
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = path.join(rootDir, "tmp", "ui-smoke");
 const baseUrl = process.env.UI_SMOKE_URL ?? "http://127.0.0.1:4000/";
-const localToken = "ui-smoke-local-token";
 
 const publicInspection = {
   ok: true,
@@ -70,7 +69,6 @@ function health({ limited = false, strictFileLimit = false } = {}) {
     maxFileBytes: strictFileLimit ? 3 : 104857600,
     maxEncryptedFileBytes: 105906314,
     maxPemBytes: 131072,
-    apiToken: localToken,
     passwordPolicy: { minChars: 16, minUniqueChars: 5 }
   };
 }
