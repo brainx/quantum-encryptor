@@ -63,11 +63,15 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - AES-256-GCM with full encrypted-file header as associated data.
 - Lazy native `liboqs` loading with dependency failures reported as unavailable backend state.
 - Workspace-only agent CLI path validation, exclusive non-overwrite creation, atomic replacement on explicit overwrite, and JSON-only responses.
+- The per-process local API token is delivered only as an `HttpOnly`, `SameSite=Strict` cookie and never appears in API response bodies, so cross-site requests cannot carry it and page JavaScript cannot read it.
+- All local web responses include a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`, blocking clickjacking of the local UI.
 
 ## Limitations
 
 - The app processes files in memory and is not suitable for very large streaming workflows.
 - Python cannot guarantee secure zeroization of immutable secret byte strings.
+- The loopback API trusts the local machine: any local process can call `GET /api/health` and read the auth cookie from the response headers, so the token guards against browser-based cross-site attacks, not against malicious local software. Keep the server bound to `127.0.0.1`; never expose it on a network interface.
+- The local web API does not rate-limit private-key password attempts. Each attempt costs a full scrypt derivation, and an attacker holding the encrypted PEM would brute force offline instead, so online throttling adds little.
 - No independent cryptographic audit or formal verification has been performed.
 - The application-specific file and key formats are not interoperable with OpenPGP or another standardized container format.
 - The hybrid construction has not undergone an independent cryptographic audit.

@@ -18,7 +18,6 @@ export const READY_HEALTH: Health = {
   maxFileBytes: 104857600,
   maxEncryptedFileBytes: 105906314,
   maxPemBytes: 131072,
-  apiToken: "test-local-token",
   passwordPolicy: {
     minChars: 16,
     minUniqueChars: 5

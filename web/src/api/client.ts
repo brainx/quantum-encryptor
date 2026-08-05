@@ -6,7 +6,7 @@ type ApiErrorPayload = {
   message: string;
 };
 
-let localApiToken = "";
+let healthLoaded = false;
 let healthRequest: Promise<Health> | null = null;
 
 export class ApiError extends Error {
@@ -20,16 +20,6 @@ export class ApiError extends Error {
   }
 }
 
-async function apiTokenHeaders(): Promise<HeadersInit> {
-  if (!localApiToken) {
-    await fetchHealth();
-  }
-  if (!localApiToken) {
-    throw new ApiError(503, "missing_api_token", "Local API token is not available.");
-  }
-  return { "X-Quantum-Encryptor-Token": localApiToken };
-}
-
 async function rejectedApiToken(response: Response): Promise<boolean> {
   if (response.status !== 403) return false;
   try {
@@ -40,24 +30,24 @@ async function rejectedApiToken(response: Response): Promise<boolean> {
   }
 }
 
-async function fetchWithApiToken(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
-  const send = async (): Promise<{ response: Response; token: string }> => {
-    const headers = new Headers(init.headers);
-    const tokenHeaders = new Headers(await apiTokenHeaders());
-    const token = tokenHeaders.get("X-Quantum-Encryptor-Token") || "";
-    headers.set("X-Quantum-Encryptor-Token", token);
-    return { response: await fetch(input, { ...init, headers }), token };
-  };
-
-  let attempt = await send();
-  if (await rejectedApiToken(attempt.response)) {
-    if (localApiToken === attempt.token) {
-      localApiToken = "";
-      await fetchHealth();
-    }
-    attempt = await send();
+async function ensureHealth(): Promise<void> {
+  // The first health fetch sets the per-process HttpOnly auth cookie; the browser
+  // attaches it to same-origin state-changing requests automatically.
+  if (!healthLoaded) {
+    await fetchHealth();
+    healthLoaded = true;
   }
-  return attempt.response;
+}
+
+async function fetchStateChanging(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+  await ensureHealth();
+  let response = await fetch(input, init);
+  if (await rejectedApiToken(response)) {
+    // The per-process token rotates on server restart; renew the auth cookie and retry once.
+    await fetchHealth();
+    response = await fetch(input, init);
+  }
+  return response;
 }
 
 function filenameFromDisposition(disposition: string | null, fallback: string): string {
@@ -84,9 +74,7 @@ export async function fetchHealth(): Promise<Health> {
     healthRequest = fetch("/api/health")
       .then(async (response) => {
         if (!response.ok) await parseError(response);
-        const payload = (await response.json()) as Health;
-        localApiToken = payload.apiToken;
-        return payload;
+        return (await response.json()) as Health;
       })
       .finally(() => {
         healthRequest = null;
@@ -98,7 +86,7 @@ export async function fetchHealth(): Promise<Health> {
 export async function inspectKey(file: File, signal?: AbortSignal): Promise<KeyInspectResult> {
   const form = new FormData();
   form.append("key", file);
-  const response = await fetchWithApiToken("/api/keys/inspect", {
+  const response = await fetchStateChanging("/api/keys/inspect", {
     method: "POST",
     body: form,
     signal
@@ -110,7 +98,7 @@ export async function inspectKey(file: File, signal?: AbortSignal): Promise<KeyI
 export async function generateKeys(password: string, signal?: AbortSignal): Promise<GeneratedKeys> {
   const form = new FormData();
   form.append("password", password);
-  const response = await fetchWithApiToken("/api/keys/generate", { method: "POST", body: form, signal });
+  const response = await fetchStateChanging("/api/keys/generate", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return (await response.json()) as GeneratedKeys;
 }
@@ -125,7 +113,7 @@ export async function encryptFile(
   form.append("file", file);
   form.append("public_key", publicKey);
   form.append("output_filename", outputFilename);
-  const response = await fetchWithApiToken("/api/files/encrypt", { method: "POST", body: form, signal });
+  const response = await fetchStateChanging("/api/files/encrypt", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),
@@ -145,7 +133,7 @@ export async function decryptFile(
   form.append("private_key", privateKey);
   form.append("password", password);
   form.append("output_filename", outputFilename);
-  const response = await fetchWithApiToken("/api/files/decrypt", { method: "POST", body: form, signal });
+  const response = await fetchStateChanging("/api/files/decrypt", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),
