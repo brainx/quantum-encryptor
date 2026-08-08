@@ -17,22 +17,22 @@
     "ui-native": "node scripts/ui_native_smoke.mjs"
   },
   "dependencies": {
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
     "@testing-library/dom": "^10.4.1",
-    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/jest-dom": "7.0.0",
     "@testing-library/react": "^16.3.2",
-    "@testing-library/user-event": "^14.6.1",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.3",
-    "jsdom": "26.1.0",
-    "playwright": "^1.61.1",
+    "@testing-library/user-event": "^14.6.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "30.0.1",
+    "playwright": "^1.62.1",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5",
+    "vite": "^8.2.0",
     "vitest": "^4.1.10"
   }
 }
