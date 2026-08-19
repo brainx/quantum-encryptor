@@ -10,6 +10,71 @@ permissions:
   contents: read
 
 jobs:
+  release-preflight:
+    name: Release metadata preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release_commit: ${{ steps.verify_release_tag.outputs.release_commit }}
+      tag_object: ${{ steps.verify_release_tag.outputs.tag_object }}
+
+    steps:
+      - name: Check out complete release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate release metadata and ancestry
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          args=(
+            --commit "${RELEASE_COMMIT}"
+            --main-ref refs/remotes/origin/main
+          )
+          if [[ "${RELEASE_REF_TYPE}" == "tag" ]]; then
+            args+=(--tag "${RELEASE_REF_NAME}" --require-tag-ref)
+          else
+            args+=(--tag-from-project)
+          fi
+          python scripts/check_release_preflight.py "${args[@]}"
+
+      - name: Verify GitHub-validated release tag signature
+        id: verify_release_tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          tag_object=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{tag}")
+          release_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          verification=$(gh api \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" \
+            --jq '[.tag, .object.type, .object.sha, .verification.verified, .verification.reason] | @tsv')
+          IFS=$'\t' read -r signed_tag object_type signed_commit verified reason <<<"${verification}"
+          if [[ "${signed_tag}" != "${RELEASE_TAG}" ]]; then
+            echo "::error::Signed tag name ${signed_tag} does not match release ref ${RELEASE_TAG}."
+            exit 1
+          fi
+          if [[ "${object_type}" != "commit" || "${signed_commit}" != "${release_commit}" ]]; then
+            echo "::error::Signed tag target does not match release commit ${release_commit}."
+            exit 1
+          fi
+          if [[ "${verified}" != "true" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} is not verified by GitHub (${reason:-unknown reason})."
+            exit 1
+          fi
+          echo "release_commit=${release_commit}" >> "${GITHUB_OUTPUT}"
+          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
+
   build-release-artifacts:
     name: Build release artifacts
     runs-on: ubuntu-latest
@@ -17,22 +82,22 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Set up Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22"
           cache: npm
 
-      - name: Install Python build tooling
-        run: python -m pip install -r requirements-dev.txt
+      - name: Install locked Python build tooling
+        run: python -m pip install --require-hashes -r requirements-dev-lock.txt
 
       - name: Audit runtime dependency spec
         run: python -m pip_audit -r requirements.txt
@@ -77,7 +142,8 @@ jobs:
       - name: Install built wheel
         run: |
           python -m venv /tmp/qe-release-test
-          /tmp/qe-release-test/bin/python -m pip install dist/*.whl
+          /tmp/qe-release-test/bin/python -m pip install --require-hashes -r requirements-lock.txt
+          /tmp/qe-release-test/bin/python -m pip install --no-deps dist/*.whl
           cd "$(mktemp -d)"
           /tmp/qe-release-test/bin/quantum-encryptor-agent health --json
           /tmp/qe-release-test/bin/python -I - <<'PY'
@@ -120,7 +186,7 @@ jobs:
           shasum -a 256 * > SHA256SUMS.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: quantum-encryptor-dist
           path: dist/*
@@ -129,36 +195,86 @@ jobs:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    needs: build-release-artifacts
+    needs:
+      - release-preflight
+      - build-release-artifacts
     permissions:
       actions: read
       contents: write
 
     steps:
       - name: Check out release metadata
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Download verified artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: quantum-encryptor-dist
           path: dist
 
-      - name: Publish GitHub release
+      - name: Create draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "$GITHUB_REF_NAME"
           dist/*
+          --draft
           --title "$GITHUB_REF_NAME"
           --notes-file CHANGELOG.md
           --verify-tag
 
+      - name: Revalidate release tag after artifact upload
+        env:
+          EXPECTED_RELEASE_COMMIT: ${{ needs.release-preflight.outputs.release_commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.release-preflight.outputs.tag_object }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ -z "${EXPECTED_RELEASE_COMMIT}" || -z "${EXPECTED_TAG_OBJECT}" ]]; then
+            echo "::error::Release preflight did not provide the verified tag identity."
+            exit 1
+          fi
+          if [[ "${EXPECTED_RELEASE_COMMIT}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::Verified release commit does not match the workflow event commit."
+            exit 1
+          fi
+          current_ref=$(gh api \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '[.object.type, .object.sha] | @tsv')
+          IFS=$'\t' read -r ref_type current_tag_object <<<"${current_ref}"
+          if [[ "${ref_type}" != "tag" || "${current_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} changed after preflight."
+            exit 1
+          fi
+          verification=$(gh api \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/git/tags/${EXPECTED_TAG_OBJECT}" \
+            --jq '[.tag, .object.type, .object.sha, .verification.verified] | @tsv')
+          IFS=$'\t' read -r signed_tag object_type signed_commit verified <<<"${verification}"
+          if [[ "${signed_tag}" != "${RELEASE_TAG}" || "${object_type}" != "commit" ]]; then
+            echo "::error::Verified tag identity changed after artifact upload."
+            exit 1
+          fi
+          if [[ "${signed_commit}" != "${EXPECTED_RELEASE_COMMIT}" || "${verified}" != "true" ]]; then
+            echo "::error::Verified tag target or signature changed after artifact upload."
+            exit 1
+          fi
+
+      - name: Publish verified GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "${RELEASE_TAG}" --draft=false
+
   native-oqs-release:
     name: Native liboqs release gate
     runs-on: ubuntu-latest
+    needs: release-preflight
 
     env:
       OQS_INSTALL_PATH: ${{ github.workspace }}/.local/oqs
@@ -166,18 +282,30 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Install build tools
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          fi
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            install -y build-essential cmake ninja-build
 
       - name: Build and install native liboqs
         run: |
