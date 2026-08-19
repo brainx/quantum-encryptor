@@ -152,9 +152,7 @@ async def _call_app_raw(
     app = api_app.create_app()
     sent: list[dict[str, Any]] = []
     request_sent = False
-    request_headers = list(headers) if headers is not None else [
-        (b"content-length", str(len(body)).encode("ascii"))
-    ]
+    request_headers = list(headers) if headers is not None else [(b"content-length", str(len(body)).encode("ascii"))]
     if host is None:
         host = api_app.LOCAL_API_HOST_HEADER
     if host:
@@ -416,9 +414,7 @@ def test_health_route_sets_auth_cookie_for_matching_browser_authority():
     ],
 )
 def test_health_route_rejects_invalid_or_missing_host_without_setting_cookie(host):
-    status, response_headers, response_body = asyncio.run(
-        _call_app_raw("/api/health", method="GET", host=host)
-    )
+    status, response_headers, response_body = asyncio.run(_call_app_raw("/api/health", method="GET", host=host))
     payload = json.loads(response_body.decode("utf-8"))
 
     assert status == 403
