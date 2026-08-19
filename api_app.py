@@ -218,7 +218,7 @@ def _is_ascii_authority(value: str | None) -> bool:
 
 
 def _parse_origin(value: str | None) -> Authority | None:
-    if not _is_ascii_authority(value):
+    if not isinstance(value, str) or not _is_ascii_authority(value):
         return None
     try:
         parsed = urlsplit(value)
@@ -242,7 +242,7 @@ def _parse_origin(value: str | None) -> Authority | None:
 
 
 def _parse_host_authority(value: str | None) -> tuple[str, int] | None:
-    if not _is_ascii_authority(value) or value.lower() == "null":
+    if not isinstance(value, str) or not _is_ascii_authority(value) or value.lower() == "null":
         return None
     try:
         parsed = urlsplit(f"http://{value}")
@@ -335,18 +335,16 @@ class LocalApiGuardMiddleware:
             return
 
         try:
-            header_token = _single_header_value(scope, b"x-quantum-encryptor-token")
+            token = _single_header_value(scope, b"x-quantum-encryptor-token")
         except _DuplicateHeaderError:
-            header_token = ""
-        if header_token is not None:
-            token = header_token
-        elif has_valid_origin:
-            try:
-                token = _cookie_value(scope, LOCAL_API_TOKEN_COOKIE)
-            except _DuplicateHeaderError:
-                token = None
-        else:
+            # A repeated explicit credential must fail closed without trying the cookie.
             token = None
+        else:
+            if token is None and has_valid_origin:
+                try:
+                    token = _cookie_value(scope, LOCAL_API_TOKEN_COOKIE)
+                except _DuplicateHeaderError:
+                    token = None
         if not _has_valid_local_api_token(token):
             await _json_error(ApiError(403, "missing_api_token", "Missing or invalid local API token."))(
                 scope, receive, send
