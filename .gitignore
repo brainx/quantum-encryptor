@@ -140,3 +140,4 @@ test_files/
 node_modules/
 static/app/
 tmp/
+.worktrees/
