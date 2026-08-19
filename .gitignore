@@ -141,3 +141,6 @@ node_modules/
 static/app/
 tmp/
 .worktrees/
+
+# Internal planning artifacts
+docs/superpowers/
