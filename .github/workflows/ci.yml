@@ -19,6 +19,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Reject internal planning artifacts
+        run: |
+          tracked_internal_files=$(git ls-files ':(icase)docs/superpowers' ':(icase)docs/superpowers/**')
+          if [[ -n "${tracked_internal_files}" ]]; then
+            echo "::error::Internal planning artifacts must not be committed."
+            printf '%s\n' "${tracked_internal_files}"
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
