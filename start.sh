@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-APP_PORT="${PORT:-4000}"
+APP_PORT="${PORT-4000}"
 
 if [ -n "${PYTHON:-}" ]; then
   PYTHON_BIN="$PYTHON"

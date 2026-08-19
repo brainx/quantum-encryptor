@@ -3,7 +3,33 @@
 import { defineConfig, loadEnv, type UserConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-export function createViteConfig(environment: Record<string, string | undefined>): UserConfig {
+type ViteEnvironment = {
+  PORT?: string;
+  QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV?: string;
+};
+
+function configuredPort(value: string | undefined): number {
+  if (value === undefined) {
+    return 4000;
+  }
+
+  const port = Number(value);
+  if (!/^[0-9]+$/.test(value) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("PORT must be an integer from 1 through 65535.");
+  }
+  return port;
+}
+
+export function loadViteEnvironment(mode: string): ViteEnvironment {
+  const loaded = loadEnv(mode, ".", ["PORT", "QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV"]);
+  return {
+    PORT: loaded.PORT,
+    QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV: loaded.QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV
+  };
+}
+
+export function createViteConfig(environment: ViteEnvironment): UserConfig {
+  const port = configuredPort(environment.PORT);
   return {
     root: "web",
     plugins: [react()],
@@ -15,7 +41,7 @@ export function createViteConfig(environment: Record<string, string | undefined>
         environment.QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV === "1"
           ? {
               "/api": {
-                target: `http://127.0.0.1:${environment.PORT ?? "4000"}`,
+                target: `http://127.0.0.1:${port}`,
                 changeOrigin: false
               }
             }
@@ -34,4 +60,4 @@ export function createViteConfig(environment: Record<string, string | undefined>
   };
 }
 
-export default defineConfig(({ mode }) => createViteConfig(loadEnv(mode, ".", "")));
+export default defineConfig(({ mode }) => createViteConfig(loadViteEnvironment(mode)));

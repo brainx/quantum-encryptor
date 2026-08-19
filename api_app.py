@@ -33,7 +33,10 @@ Authority = tuple[str, str, int]
 def _configured_port(value: str) -> int:
     if not value.isascii() or not value.isdecimal():
         raise ValueError("PORT must be an integer from 1 through 65535.")
-    port = int(value)
+    try:
+        port = int(value)
+    except ValueError:
+        raise ValueError("PORT must be an integer from 1 through 65535.") from None
     if not 1 <= port <= 65535:
         raise ValueError("PORT must be an integer from 1 through 65535.")
     return port
