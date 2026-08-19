@@ -76,6 +76,8 @@ The application is designed to protect against the following threats:
 - Legacy hybrid public keys are rejected for encryption and must be regenerated under the current suite.
 - The UI and core encryption path enforce a 100 MiB plaintext in-memory file limit; decryption accepts only the bounded encrypted-container size needed for header, KEM ciphertext, nonce, and tag overhead.
 - The local web API has one exact `http://127.0.0.1:<PORT>` authority, with `http://127.0.0.1:4001` added only when `QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1` is set for Vite development. State-changing cookie requests require a parsed allowed `Origin` exactly equal to the direct allowed `Host`; Origin-less clients must use `X-Quantum-Encryptor-Token`, and an invalid supplied header cannot fall back to the cookie. `GET /api/health` issues the `HttpOnly`, `SameSite=Strict` cookie only for an allowed Host and matching Origin when present; forwarding headers are not trusted and the token never appears in response bodies. All responses carry a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
+- Every `/api/*` response replaces its cache policy with `Cache-Control: no-store` and `Pragma: no-cache`, while static responses remain outside that policy.
+- The Generate workflow retains its in-app PEM references in current-tab React state, provides explicit clearing, confirms in-app navigation, and conditionally requests a browser leave-page warning while those references remain; downloaded files are separate browser/operating-system copies.
 - Download filenames are reduced to local filenames before the API returns them to the browser.
 - Private-key password protection requires at least 16 characters, at least 5 unique characters, and rejects known weak values in the core, UI, and agent CLI.
 - Unencrypted private keys are rejected in the core, UI, and agent CLI.
@@ -137,6 +139,11 @@ The application has the following security limitations:
    - Files are processed in memory, so very large-file streaming is not supported
    - Sensitive data may remain in Python-managed memory until garbage collection
    - Local reference deletion in the implementation must not be treated as secure memory zeroization
+   - Explicitly clearing generated keys drops React's application references but does not guarantee JavaScript or Python memory zeroization; garbage collection and process-memory reuse are outside application control
+   - Browser leave-page prompts are best effort and browser controlled. They may be suppressed and do not protect against crashes, forced termination, developer tools, extensions, malicious local software, or a compromised browser or operating system
+   - Browser history may preserve a document and its JavaScript heap in the back/forward cache and later restore the generated PEM state; browser lifecycle behavior varies and is not an erasure control
+   - Generated PEMs are returned directly to the tab; there is no server-side temporary key vault or recovery protocol
+   - Browser downloads inherit filesystem permissions from the browser, operating system, and destination; the web flow cannot guarantee the agent CLI's POSIX `0600` private-key mode
 
 ## Reporting Security Issues
 

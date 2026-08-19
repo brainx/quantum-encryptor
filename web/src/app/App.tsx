@@ -44,6 +44,18 @@ export default function App() {
     };
   }, [loadHealth]);
 
+  useEffect(() => {
+    if (!hasGeneratedKeys) return;
+
+    function warnBeforeUnload(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = true;
+    }
+
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [hasGeneratedKeys]);
+
   function navigate(nextView: View) {
     if (nextView === activeView) return;
     if (activeView === "generate" && hasGeneratedKeys) {

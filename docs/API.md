@@ -54,7 +54,13 @@ The custom web UI is served by `api_app.py` at exactly `http://127.0.0.1:<PORT>`
 }
 ```
 
-`backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception. The health response is marked `Cache-Control: no-store` and `Pragma: no-cache` because it sets the per-process local API token cookie.
+`backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception.
+
+### Response caching and generated-key custody
+
+Every HTTP response under `/api/*` carries `Cache-Control: no-store` and `Pragma: no-cache`, including JSON successes and errors, authorization or body-limit middleware rejections, unmatched API routes, framework-generated 500 responses, and file downloads. The policy is applied centrally so new API handlers inherit it; static UI responses outside `/api/*` keep their own cache behavior. These directives reduce retention by conforming HTTP caches but do not securely erase browser or process memory.
+
+Key generation returns the public and encrypted private PEM directly in one response. The server does not retain a temporary downloadable key pair or provide a recovery endpoint; save both values immediately because explicit clearing removes the app's references and browser lifecycle transitions may lose the tab state. Browser history may also preserve and later restore a suspended document's state.
 
 ### Agent JSON Contract
 

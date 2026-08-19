@@ -170,7 +170,7 @@ export function GenerateKeysWorkflow({ health, generate = generateKeys, onSensit
       {hasGeneratedKeys && generatedKeys && (
         <section aria-label="Generated key downloads" className="generated-key-downloads">
           <Notice kind="success" title="Key pair generated">
-            Save both files now. The public key is safe to share; keep the encrypted private key and password secure.
+            Save both files now. The app keeps this generated result in this tab, and you may lose it if you clear it, reload, or leave the page. The public key is safe to share; keep the encrypted private key and password secure.
           </Notice>
           <div className="generated-key-download-actions">
             <button

@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { READY_HEALTH } from "../test/fixtures";
@@ -96,6 +96,75 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Encrypt a file" })).toBeVisible();
   });
 
+  it("cancels page leave only while generated keys remain", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    const initialEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(initialEvent)).toBe(true);
+    expect(initialEvent.defaultPrevented).toBe(false);
+
+    await openGeneratedKeys(user);
+    const activeEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(activeEvent)).toBe(false);
+    expect(activeEvent.defaultPrevented).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "Clear generated keys" }));
+    const clearedEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(clearedEvent)).toBe(true);
+    expect(clearedEvent.defaultPrevented).toBe(false);
+  });
+
+  it("allows page leave while key generation is pending or failed", async () => {
+    let rejectGeneration: (reason?: unknown) => void = () => undefined;
+    client.generateKeys.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectGeneration = reject;
+      })
+    );
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Generate keys" }));
+    await screen.findByRole("heading", { name: "Generate keys" });
+    await user.type(screen.getByLabelText("Private key password"), "correct horse battery staple");
+    await user.type(screen.getByLabelText("Confirm private key password"), "correct horse battery staple");
+    await user.click(screen.getByRole("button", { name: "Generate key pair" }));
+    expect(await screen.findByRole("button", { name: "Generating key pair" })).toBeDisabled();
+
+    const pendingEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(pendingEvent)).toBe(true);
+    expect(pendingEvent.defaultPrevented).toBe(false);
+
+    await act(async () => {
+      rejectGeneration(new Error("raw backend generation details"));
+    });
+    expect(
+      await screen.findByText("Could not generate keys. Check the password requirements and try again.")
+    ).toBeVisible();
+
+    const failedEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(failedEvent)).toBe(true);
+    expect(failedEvent.defaultPrevented).toBe(false);
+  });
+
+  it("restores page leave when the app unmounts", async () => {
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+
+    await openGeneratedKeys(user);
+    const activeEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(activeEvent)).toBe(false);
+
+    unmount();
+
+    const unmountedEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(unmountedEvent)).toBe(true);
+    expect(unmountedEvent.defaultPrevented).toBe(false);
+  });
+
   it("keeps generated keys active when leaving is cancelled", async () => {
     const user = userEvent.setup();
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
@@ -119,6 +188,10 @@ describe("App", () => {
 
     expect(confirm).toHaveBeenCalledWith("Generated keys are still available. Leave this workflow and clear them?");
     expect(await screen.findByRole("heading", { name: "Inspect a key" })).toBeVisible();
+
+    const navigatedEvent = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(navigatedEvent)).toBe(true);
+    expect(navigatedEvent.defaultPrevented).toBe(false);
 
     await user.click(screen.getByRole("button", { name: "Generate keys" }));
     await screen.findByRole("heading", { name: "Generate keys" });
