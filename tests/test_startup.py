@@ -1,3 +1,4 @@
+import ast
 import os
 from pathlib import Path
 import subprocess
@@ -71,3 +72,36 @@ def test_import_rejects_invalid_port_configuration_without_token_leakage(port):
     assert completed.returncode != 0
     assert "PORT must be an integer from 1 through 65535." in output
     assert token not in output
+
+
+@pytest.mark.parametrize(
+    ("vite_dev_value", "expected_authorities"),
+    [
+        ("1", [("http", "127.0.0.1", 4000), ("http", "127.0.0.1", 4001)]),
+        (None, [("http", "127.0.0.1", 4000)]),
+        ("", [("http", "127.0.0.1", 4000)]),
+        ("0", [("http", "127.0.0.1", 4000)]),
+        ("true", [("http", "127.0.0.1", 4000)]),
+        (" 1", [("http", "127.0.0.1", 4000)]),
+        ("1 ", [("http", "127.0.0.1", 4000)]),
+    ],
+)
+def test_vite_development_authority_requires_exact_environment_opt_in(vite_dev_value, expected_authorities):
+    environment = os.environ.copy()
+    environment.update({"PORT": "4000", "PYTHONPATH": str(REPOSITORY_ROOT)})
+    if vite_dev_value is None:
+        environment.pop("QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV", None)
+    else:
+        environment["QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV"] = vite_dev_value
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "import api_app; print(sorted(api_app.ALLOWED_BROWSER_AUTHORITIES))"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert ast.literal_eval(completed.stdout) == expected_authorities

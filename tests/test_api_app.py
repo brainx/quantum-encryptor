@@ -242,6 +242,9 @@ def _invalid_key_request_headers(*extra_headers: tuple[bytes, bytes]) -> tuple[b
         ("http://127.0.0.1:4000", ("http", "127.0.0.1", 4000)),
         ("HTTP://127.0.0.1:4000", ("http", "127.0.0.1", 4000)),
         ("http://127.0.0.1", ("http", "127.0.0.1", 80)),
+        ("http://localhost:4000", ("http", "localhost", 4000)),
+        ("http://[::1]:4000", ("http", "::1", 4000)),
+        ("http://127.0.0.2:4000", ("http", "127.0.0.2", 4000)),
     ],
 )
 def test_parse_origin_normalizes_valid_http_authorities(value, expected):
@@ -255,7 +258,6 @@ def test_parse_origin_normalizes_valid_http_authorities(value, expected):
         "",
         "null",
         "https://127.0.0.1:4000",
-        "http://localhost:4000",
         "http://user@127.0.0.1:4000",
         "http://127.0.0.1:4000/path",
         "http://127.0.0.1:4000?query=1",
@@ -269,13 +271,18 @@ def test_parse_origin_normalizes_valid_http_authorities(value, expected):
         "http://127.0.0.1:4000.evil",
     ],
 )
-def test_parse_origin_rejects_non_exact_local_authorities(value):
+def test_parse_origin_rejects_malformed_authorities(value):
     assert api_app._parse_origin(value) is None
 
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("127.0.0.1:4000", ("127.0.0.1", 4000))],
+    [
+        ("127.0.0.1:4000", ("127.0.0.1", 4000)),
+        ("localhost:4000", ("localhost", 4000)),
+        ("[::1]:4000", ("::1", 4000)),
+        ("127.0.0.2:4000", ("127.0.0.2", 4000)),
+    ],
 )
 def test_parse_host_authority_normalizes_valid_authority(value, expected):
     assert api_app._parse_host_authority(value) == expected
@@ -287,7 +294,6 @@ def test_parse_host_authority_normalizes_valid_authority(value, expected):
         None,
         "",
         "null",
-        "localhost:4000",
         "user@127.0.0.1:4000",
         "http://127.0.0.1:4000",
         "127.0.0.1:4000/path",
@@ -302,7 +308,7 @@ def test_parse_host_authority_normalizes_valid_authority(value, expected):
         "127.0.0.1:4000.evil",
     ],
 )
-def test_parse_host_authority_rejects_non_exact_local_authorities(value):
+def test_parse_host_authority_rejects_malformed_authorities(value):
     assert api_app._parse_host_authority(value) is None
 
 
@@ -398,7 +404,17 @@ def test_health_route_sets_auth_cookie_for_matching_browser_authority():
     assert _header(response_headers, b"set-cookie") is not None
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1:4001", "localhost:4000", "127.0.0.1:4000.evil", ""])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1:4001",
+        "localhost:4000",
+        "[::1]:4000",
+        "127.0.0.2:4000",
+        "127.0.0.1:4000.evil",
+        "",
+    ],
+)
 def test_health_route_rejects_invalid_or_missing_host_without_setting_cookie(host):
     status, response_headers, response_body = asyncio.run(
         _call_app_raw("/api/health", method="GET", host=host)
@@ -426,7 +442,15 @@ def test_health_route_rejects_duplicate_host_without_setting_cookie():
     assert _header(response_headers, b"set-cookie") is None
 
 
-@pytest.mark.parametrize("origin", ["http://127.0.0.1:4001", "http://127.0.0.1:4000.evil"])
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://127.0.0.1:4001",
+        "http://[::1]:4000",
+        "http://127.0.0.2:4000",
+        "http://127.0.0.1:4000.evil",
+    ],
+)
 def test_health_route_rejects_present_invalid_origin_without_setting_cookie(origin):
     status, response_headers, response_body = asyncio.run(
         _call_app_raw(
@@ -555,7 +579,10 @@ def test_post_api_rejects_invalid_explicit_token_even_with_valid_cookie():
     assert payload["error_code"] == "missing_api_token"
 
 
-@pytest.mark.parametrize("host", ["", "127.0.0.1:4001", "127.0.0.1:4000.evil"])
+@pytest.mark.parametrize(
+    "host",
+    ["", "127.0.0.1:4001", "[::1]:4000", "127.0.0.2:4000", "127.0.0.1:4000.evil"],
+)
 def test_post_api_rejects_missing_malformed_or_sibling_host(host):
     body, headers = _invalid_key_request_headers(
         (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
@@ -565,6 +592,42 @@ def test_post_api_rejects_missing_malformed_or_sibling_host(host):
 
     assert status == 403
     assert payload["error_code"] == "forbidden_host"
+
+
+@pytest.mark.parametrize("origin", ["http://[::1]:4000", "http://127.0.0.2:4000"])
+def test_post_api_rejects_ipv6_and_alternate_loopback_origins(origin):
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+        (b"origin", origin.encode("ascii")),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_origin"
+
+
+@pytest.mark.parametrize(
+    ("host", "origin", "error_code"),
+    [
+        ("127.0.0.1:4001", None, "forbidden_host"),
+        ("127.0.0.1:4000", "http://127.0.0.1:4001", "forbidden_origin"),
+    ],
+)
+def test_authority_rejection_precedes_oversized_body_validation(host, origin, error_code):
+    body = b"not-a-valid-multipart-body"
+    headers = [
+        (b"content-type", b"multipart/form-data; boundary=missing"),
+        (b"content-length", str(_inspect_key_body_limit() + 1).encode("ascii")),
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+    ]
+    if origin is not None:
+        headers.append((b"origin", origin.encode("ascii")))
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host=host))
+
+    assert status == 403
+    assert payload["error_code"] == error_code
 
 
 def test_post_api_rejects_duplicate_host():
