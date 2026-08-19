@@ -24,6 +24,8 @@ This project follows a practical semantic-versioning style.
 
 ### Security
 
+- Updated the locked Nano ID and PostCSS transitive dependencies to releases that address their current security advisories.
+- Raised the minimum `cryptography` version to 50.0.0 and refreshed the hash-locked runtime and development dependency sets to exclude the vulnerable 49.0.0 release.
 - New encryption requires composite public keys and cannot silently downgrade to the legacy single-KEM format.
 - Authenticated format-v3 containers and v2 ML-KEM private keys remain decrypt-only for migration.
 - New keys and ciphertexts use the unambiguous `ML-KEM-768+X25519-v2` suite and require exact ML-KEM-768 support; Kyber768 is no longer treated as an interchangeable alias.

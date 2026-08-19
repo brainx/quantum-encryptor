@@ -31,7 +31,8 @@ APP_ROOT = Path(__file__).resolve().parent
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 SMALL_FORM_MAX_BYTES = 64 * 1024
 LOCAL_API_TOKEN = os.environ.get("QUANTUM_ENCRYPTOR_API_TOKEN") or secrets.token_urlsafe(32)
-LOCAL_API_TOKEN_COOKIE = "qe_api_token"
+# Cookie name, not a secret value.
+LOCAL_API_TOKEN_COOKIE = "qe_api_token"  # nosec B105
 ALLOWED_ORIGIN_PREFIXES = (
     "http://127.0.0.1:",
     "http://localhost:",
