@@ -471,6 +471,23 @@ def handle_inspect_key(args: argparse.Namespace, workspace: Path) -> int:
     except Exception as exc:
         raise _agent_error_from_core(operation, exc) from exc
 
+    if payload["key_type"] == "private" and args.password_env is not None:
+        password = _password_from_env(args.password_env, operation, required=True)
+        private_key, kem_alg, loaded_key_type = core.load_key_pem(pem_content, password=password)
+        if not private_key or not kem_alg or loaded_key_type != "private":
+            raise AgentCommandError(
+                "private_key_load_failed",
+                "Could not load private key.",
+                EXIT_CRYPTO_FAILURE,
+                operation,
+            )
+        try:
+            payload["public_key_fingerprint"] = core.get_private_key_public_fingerprint(private_key, kem_alg)
+        except Exception as exc:
+            raise _agent_error_from_core(operation, exc) from exc
+        finally:
+            del private_key
+
     payload["key"] = _relative_to_workspace(key_path, workspace)
     return _success(operation, **payload)
 
@@ -492,6 +509,7 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
     if not public_key or not private_key:
         raise AgentCommandError("key_generation_failed", "Key generation failed.", EXIT_BACKEND_UNAVAILABLE, operation)
 
+    public_key_fingerprint = core.get_public_key_fingerprint(public_key, cfg.HYBRID_KEM_ALG)
     public_pem = core.save_key_pem(public_key, cfg.HYBRID_KEM_ALG, "public")
     private_pem = core.save_key_pem(private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
     del public_key
@@ -515,6 +533,7 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
         kem_component=kem_component,
         public_key=_relative_to_workspace(public_path, workspace),
         private_key=_relative_to_workspace(private_path, workspace),
+        public_key_fingerprint=public_key_fingerprint,
         private_key_encrypted=True,
         private_key_kdf=cfg.PRIVATE_KEY_KDF_ALG,
     )
@@ -738,6 +757,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_key = subparsers.add_parser("inspect-key", help="Inspect a PQC PEM key.")
     inspect_key.add_argument("--key", required=True)
+    inspect_key.add_argument(
+        "--password-env",
+        help="Optional environment variable used to unlock a private key and derive its public fingerprint.",
+    )
     inspect_key.set_defaults(handler=handle_inspect_key)
 
     return parser

@@ -24,15 +24,27 @@ export type Health = {
   };
 };
 
+type PublicKeyInfo = {
+  kem: string;
+  key_type: "public";
+  public_key_fingerprint: string;
+  private_key_encrypted?: never;
+  private_key_format_version?: never;
+  private_key_kdf?: never;
+};
+
+type PrivateKeyInfo = {
+  kem: string;
+  key_type: "private";
+  public_key_fingerprint?: never;
+  private_key_encrypted?: boolean;
+  private_key_format_version?: number;
+  private_key_kdf?: string;
+};
+
 export type KeyInspectResult = {
   ok: boolean;
-  keyInfo: {
-    kem: string;
-    key_type: "public" | "private";
-    private_key_encrypted?: boolean;
-    private_key_format_version?: number;
-    private_key_kdf?: string;
-  };
+  keyInfo: PublicKeyInfo | PrivateKeyInfo;
   display: Record<string, string>;
 };
 
@@ -43,6 +55,7 @@ export type GeneratedKeys = {
   privatePem: string;
   publicFilename: string;
   privateFilename: string;
+  publicKeyFingerprint: string;
 };
 
 export type DownloadResult = {

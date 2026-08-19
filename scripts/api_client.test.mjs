@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { transformWithOxc } from "vite";
 
 let moduleSequence = 0;
+const testPublicKeyFingerprint = `QE1-SHA3-256:${"a".repeat(64)}`;
 
 async function loadApiModule() {
   const tmpDirectory = new URL("../tmp/api-client-tests/", import.meta.url);
@@ -66,7 +67,8 @@ function generatedKeysPayload() {
     publicPem: "PUBLIC PEM",
     privatePem: "PRIVATE PEM",
     publicFilename: "quantum_public_key.pem",
-    privateFilename: "quantum_private_key.pem"
+    privateFilename: "quantum_private_key.pem",
+    publicKeyFingerprint: testPublicKeyFingerprint
   };
 }
 
@@ -109,6 +111,7 @@ test("a token rejection refreshes health and retries the state-changing request 
   const result = await api.generateKeys("correct horse battery staple");
 
   assert.equal(result.publicFilename, "quantum_public_key.pem");
+  assert.equal(result.publicKeyFingerprint, testPublicKeyFingerprint);
   assert.deepEqual(
     calls.map(({ url }) => url),
     ["/api/health", "/api/keys/generate", "/api/health", "/api/keys/generate"]

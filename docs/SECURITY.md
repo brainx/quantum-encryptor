@@ -36,6 +36,11 @@ The application uses post-quantum/traditional hybrid key establishment followed 
    - Salt size: 16 bytes (128 bits)
    - New encrypted private-key PEM format version 3 authenticates the hybrid suite, KDF metadata, salt, and nonce as AES-GCM associated data
 
+7. **Public-Key Fingerprints**: SHA3-256
+   - Uses the domain `QuantumEncryptor-PublicKey-Fingerprint-v1` followed by a NUL byte, then the two-byte unsigned big-endian length of the ASCII algorithm label, the label bytes, the four-byte unsigned big-endian public-key length, and the canonically validated public-key bytes
+   - Encodes the digest as the complete `QE1-SHA3-256:<64 lowercase hexadecimal characters>` value
+   - Versions fingerprinting independently and does not alter PEM headers, PEM format versions, or the encrypted-file format
+
 ## Threat Model
 
 The application is designed to protect against the following threats:
@@ -72,6 +77,8 @@ The application is designed to protect against the following threats:
 - New encrypted private-key PEM parsing requires `PQC-Key-Format: 3`; authenticated v2 ML-KEM keys remain decrypt-only for migration.
 - PEM private-key encryption authenticates the private-key format version, suite, KDF parameters, salt, and nonce as AES-GCM associated data.
 - PEM parsing uses strict base64 decoding and validates encrypted private-key salt, nonce, scrypt KDF metadata, maximum PEM size, and maximum raw key payload size.
+- Public fingerprints are produced only after exact length checks, canonical and usable X25519 public-coordinate validation for hybrid keys, and canonical ML-KEM encoding validation; the exact algorithm label is included in the fingerprint preimage.
+- Public inspection and generation expose the full fingerprint in the API, web UI, and agent JSON. Metadata-only encrypted private-key inspection omits it; the CLI derives it only after an explicit `--password-env NAME` unlock authenticates the PEM and the decrypted private-key structure validates.
 - File decryption requires an exact private-key/container suite label match. The legacy `ML-KEM-768+X25519` label is decrypt-only; its bounded ML-KEM/Kyber migration fallback accepts a candidate only after AES-GCM authentication succeeds. Format-v3 containers use their exact stored KEM identity.
 - Legacy hybrid public keys are rejected for encryption and must be regenerated under the current suite.
 - The UI and core encryption path enforce a 100 MiB plaintext in-memory file limit; decryption accepts only the bounded encrypted-container size needed for header, KEM ciphertext, nonce, and tag overhead.
@@ -108,7 +115,8 @@ To maximize the security of the application, follow these best practices:
 
 1. **File Encryption**
    - Encrypt files before transferring them over untrusted networks
-   - Verify the authenticity of public keys before use
+   - Compare the complete public-key fingerprint with the key owner over an independently authenticated channel before use
+   - Do not treat a fingerprint received with the key as independent verification
 
 2. **Password Selection**
    - Use high-entropy passwords (at least 16 characters)
@@ -144,6 +152,10 @@ The application has the following security limitations:
    - Browser history may preserve a document and its JavaScript heap in the back/forward cache and later restore the generated PEM state; browser lifecycle behavior varies and is not an erasure control
    - Generated PEMs are returned directly to the tab; there is no server-side temporary key vault or recovery protocol
    - Browser downloads inherit filesystem permissions from the browser, operating system, and destination; the web flow cannot guarantee the agent CLI's POSIX `0600` private-key mode
+
+5. **Fingerprint Trust**
+   - A matching fingerprint identifies the same validated algorithm label and canonical public-key bytes; it is not a certificate, signature, trust chain, proof of identity, or proof of private-key control
+   - Fingerprints do not prevent an attacker from substituting both a public key and its displayed fingerprint on the same compromised channel
 
 ## Reporting Security Issues
 

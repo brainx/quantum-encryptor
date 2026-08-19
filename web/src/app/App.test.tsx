@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { READY_HEALTH } from "../test/fixtures";
 import App from "./App";
 
+const TEST_PUBLIC_KEY_FINGERPRINT = `QE1-SHA3-256:${"a".repeat(64)}`;
+
 const client = vi.hoisted(() => ({
   fetchHealth: vi.fn(),
   generateKeys: vi.fn()
@@ -39,7 +41,8 @@ beforeEach(() => {
     publicPem: "PUBLIC-PEM",
     privatePem: "ENCRYPTED-PRIVATE-PEM",
     publicFilename: "recipient-public.pem",
-    privateFilename: "recipient-private.pem"
+    privateFilename: "recipient-private.pem",
+    publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT
   });
 });
 

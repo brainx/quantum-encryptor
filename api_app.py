@@ -602,6 +602,7 @@ async def generate_keys(request: Request) -> JSONResponse:
         if not raw_public_key or not raw_private_key:
             raise ApiError(503, "backend_unavailable", "Could not generate a hybrid key pair.")
 
+        public_key_fingerprint = core.get_public_key_fingerprint(raw_public_key, cfg.HYBRID_KEM_ALG)
         public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
         private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
         del raw_public_key
@@ -614,6 +615,7 @@ async def generate_keys(request: Request) -> JSONResponse:
                 "kem": cfg.HYBRID_KEM_ALG,
                 "publicPem": public_pem,
                 "privatePem": private_pem,
+                "publicKeyFingerprint": public_key_fingerprint,
                 "publicFilename": "ml-kem-768_x25519_public.pem",
                 "privateFilename": "ml-kem-768_x25519_private.pem",
             }

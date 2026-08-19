@@ -20,6 +20,53 @@ import crypto_core as core
 LEGACY_HYBRID_SUITE = cfg.LEGACY_HYBRID_KEM_ALG
 
 
+def _synthetic_mlkem_public(seed: bytes = bytes(32)) -> bytes:
+    """Return structurally valid canonical ML-KEM-768 public bytes."""
+    assert len(seed) == 32
+    return bytes(1152) + seed
+
+
+def _synthetic_mlkem_private(public_key: bytes | None = None, rejection_seed: bytes = bytes(32)) -> bytes:
+    """Return ML-KEM-768 private bytes with a valid embedded-public hash."""
+    public_key = public_key or _synthetic_mlkem_public()
+    assert len(public_key) == 1184
+    assert len(rejection_seed) == 32
+    return bytes(1152) + public_key + hashlib.sha3_256(public_key).digest() + rejection_seed
+
+
+def _public_key_pem(public_key: bytes, kem_alg: str = cfg.KEM_ALG) -> str:
+    return "\n".join(
+        [
+            cfg.PEM_PUBLIC_HEADER,
+            f"{cfg.PEM_ALGORITHM_HEADER}{kem_alg}",
+            base64.b64encode(public_key).decode("ascii"),
+            cfg.PEM_PUBLIC_FOOTER,
+        ]
+    )
+
+
+def _syntactic_encrypted_private_pem(
+    encrypted_key: bytes,
+    kem_alg: str = cfg.KEM_ALG,
+    extra_metadata: tuple[str, ...] = (),
+) -> str:
+    salt = base64.b64encode(bytes(cfg.SCRYPT_SALT_BYTES)).decode("ascii")
+    nonce = base64.b64encode(bytes(cfg.AES_NONCE_BYTES)).decode("ascii")
+    return "\n".join(
+        [
+            cfg.PEM_PRIVATE_HEADER,
+            f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
+            cfg.PEM_PROC_TYPE_HEADER,
+            f"{cfg.PEM_DEK_INFO_HEADER}{salt},{nonce}",
+            f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
+            f"{cfg.PEM_ALGORITHM_HEADER}{kem_alg}",
+            *extra_metadata,
+            base64.b64encode(encrypted_key).decode("ascii"),
+            cfg.PEM_PRIVATE_FOOTER,
+        ]
+    )
+
+
 def _encrypted_blob_offsets(encrypted_data: bytes) -> dict[str, int]:
     """Return useful offsets for the project encrypted-file format."""
     fixed_header_size = struct.calcsize(cfg.HEADER_BASE_FORMAT)
@@ -67,8 +114,8 @@ def _syntactic_encrypted_blob(version: int = cfg.FORMAT_VERSION) -> bytes:
 
 def _fake_hybrid_keys() -> tuple[bytes, bytes, bytes, bytes]:
     """Return matching composite keys plus their ML-KEM components for fake-backend tests."""
-    mlkem_private = b"M" * 32
-    mlkem_public = hashlib.sha256(mlkem_private).digest()
+    mlkem_public = _synthetic_mlkem_public(os.urandom(32))
+    mlkem_private = _synthetic_mlkem_private(mlkem_public, os.urandom(32))
     x25519_private_key = x25519.X25519PrivateKey.generate()
     x25519_private = x25519_private_key.private_bytes(
         serialization.Encoding.Raw,
@@ -96,8 +143,8 @@ def fake_oqs_backend(monkeypatch):
             assert algorithm in {cfg.KEM_ALG, "Kyber768"}
             self.secret_key = secret_key
             self.details = {
-                "length_public_key": 32,
-                "length_secret_key": 32,
+                "length_public_key": cfg.MLKEM768_PUBLIC_KEY_BYTES,
+                "length_secret_key": cfg.MLKEM768_PRIVATE_KEY_BYTES,
                 "length_ciphertext": 32,
             }
 
@@ -112,7 +159,8 @@ def fake_oqs_backend(monkeypatch):
             return ciphertext, hashlib.sha256(b"mlkem-share" + public_key + ciphertext).digest()
 
         def decap_secret(self, ciphertext):
-            public_key = hashlib.sha256(self.secret_key).digest()
+            public_start = cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES
+            public_key = self.secret_key[public_start : public_start + cfg.MLKEM768_PUBLIC_KEY_BYTES]
             return hashlib.sha256(b"mlkem-share" + public_key + ciphertext).digest()
 
     class FakeOQS:
@@ -137,8 +185,8 @@ def _algorithm_sensitive_fake_oqs(decapsulation_attempts=None):
             if secret_key is not None and decapsulation_attempts is not None:
                 decapsulation_attempts.append(algorithm)
             self.details = {
-                "length_public_key": 32,
-                "length_secret_key": 32,
+                "length_public_key": cfg.MLKEM768_PUBLIC_KEY_BYTES,
+                "length_secret_key": cfg.MLKEM768_PRIVATE_KEY_BYTES,
                 "length_ciphertext": 32,
             }
 
@@ -154,7 +202,8 @@ def _algorithm_sensitive_fake_oqs(decapsulation_attempts=None):
             return ciphertext, shared_secret
 
         def decap_secret(self, ciphertext):
-            public_key = hashlib.sha256(self.secret_key).digest()
+            public_start = cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES
+            public_key = self.secret_key[public_start : public_start + cfg.MLKEM768_PUBLIC_KEY_BYTES]
             return hashlib.sha256(self.algorithm.encode("ascii") + public_key + ciphertext).digest()
 
     class FakeOQS:
@@ -301,9 +350,46 @@ class TestKeyGeneration:
         assert public_key is None
         assert private_key is None
 
+    def test_generate_oqs_keys_rejects_noncanonical_backend_output(self, monkeypatch):
+        """Backend-reported lengths do not override ML-KEM structural validation."""
+        invalid_public = bytearray(_synthetic_mlkem_public())
+        invalid_public[:3] = bytes((0x01, 0x0D, 0x00))
+        invalid_private = _synthetic_mlkem_private(bytes(invalid_public))
+
+        class InvalidGeneratedKEM:
+            details = {
+                "length_public_key": cfg.MLKEM768_PUBLIC_KEY_BYTES,
+                "length_secret_key": cfg.MLKEM768_PRIVATE_KEY_BYTES,
+            }
+
+            def __init__(self, _algorithm):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                return None
+
+            def generate_keypair(self):
+                return bytes(invalid_public)
+
+            def export_secret_key(self):
+                return invalid_private
+
+        class InvalidGeneratedOQS:
+            KeyEncapsulation = InvalidGeneratedKEM
+
+        monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem: cfg.KEM_ALG)
+        monkeypatch.setattr(core, "_require_oqs", lambda: InvalidGeneratedOQS)
+
+        assert core.generate_oqs_keys(cfg.KEM_ALG) == (None, None)
+
     def test_generate_hybrid_keys_combines_independent_x25519_and_ml_kem_keys(self, monkeypatch):
         """Composite keys contain independently generated X25519 and ML-KEM components."""
-        monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: (b"mlkem-public", b"mlkem-private"))
+        expected_public = _synthetic_mlkem_public()
+        expected_private = _synthetic_mlkem_private(expected_public)
+        monkeypatch.setattr(core, "generate_oqs_keys", lambda _kem: (expected_public, expected_private))
 
         public_key, private_key = core.generate_hybrid_keys(cfg.KEM_ALG)
 
@@ -317,8 +403,8 @@ class TestKeyGeneration:
             .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         )
         assert derived_public == x25519_public
-        assert mlkem_public == b"mlkem-public"
-        assert mlkem_private == b"mlkem-private"
+        assert mlkem_public == expected_public
+        assert mlkem_private == expected_private
 
     def test_generate_hybrid_keys_rejects_legacy_kyber(self, monkeypatch):
         """New composite keys must use exact standardized ML-KEM, never legacy Kyber."""
@@ -335,6 +421,17 @@ class TestKeyGeneration:
         """Composite keys fail closed unless both components are present."""
         with pytest.raises(core.InvalidKeyFormatError):
             core.unpack_hybrid_key(b"x" * cfg.X25519_KEY_BYTES, key_type)
+
+    def test_pack_hybrid_key_rejects_truncated_mlkem_component(self):
+        """A one-byte ML-KEM component cannot become a composite key."""
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.pack_hybrid_key(bytes(cfg.X25519_KEY_BYTES), b"x")
+
+    @pytest.mark.parametrize("key_type", ["public", "private"])
+    def test_unpack_hybrid_key_rejects_wrong_total_length(self, key_type):
+        """Composite splitting enforces the exact public/private size."""
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.unpack_hybrid_key(bytes(cfg.X25519_KEY_BYTES + 1), key_type)
 
     def test_resolve_invalid_algorithm_raises_typed_error(self):
         """Unsupported KEM names raise the typed core exception."""
@@ -606,6 +703,348 @@ class TestPrivateKeyEncryption:
 class TestPEMKeyFormat:
     """Tests for PEM key format functions."""
 
+    def test_public_key_fingerprint_uses_stable_versioned_encoding(self):
+        """The same canonical public key keeps its documented QE1 fingerprint."""
+        public_key = bytes(range(32)) + _synthetic_mlkem_public()
+
+        assert core.get_public_key_fingerprint(public_key, cfg.HYBRID_KEM_ALG) == (
+            "QE1-SHA3-256:1eb678b26edc4f1509c23c4ebe375d6d9a7a1daa46b551d5a9a0f4221727434b"
+        )
+
+    @pytest.mark.parametrize(
+        ("kem_alg", "public_key", "expected"),
+        [
+            (
+                cfg.KEM_ALG,
+                _synthetic_mlkem_public(),
+                "QE1-SHA3-256:aa26edc9dfd9928c5898e90d85ed0ae942fbaf5589c30d800c2e318ebdc00479",
+            ),
+            (
+                "Kyber768",
+                _synthetic_mlkem_public(),
+                "QE1-SHA3-256:ae58fdab905fcd3c22b1cac1fb31b5b9c683ace55446090dc5d516a0b0a3ad77",
+            ),
+            (
+                cfg.LEGACY_HYBRID_KEM_ALG,
+                bytes(range(32)) + _synthetic_mlkem_public(),
+                "QE1-SHA3-256:8266ab17f27ef7c99a44d9e33d3c24e6803a0847b0c9822f663a288c8c94eaf4",
+            ),
+        ],
+    )
+    def test_public_key_fingerprint_vectors_bind_exact_algorithm_identity(self, kem_alg, public_key, expected):
+        """Current, legacy, and Kyber labels have stable, distinct fingerprint vectors."""
+        assert core.get_public_key_fingerprint(public_key, kem_alg) == expected
+
+    @pytest.mark.parametrize(
+        ("kem_alg", "public_key"),
+        [
+            (cfg.KEM_ALG, b"short"),
+            (cfg.HYBRID_KEM_ALG, bytes(cfg.X25519_KEY_BYTES + 1)),
+        ],
+    )
+    def test_public_key_fingerprint_rejects_wrong_key_lengths(self, kem_alg, public_key):
+        """A fingerprint cannot legitimize truncated key material."""
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.get_public_key_fingerprint(public_key, kem_alg)
+
+    @pytest.mark.parametrize("encoded_pair", [bytes((0x01, 0x0D, 0x00)), bytes((0x00, 0x10, 0xD0))])
+    def test_public_key_fingerprint_rejects_noncanonical_mlkem_coefficients(self, encoded_pair):
+        """ML-KEM public coefficients at the modulus boundary are invalid."""
+        public_key = bytearray(_synthetic_mlkem_public())
+        public_key[:3] = encoded_pair
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.get_public_key_fingerprint(bytes(public_key), cfg.KEM_ALG)
+
+    def test_public_key_fingerprint_accepts_largest_canonical_mlkem_coefficient(self):
+        """The coefficient immediately below q remains canonical."""
+        public_key = bytearray(_synthetic_mlkem_public())
+        public_key[:3] = bytes((0x00, 0x0D, 0x00))  # First coefficient is q-1=3328.
+
+        assert core.get_public_key_fingerprint(bytes(public_key), cfg.KEM_ALG).startswith("QE1-SHA3-256:")
+
+    @pytest.mark.parametrize(
+        "x25519_public",
+        [
+            bytes(cfg.X25519_KEY_BYTES),
+            (1).to_bytes(cfg.X25519_KEY_BYTES, "little"),
+            core.X25519_FIELD_MODULUS.to_bytes(cfg.X25519_KEY_BYTES, "little"),
+            bytes(range(cfg.X25519_KEY_BYTES - 1)) + bytes([0x9F]),
+        ],
+    )
+    def test_public_key_fingerprint_rejects_noncanonical_or_unusable_x25519(self, x25519_public):
+        """Hybrid fingerprints require one canonical, usable X25519 representation."""
+        public_key = x25519_public + _synthetic_mlkem_public()
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.get_public_key_fingerprint(public_key, cfg.HYBRID_KEM_ALG)
+
+    def test_public_key_fingerprint_rejects_unsupported_algorithm(self):
+        """A fingerprint cannot assign an unsupported identity to key bytes."""
+        with pytest.raises(core.UnsupportedAlgorithmError):
+            core.get_public_key_fingerprint(_synthetic_mlkem_public(), "Fake-KEM")
+
+    def test_private_key_public_fingerprint_matches_corresponding_public_key(self):
+        """An authenticated private key derives the same public fingerprint as its pair."""
+        x25519_private_key = x25519.X25519PrivateKey.from_private_bytes(bytes(range(32)))
+        x25519_public = x25519_private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        mlkem_public = _synthetic_mlkem_public()
+        private_key = bytes(range(32)) + _synthetic_mlkem_private(mlkem_public)
+        public_key = x25519_public + mlkem_public
+
+        assert core.get_private_key_public_fingerprint(private_key, cfg.HYBRID_KEM_ALG) == (
+            core.get_public_key_fingerprint(public_key, cfg.HYBRID_KEM_ALG)
+        )
+
+    def test_private_key_public_fingerprint_rejects_invalid_embedded_public_hash(self):
+        """Private-key fingerprinting requires a valid ML-KEM embedded-public hash."""
+        private_key = bytearray(_synthetic_mlkem_private())
+        private_key[2336] ^= 0x01
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.get_private_key_public_fingerprint(bytes(private_key), cfg.KEM_ALG)
+
+    def test_private_key_public_fingerprint_rejects_noncanonical_embedded_public_key(self):
+        """Private-key fingerprinting validates the embedded ML-KEM public encoding."""
+        public_key = bytearray(_synthetic_mlkem_public())
+        public_key[:3] = bytes((0x01, 0x0D, 0x00))
+        private_key = _synthetic_mlkem_private(bytes(public_key))
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.get_private_key_public_fingerprint(private_key, cfg.KEM_ALG)
+
+    def test_strict_inspection_rejects_invalid_base64_payload(self):
+        """Inspection cannot accept key metadata when the payload is not base64."""
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PUBLIC_HEADER,
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                "not-valid-base64!",
+                cfg.PEM_PUBLIC_FOOTER,
+            ]
+        )
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+
+    def test_strict_inspection_rejects_noncanonical_base64_pad_bits(self):
+        """Equivalent base64 spellings with nonzero pad bits are rejected."""
+        canonical_payload = base64.b64encode(_synthetic_mlkem_public()).decode("ascii")
+        assert canonical_payload.endswith("A=")
+        noncanonical_payload = f"{canonical_payload[:-2]}B="
+        pem_content = _public_key_pem(_synthetic_mlkem_public()).replace(
+            canonical_payload,
+            noncanonical_payload,
+        )
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+
+    @pytest.mark.parametrize(
+        ("kem_alg", "public_key"),
+        [
+            (cfg.KEM_ALG, bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES - 1)),
+            (cfg.KEM_ALG, bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES + 1)),
+            (cfg.HYBRID_KEM_ALG, bytes(cfg.HYBRID_PUBLIC_KEY_BYTES - 1)),
+            (cfg.HYBRID_KEM_ALG, bytes(cfg.HYBRID_PUBLIC_KEY_BYTES + 1)),
+        ],
+    )
+    def test_strict_inspection_rejects_wrong_public_key_lengths(self, kem_alg, public_key):
+        """Inspection rejects truncated single and hybrid public keys."""
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(_public_key_pem(public_key, kem_alg))
+
+    def test_strict_inspection_rejects_duplicate_algorithm_metadata(self):
+        """Duplicate algorithm fields cannot override one another."""
+        pem_content = _public_key_pem(_synthetic_mlkem_public()).replace(
+            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+            "\n".join(
+                [
+                    f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                    f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                ]
+            ),
+        )
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+
+    def test_strict_inspection_rejects_private_metadata_in_public_pem(self):
+        """Private encryption metadata is never ignored inside a public PEM."""
+        pem_content = _public_key_pem(_synthetic_mlkem_public()).replace(
+            f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+            "\n".join([f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}", cfg.PEM_PROC_TYPE_HEADER]),
+        )
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+
+    @pytest.mark.parametrize(
+        ("kem_alg", "payload_bytes"),
+        [
+            (cfg.KEM_ALG, cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES - 1),
+            (cfg.KEM_ALG, cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES + 1),
+            (cfg.HYBRID_KEM_ALG, cfg.HYBRID_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES - 1),
+            (cfg.HYBRID_KEM_ALG, cfg.HYBRID_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES + 1),
+        ],
+    )
+    def test_strict_inspection_rejects_wrong_encrypted_private_payload_length(self, kem_alg, payload_bytes):
+        """Encrypted private envelopes expose an exact ciphertext-size invariant."""
+        pem_content = _syntactic_encrypted_private_pem(bytes(payload_bytes), kem_alg)
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+
+    def test_unencrypted_private_policy_only_applies_after_key_validation(self):
+        """Malformed unencrypted private bytes fail as a format error, not a policy-only error."""
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PRIVATE_HEADER,
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                base64.b64encode(b"truncated").decode("ascii"),
+                cfg.PEM_PRIVATE_FOOTER,
+            ]
+        )
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+        assert core.get_key_info_pem(pem_content) == (None, None, False)
+
+    def test_strict_inspection_rejects_duplicate_private_metadata(self):
+        """Duplicate KDF metadata cannot be accepted before password authentication."""
+        duplicate_kdf = (
+            f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}"
+        )
+        pem_content = _syntactic_encrypted_private_pem(
+            bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES),
+            extra_metadata=(duplicate_kdf,),
+        )
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict(pem_content)
+
+    @pytest.mark.parametrize("metadata_kind", ["format", "proc", "dek"])
+    def test_strict_inspection_rejects_each_duplicate_private_envelope_field(self, metadata_kind):
+        """Every private-envelope field is unique, not first- or last-wins."""
+        pem_lines = _syntactic_encrypted_private_pem(
+            bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES)
+        ).splitlines()
+        if metadata_kind == "format":
+            index = next(
+                offset for offset, line in enumerate(pem_lines) if line.startswith(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER)
+            )
+        elif metadata_kind == "proc":
+            index = pem_lines.index(cfg.PEM_PROC_TYPE_HEADER)
+        else:
+            index = next(offset for offset, line in enumerate(pem_lines) if line.startswith(cfg.PEM_DEK_INFO_HEADER))
+        pem_lines.insert(index + 1, pem_lines[index])
+
+        with pytest.raises(core.InvalidKeyFormatError):
+            core.inspect_key_pem_strict("\n".join(pem_lines))
+
+    @pytest.mark.parametrize(
+        "kdf_value",
+        [
+            f"{cfg.PRIVATE_KEY_KDF_ALG},n={cfg.SCRYPT_N},n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
+            f"{cfg.PRIVATE_KEY_KDF_ALG},n=1,n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}",
+        ],
+    )
+    def test_strict_inspection_rejects_duplicate_kdf_parameters(self, kdf_value):
+        """Repeated KDF parameter names cannot change meaning through last-wins parsing."""
+        pem_content = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+        canonical_kdf = (
+            f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG}," f"n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}"
+        )
+
+        with pytest.raises(core.UnsupportedKDFError):
+            core.inspect_key_pem_strict(pem_content.replace(canonical_kdf, f"{cfg.PEM_KDF_HEADER}{kdf_value}"))
+
+    @pytest.mark.parametrize(
+        ("original", "replacement", "error_type"),
+        [
+            (
+                f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
+                f"{cfg.PEM_PRIVATE_KEY_FORMAT_HEADER}0{cfg.PEM_PRIVATE_KEY_FORMAT_VERSION}",
+                core.InvalidKeyFormatError,
+            ),
+            (
+                f"n={cfg.SCRYPT_N}",
+                f"n=0{cfg.SCRYPT_N}",
+                core.UnsupportedKDFError,
+            ),
+        ],
+    )
+    def test_strict_inspection_rejects_noncanonical_numeric_metadata(self, original, replacement, error_type):
+        """Equivalent numeric spellings cannot bypass canonical authenticated metadata."""
+        pem_content = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+
+        with pytest.raises(error_type):
+            core.inspect_key_pem_strict(pem_content.replace(original, replacement))
+
+    @pytest.mark.parametrize(
+        ("kem_alg", "private_bytes"),
+        [
+            (cfg.KEM_ALG, cfg.MLKEM768_PRIVATE_KEY_BYTES - 1),
+            (cfg.KEM_ALG, cfg.MLKEM768_PRIVATE_KEY_BYTES + 1),
+            (cfg.HYBRID_KEM_ALG, cfg.HYBRID_PRIVATE_KEY_BYTES - 1),
+            (cfg.HYBRID_KEM_ALG, cfg.HYBRID_PRIVATE_KEY_BYTES + 1),
+        ],
+    )
+    def test_load_key_pem_rejects_wrong_decrypted_private_length(self, monkeypatch, kem_alg, private_bytes):
+        """Authenticated decryption cannot return a private key one byte short or long."""
+        encrypted_bytes = core._expected_key_bytes(kem_alg, "private") + cfg.AES_TAG_BYTES
+        pem_content = _syntactic_encrypted_private_pem(bytes(encrypted_bytes), kem_alg)
+        monkeypatch.setattr(core, "decrypt_private_key", lambda _metadata, _password: bytes(private_bytes))
+
+        assert core.load_key_pem(pem_content, password="river metal orbit cactus 47") == (None, None, None)
+
+    def test_strict_inspection_returns_public_fingerprint(self):
+        """A valid public PEM exposes a fingerprint of decoded canonical key bytes."""
+        key_info = core.inspect_key_pem_strict(_public_key_pem(_synthetic_mlkem_public()))
+
+        assert key_info["public_key_fingerprint"] == (
+            "QE1-SHA3-256:aa26edc9dfd9928c5898e90d85ed0ae942fbaf5589c30d800c2e318ebdc00479"
+        )
+
+    def test_public_fingerprint_is_independent_of_pem_line_endings_and_wrapping(self):
+        """PEM presentation does not affect the fingerprint of canonical decoded bytes."""
+        public_key = _synthetic_mlkem_public()
+        canonical_pem = _public_key_pem(public_key)
+        encoded = base64.b64encode(public_key).decode("ascii")
+        wrapped_pem = "\r\n".join(
+            [
+                cfg.PEM_PUBLIC_HEADER,
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                *(encoded[offset : offset + 64] for offset in range(0, len(encoded), 64)),
+                cfg.PEM_PUBLIC_FOOTER,
+            ]
+        )
+
+        canonical_info = core.inspect_key_pem_strict(canonical_pem)
+        wrapped_info = core.inspect_key_pem_strict(wrapped_pem)
+
+        assert wrapped_info["public_key_fingerprint"] == canonical_info["public_key_fingerprint"]
+
+    def test_private_inspection_omits_unauthenticated_public_fingerprint(self):
+        """Passwordless private-envelope inspection never claims a public fingerprint."""
+        pem_content = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+
+        key_info = core.inspect_key_pem_strict(pem_content)
+
+        assert key_info["key_type"] == "private"
+        assert "public_key_fingerprint" not in key_info
+
+    def test_get_key_info_uses_validated_public_and_private_pem(self):
+        """Metadata inspection reports only structurally valid public and private envelopes."""
+        public_pem = _public_key_pem(_synthetic_mlkem_public())
+        private_pem = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+
+        assert core.get_key_info_pem(public_pem) == (cfg.KEM_ALG, "Public", False)
+        assert core.get_key_info_pem(private_pem) == (cfg.KEM_ALG, "Private", True)
+
     def test_save_load_public_key_pem(self, key_pair, kem_algorithm):
         """Test saving and loading a public key in PEM format."""
         public_key, _ = key_pair
@@ -633,6 +1072,14 @@ class TestPEMKeyFormat:
         pem_string = core.save_key_pem(private_key, kem_alg, "private")
 
         assert pem_string is None
+
+    @pytest.mark.parametrize(
+        ("key_type", "password"),
+        [("public", None), ("private", "river metal orbit cactus 47")],
+    )
+    def test_save_key_pem_rejects_wrong_key_lengths(self, key_type, password):
+        """Serialization cannot bless truncated bytes with a supported algorithm label."""
+        assert core.save_key_pem(b"truncated", cfg.KEM_ALG, key_type, password=password) is None
 
     def test_save_load_private_key_pem_with_password(self, key_pair, kem_algorithm):
         """Test saving and loading a private key with password."""
@@ -667,7 +1114,7 @@ class TestPEMKeyFormat:
     def test_save_load_current_private_key_pem_with_authenticated_metadata(self):
         """The current private-key PEM envelope authenticates metadata and round-trips."""
         password = "river metal orbit cactus 47"
-        raw_private_key = b"private-key-bytes"
+        raw_private_key = _synthetic_mlkem_private()
 
         pem_string = core.save_key_pem(raw_private_key, cfg.KEM_ALG, "private", password=password)
 
@@ -681,8 +1128,12 @@ class TestPEMKeyFormat:
     def test_save_load_hybrid_key_pem_uses_v3_authenticated_envelope(self):
         """New composite keys use the authenticated v3 private-key envelope."""
         password = "river metal orbit cactus 47"
-        raw_public_key = core.pack_hybrid_key(b"P" * cfg.X25519_KEY_BYTES, b"mlkem-public")
-        raw_private_key = core.pack_hybrid_key(b"S" * cfg.X25519_KEY_BYTES, b"mlkem-private")
+        mlkem_public = _synthetic_mlkem_public()
+        raw_public_key = core.pack_hybrid_key(b"P" * cfg.X25519_KEY_BYTES, mlkem_public)
+        raw_private_key = core.pack_hybrid_key(
+            b"S" * cfg.X25519_KEY_BYTES,
+            _synthetic_mlkem_private(mlkem_public),
+        )
 
         public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
         private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
@@ -708,8 +1159,12 @@ class TestPEMKeyFormat:
     def test_legacy_hybrid_pem_remains_loadable_but_cannot_encrypt(self):
         """Legacy composite PEMs remain readable only for authenticated archive recovery."""
         password = "river metal orbit cactus 47"
-        raw_public_key = core.pack_hybrid_key(b"P" * cfg.X25519_KEY_BYTES, b"legacy-kem-public")
-        raw_private_key = core.pack_hybrid_key(b"S" * cfg.X25519_KEY_BYTES, b"legacy-kem-private")
+        mlkem_public = _synthetic_mlkem_public(bytes([1]) * 32)
+        raw_public_key = core.pack_hybrid_key(b"P" * cfg.X25519_KEY_BYTES, mlkem_public)
+        raw_private_key = core.pack_hybrid_key(
+            b"S" * cfg.X25519_KEY_BYTES,
+            _synthetic_mlkem_private(mlkem_public),
+        )
 
         public_pem = core.save_key_pem(raw_public_key, cfg.LEGACY_HYBRID_KEM_ALG, "public")
         private_pem = core.save_key_pem(
@@ -749,13 +1204,50 @@ class TestPEMKeyFormat:
         """Authenticated v2 ML-KEM private keys remain usable for decrypting v3 containers."""
         password = "river metal orbit cactus 47"
         monkeypatch.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 2)
-        legacy_pem = core.save_key_pem(b"legacy-private", cfg.KEM_ALG, "private", password=password)
+        legacy_private = _synthetic_mlkem_private()
+        legacy_pem = core.save_key_pem(legacy_private, cfg.KEM_ALG, "private", password=password)
         assert legacy_pem is not None
 
         monkeypatch.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 3)
         loaded = core.load_key_pem(legacy_pem, password=password)
 
-        assert loaded == (b"legacy-private", cfg.KEM_ALG, "private")
+        assert loaded == (legacy_private, cfg.KEM_ALG, "private")
+
+    def test_load_key_pem_preserves_opt_in_legacy_private_envelope(self, monkeypatch):
+        """The explicit legacy switch still permits old private envelopes without format AAD."""
+        password = "river metal orbit cactus 47"
+        raw_private_key = _synthetic_mlkem_private()
+        salt = bytes(range(cfg.SCRYPT_SALT_BYTES))
+        nonce = bytes(range(cfg.AES_NONCE_BYTES))
+        encrypted_key = AESGCM(core.derive_key_from_password(password, salt)).encrypt(
+            nonce,
+            raw_private_key,
+            None,
+        )
+        pem_content = "\n".join(
+            [
+                cfg.PEM_PRIVATE_HEADER,
+                cfg.PEM_PROC_TYPE_HEADER,
+                (
+                    f"{cfg.PEM_DEK_INFO_HEADER}{base64.b64encode(salt).decode('ascii')},"
+                    f"{base64.b64encode(nonce).decode('ascii')}"
+                ),
+                (
+                    f"{cfg.PEM_KDF_HEADER}{cfg.PRIVATE_KEY_KDF_ALG},"
+                    f"n={cfg.SCRYPT_N},r={cfg.SCRYPT_R},p={cfg.SCRYPT_P}"
+                ),
+                f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                base64.b64encode(encrypted_key).decode("ascii"),
+                cfg.PEM_PRIVATE_FOOTER,
+            ]
+        )
+        monkeypatch.setattr(cfg, "ALLOW_LEGACY_PRIVATE_KEY_PEM", True)
+
+        assert core.load_key_pem(pem_content, password=password) == (
+            raw_private_key,
+            cfg.KEM_ALG,
+            "private",
+        )
 
     def test_load_key_pem_rejects_oversized_public_key_payload(self, monkeypatch):
         """Decoded PEM key payloads are capped before acceptance."""
@@ -813,8 +1305,9 @@ class TestPEMKeyFormat:
         """Changing authenticated algorithm metadata breaks private-key decryption."""
         password = "river metal orbit cactus 47"
         monkeypatch.setattr(cfg, "ALLOWED_KEM_ALGS", (cfg.KEM_ALG, "Fake-KEM"))
+        monkeypatch.setattr(cfg, "ALLOWED_KEY_ALGS", (*cfg.ALLOWED_HYBRID_KEM_ALGS, *cfg.ALLOWED_KEM_ALGS))
 
-        pem_string = core.save_key_pem(b"private-key-bytes", cfg.KEM_ALG, "private", password=password)
+        pem_string = core.save_key_pem(_synthetic_mlkem_private(), cfg.KEM_ALG, "private", password=password)
         assert pem_string is not None
         tampered = pem_string.replace(f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}", "Algorithm: Fake-KEM")
 
@@ -827,7 +1320,7 @@ class TestPEMKeyFormat:
     def test_private_key_pem_rejects_kdf_metadata_tampering(self):
         """Changing authenticated KDF metadata breaks private-key decryption."""
         password = "river metal orbit cactus 47"
-        pem_string = core.save_key_pem(b"private-key-bytes", cfg.KEM_ALG, "private", password=password)
+        pem_string = core.save_key_pem(_synthetic_mlkem_private(), cfg.KEM_ALG, "private", password=password)
         assert pem_string is not None
         tampered = pem_string.replace(f"n={cfg.SCRYPT_N}", "n=65536")
 
@@ -840,7 +1333,7 @@ class TestPEMKeyFormat:
     def test_private_key_pem_rejects_dek_metadata_tampering(self):
         """Changing authenticated salt/nonce metadata breaks private-key decryption."""
         password = "river metal orbit cactus 47"
-        pem_string = core.save_key_pem(b"private-key-bytes", cfg.KEM_ALG, "private", password=password)
+        pem_string = core.save_key_pem(_synthetic_mlkem_private(), cfg.KEM_ALG, "private", password=password)
         assert pem_string is not None
         dek_line = next(line for line in pem_string.splitlines() if line.startswith(cfg.PEM_DEK_INFO_HEADER))
         _salt_b64, nonce_b64 = dek_line[len(cfg.PEM_DEK_INFO_HEADER) :].split(",", 1)
@@ -934,7 +1427,7 @@ class TestPEMKeyFormat:
 
     def test_load_unencrypted_private_key_pem_is_rejected(self):
         """Legacy unencrypted private keys fail closed."""
-        private_key = base64.b64encode(b"private-key").decode("ascii")
+        private_key = base64.b64encode(_synthetic_mlkem_private()).decode("ascii")
         pem_content = "\n".join(
             [
                 cfg.PEM_PRIVATE_HEADER,
@@ -1030,6 +1523,22 @@ class TestFileEncryption:
             is None
         )
 
+    def test_encrypt_rejects_noncanonical_x25519_before_backend_use(self, monkeypatch):
+        """An aliased X25519 encoding cannot create ciphertext with mismatched KDF context."""
+        x25519_public = bytearray(bytes(range(cfg.X25519_KEY_BYTES)))
+        x25519_public[-1] |= 0x80
+        public_key = bytes(x25519_public) + _synthetic_mlkem_public()
+        backend_resolution_calls = []
+
+        def record_backend_resolution(_kem_alg):
+            backend_resolution_calls.append(_kem_alg)
+            return cfg.KEM_ALG
+
+        monkeypatch.setattr(core, "resolve_kem_algorithm", record_backend_resolution)
+
+        assert core.encrypt_file_pro(b"plaintext", public_key, cfg.HYBRID_KEM_ALG) is None
+        assert backend_resolution_calls == []
+
     def test_hybrid_v4_rejects_wrong_ml_kem_component(self, fake_oqs_backend):
         """A matching X25519 key cannot compensate for the wrong ML-KEM private component."""
         public_key, private_key, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
@@ -1037,7 +1546,8 @@ class TestFileEncryption:
         assert encrypted_data is not None
 
         x25519_private, _correct_mlkem_private = core.unpack_hybrid_key(private_key, "private")
-        wrong_private = core.pack_hybrid_key(x25519_private, b"W" * 32)
+        wrong_public = _synthetic_mlkem_public(bytes([2]) * 32)
+        wrong_private = core.pack_hybrid_key(x25519_private, _synthetic_mlkem_private(wrong_public))
 
         assert (
             core.decrypt_file_pro(
@@ -1167,6 +1677,22 @@ class TestFileEncryption:
             mlkem_private,
             expected_kem_alg=cfg.KEM_ALG,
         ) == (b"legacy plaintext", cfg.KEM_ALG)
+
+    def test_legacy_decrypt_rejects_invalid_private_key_before_backend_use(self, monkeypatch):
+        """Direct legacy decryption validates the private key before native decapsulation."""
+        invalid_private = bytearray(_synthetic_mlkem_private())
+        invalid_private[2336] ^= 0x01
+        monkeypatch.setattr(
+            core,
+            "resolve_decryption_kem_algorithms",
+            lambda _suite: pytest.fail("backend resolution must not run"),
+        )
+
+        assert core.decrypt_file_pro(
+            _syntactic_encrypted_blob(version=cfg.LEGACY_FORMAT_VERSION),
+            bytes(invalid_private),
+            expected_kem_alg=cfg.KEM_ALG,
+        ) == (None, cfg.KEM_ALG)
 
     def test_hybrid_v4_rejects_suite_downgrade_before_backend_use(self, monkeypatch):
         """A v4 container cannot relabel itself as the legacy single-KEM suite."""

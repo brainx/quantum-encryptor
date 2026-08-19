@@ -36,3 +36,17 @@ def test_format_private_key_info_for_display():
     assert display["Password Encrypted"] == "Yes"
     assert display["Private Key Format"] == str(cfg.PEM_PRIVATE_KEY_FORMAT_VERSION)
     assert display["KDF"] == cfg.PRIVATE_KEY_KDF_ALG
+
+
+def test_format_public_key_info_for_display_includes_fingerprint():
+    fingerprint = "QE1-SHA3-256:" + "a" * 64
+
+    display = format_key_info_for_display(
+        {
+            "key_type": "public",
+            "kem": cfg.HYBRID_KEM_ALG,
+            "public_key_fingerprint": fingerprint,
+        }
+    )
+
+    assert display["Public Key Fingerprint"] == fingerprint
