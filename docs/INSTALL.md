@@ -45,17 +45,22 @@ For reproducible development installs:
 pip install --require-hashes -r requirements-dev-lock.txt
 ```
 
-Regenerate the lock files only after intentionally changing dependency inputs:
+Regenerate the lock files only after intentionally changing dependency inputs. Lock generation is canonical on Ubuntu 24.04 x86-64 with Python 3.13.15, pip 25.3, pip-tools 7.5.3, packaging 26.2, build 1.5.0, click 8.4.2, pyproject-hooks 1.2.0, setuptools 83.0.0, wheel 0.47.0, Node 22.23.1, and npm 10.9.8. Use an isolated environment with those exact versions, then run:
 
 ```bash
-PIP_TOOLS_CACHE_DIR=.cache/pip-tools \
-  pip-compile --generate-hashes --output-file=requirements-lock.txt requirements.txt
+CUSTOM_COMPILE_COMMAND='pip-compile --generate-hashes --output-file=requirements-lock.txt requirements.txt' \
+  PIP_TOOLS_CACHE_DIR=.cache/pip-tools \
+  python -m piptools compile --generate-hashes --output-file=requirements-lock.txt requirements.txt
 
-PIP_TOOLS_CACHE_DIR=.cache/pip-tools \
-  pip-compile --allow-unsafe --generate-hashes --output-file=requirements-dev-lock.txt requirements-dev.txt
+CUSTOM_COMPILE_COMMAND='pip-compile --allow-unsafe --generate-hashes --output-file=requirements-dev-lock.txt requirements-dev.txt' \
+  PIP_TOOLS_CACHE_DIR=.cache/pip-tools \
+  python -m piptools compile --allow-unsafe --generate-hashes --output-file=requirements-dev-lock.txt requirements-dev.txt
+
+npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+python scripts/check_dependency_locks.py
 ```
 
-The development lock uses `--allow-unsafe` so build tooling dependencies such as `pip` and `setuptools` are pinned when they are part of the resolved toolchain.
+The checker regenerates temporary copies and fails if any committed lock differs; it never rewrites repository files. The development lock uses `--allow-unsafe` so build tooling dependencies such as `pip` and `setuptools` are pinned when they are part of the resolved toolchain.
 
 ## Native liboqs
 

@@ -4,24 +4,94 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+      day: "monday"
+      time: "05:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
     groups:
-      python-runtime-and-dev:
+      python-tests:
         patterns:
-          - "*"
+          - "pytest"
+          - "pytest-*"
+        update-types:
+          - "minor"
+          - "patch"
+      python-docs:
+        patterns:
+          - "sphinx"
+          - "sphinx-*"
+          - "docutils"
+        update-types:
+          - "minor"
+          - "patch"
+      python-lock-toolchain:
+        patterns:
+          - "pip"
+          - "pip-tools"
+          - "setuptools"
+          - "wheel"
+        update-types:
+          - "minor"
+          - "patch"
+      python-publish-toolchain:
+        patterns:
+          - "build"
+          - "twine"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+      day: "tuesday"
+      time: "05:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
     groups:
-      web-dependencies:
+      react-family:
         patterns:
-          - "*"
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+        update-types:
+          - "minor"
+          - "patch"
+      vite-family:
+        patterns:
+          - "vite"
+          - "@vitejs/plugin-react"
+        update-types:
+          - "minor"
+          - "patch"
+      testing-library:
+        patterns:
+          - "@testing-library/*"
+        update-types:
+          - "minor"
+          - "patch"
+      browser-testing:
+        patterns:
+          - "playwright"
+          - "@axe-core/playwright"
+        update-types:
+          - "minor"
+          - "patch"
+      unit-testing:
+        patterns:
+          - "vitest"
+          - "jsdom"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+      day: "wednesday"
+      time: "05:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
