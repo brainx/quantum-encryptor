@@ -29,6 +29,17 @@ function limitMessage(label: string, maxBytes: number): string {
   return `${label} exceeds the ${maxBytes.toLocaleString()} byte limit.`;
 }
 
+const PUBLIC_KEY_FINGERPRINT_PREFIX = "QE1-SHA3-256:";
+const PUBLIC_KEY_FINGERPRINT_PATTERN = /^QE1-SHA3-256:[0-9a-f]{64}$/;
+
+function isValidPublicKeyFingerprint(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length === PUBLIC_KEY_FINGERPRINT_PREFIX.length + 64 &&
+    PUBLIC_KEY_FINGERPRINT_PATTERN.test(value)
+  );
+}
+
 export function EncryptWorkflow({
   health,
   inspect,
@@ -54,8 +65,17 @@ export function EncryptWorkflow({
   const fileError = file && file.size > health.maxFileBytes ? limitMessage("This file", health.maxFileBytes) : null;
   const keyError = publicKey && publicKey.size > health.maxPemBytes ? limitMessage("This key file", health.maxPemBytes) : null;
   const safeInspectionError = inspectionError ? "The recipient key could not be inspected." : null;
+  const recipientPublicKeyFingerprint =
+    inspection?.ok &&
+    inspection.keyInfo.key_type === "public" &&
+    isValidPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)
+      ? inspection.keyInfo.public_key_fingerprint
+      : null;
   const compatiblePublicKey = Boolean(
-    inspection?.ok && inspection.keyInfo.key_type === "public" && inspection.keyInfo.kem === health.kem
+    inspection?.ok &&
+      inspection.keyInfo.key_type === "public" &&
+      inspection.keyInfo.kem === health.kem &&
+      recipientPublicKeyFingerprint
   );
 
   const readinessReason = useMemo(() => {
@@ -70,6 +90,9 @@ export function EncryptWorkflow({
     if (inspection.keyInfo.key_type !== "public") return "A public key is required to encrypt a file.";
     if (inspection.keyInfo.kem !== health.kem) {
       return `This public key uses ${inspection.keyInfo.kem}; encryption requires ${health.kem}.`;
+    }
+    if (!isValidPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)) {
+      return "The recipient public key did not provide a valid fingerprint.";
     }
     if (!outputFilename.trim()) return "Enter an output filename.";
     return null;
@@ -218,7 +241,19 @@ export function EncryptWorkflow({
                 <dt>Recipient key</dt>
                 <dd>{keyClassification ?? (publicKey ? "Awaiting inspection" : "Not selected")}</dd>
               </div>
+              {compatiblePublicKey && recipientPublicKeyFingerprint && (
+                <div>
+                  <dt>Recipient public-key fingerprint</dt>
+                  <dd>{recipientPublicKeyFingerprint}</dd>
+                </div>
+              )}
             </dl>
+            {compatiblePublicKey && recipientPublicKeyFingerprint && (
+              <p className="field-hint">
+                Compare this complete fingerprint with the recipient over a separate trusted channel before
+                encrypting.
+              </p>
+            )}
             <div className="output-filename-field">
               <label htmlFor="encrypt-output-filename">Output filename</label>
               <input

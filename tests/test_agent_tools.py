@@ -3,6 +3,7 @@ Tests for the local agent-facing CLI.
 """
 
 import base64
+import hashlib
 import json
 import os
 import stat
@@ -23,7 +24,8 @@ def _run_agent(argv, capsys):
 
 
 def _valid_public_pem() -> str:
-    key_data = base64.b64encode(b"test-public-key").decode("ascii")
+    key_bytes = bytes(range(cfg.X25519_KEY_BYTES)) + bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES)
+    key_data = base64.b64encode(key_bytes).decode("ascii")
     return "\n".join(
         [
             cfg.PEM_PUBLIC_HEADER,
@@ -36,7 +38,18 @@ def _valid_public_pem() -> str:
 
 
 def _valid_private_pem(encrypted: bool = True) -> str:
-    key_data = base64.b64encode(b"test-private-key").decode("ascii")
+    if encrypted:
+        key_bytes = bytes(cfg.HYBRID_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES)
+    else:
+        mlkem_public = bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES)
+        mlkem_private = (
+            bytes(cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES)
+            + mlkem_public
+            + hashlib.sha3_256(mlkem_public).digest()
+            + bytes(32)
+        )
+        key_bytes = bytes(cfg.X25519_KEY_BYTES) + mlkem_private
+    key_data = base64.b64encode(key_bytes).decode("ascii")
     if not encrypted:
         return "\n".join(
             [
@@ -63,6 +76,16 @@ def _valid_private_pem(encrypted: bool = True) -> str:
             "",
         ]
     )
+
+
+def _private_key_info() -> dict[str, object]:
+    return {
+        "key_type": "private",
+        "kem": cfg.HYBRID_KEM_ALG,
+        "private_key_encrypted": True,
+        "private_key_format_version": cfg.PEM_PRIVATE_KEY_FORMAT_VERSION,
+        "private_key_kdf": cfg.PRIVATE_KEY_KDF_ALG,
+    }
 
 
 def _syntactic_encrypted_blob() -> bytes:
@@ -105,6 +128,12 @@ def test_inspect_key_returns_public_key_metadata(monkeypatch, tmp_path, capsys):
     code, payload = _run_agent(["inspect-key", "--key", "recipient.pem"], capsys)
 
     assert code == tools.EXIT_SUCCESS
+    fingerprint = payload.pop("public_key_fingerprint")
+    assert fingerprint.startswith("QE1-SHA3-256:")
+    assert len(fingerprint) == len("QE1-SHA3-256:") + 64
+    digest = fingerprint.removeprefix("QE1-SHA3-256:")
+    assert digest == digest.lower()
+    assert set(digest) <= set("0123456789abcdef")
     assert payload == {
         "ok": True,
         "operation": "inspect-key",
@@ -113,6 +142,88 @@ def test_inspect_key_returns_public_key_metadata(monkeypatch, tmp_path, capsys):
         "key_type": "public",
         "kem": cfg.HYBRID_KEM_ALG,
     }
+
+
+def test_inspect_key_unlocks_private_key_only_when_password_env_is_requested(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
+    monkeypatch.setenv("AGENT_SECRET", "correct horse battery staple")
+    fingerprint = "QE1-SHA3-256:" + "c" * 64
+    monkeypatch.setattr(
+        core,
+        "inspect_key_pem_strict",
+        lambda _pem: _private_key_info(),
+    )
+
+    def load_private_key(_pem: str, password=None):
+        assert password == "correct horse battery staple"
+        return b"private", cfg.HYBRID_KEM_ALG, "private"
+
+    monkeypatch.setattr(core, "load_key_pem", load_private_key)
+
+    def get_fingerprint(private_key: bytes, kem_alg: str) -> str:
+        assert private_key == b"private"
+        assert kem_alg == cfg.HYBRID_KEM_ALG
+        return fingerprint
+
+    monkeypatch.setattr(core, "get_private_key_public_fingerprint", get_fingerprint, raising=False)
+
+    code, payload = _run_agent(
+        ["inspect-key", "--key", "private.pem", "--password-env", "AGENT_SECRET"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_SUCCESS
+    assert payload["public_key_fingerprint"] == fingerprint
+
+
+def test_inspect_key_private_metadata_does_not_read_default_password_env(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
+    monkeypatch.setattr(
+        core,
+        "inspect_key_pem_strict",
+        lambda _pem: _private_key_info(),
+    )
+    monkeypatch.setattr(core, "load_key_pem", lambda *_args, **_kwargs: pytest.fail("private key must stay locked"))
+
+    code, payload = _run_agent(["inspect-key", "--key", "private.pem"], capsys)
+
+    assert code == tools.EXIT_SUCCESS
+    assert "public_key_fingerprint" not in payload
+
+
+def test_inspect_key_wrong_private_password_fails_without_fingerprint(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
+    monkeypatch.setenv("AGENT_SECRET", "incorrect horse battery staple")
+    monkeypatch.setattr(
+        core,
+        "inspect_key_pem_strict",
+        lambda _pem: _private_key_info(),
+    )
+
+    def reject_password(_pem: str, password=None):
+        assert password == "incorrect horse battery staple"
+        return None, None, None
+
+    monkeypatch.setattr(core, "load_key_pem", reject_password)
+    monkeypatch.setattr(
+        core,
+        "get_private_key_public_fingerprint",
+        lambda *_args: pytest.fail("fingerprint must not be derived after failed unlock"),
+        raising=False,
+    )
+
+    code, payload = _run_agent(
+        ["inspect-key", "--key", "private.pem", "--password-env", "AGENT_SECRET"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_CRYPTO_FAILURE
+    assert payload["error_code"] == "private_key_load_failed"
+    assert "public_key_fingerprint" not in payload
 
 
 def test_inspect_key_rejects_unencrypted_private_key(monkeypatch, tmp_path, capsys):
@@ -558,6 +669,8 @@ def test_generate_keys_uses_password_env_without_printing_key_material(monkeypat
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: (b"public", b"private"))
+    fingerprint = "QE1-SHA3-256:" + "d" * 64
+    monkeypatch.setattr(core, "get_public_key_fingerprint", lambda _key, _kem: fingerprint)
 
     def save_key_pem(key_bytes, kem_alg, key_type, password=None):
         assert kem_alg == cfg.HYBRID_KEM_ALG
@@ -579,6 +692,7 @@ def test_generate_keys_uses_password_env_without_printing_key_material(monkeypat
     assert payload["private_key_encrypted"] is True
     assert payload["kem"] == cfg.HYBRID_KEM_ALG
     assert payload["private_key_kdf"] == cfg.PRIVATE_KEY_KDF_ALG
+    assert payload["public_key_fingerprint"] == fingerprint
     assert payload["public_key"] == "agent-public.pem"
     assert payload["private_key"] == "agent-private.pem"
     assert "PRIVATE PEM" not in json.dumps(payload)

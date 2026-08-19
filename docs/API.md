@@ -17,6 +17,8 @@ python -m pqc_agent_tools health --json
 export PQC_PRIVATE_KEY_PASSWORD='<strong-private-key-password>'
 python -m pqc_agent_tools generate-keys --public-out keys/public.pem --private-out keys/private.pem
 python -m pqc_agent_tools inspect-key --key keys/public.pem
+python -m pqc_agent_tools inspect-key --key keys/private.pem
+python -m pqc_agent_tools inspect-key --key keys/private.pem --password-env PQC_PRIVATE_KEY_PASSWORD
 python -m pqc_agent_tools encrypt --input data/plain.txt --public-key keys/public.pem --output data/plain.pqc
 python -m pqc_agent_tools inspect-file --input data/plain.pqc
 python -m pqc_agent_tools verify-file --input data/plain.pqc --private-key keys/private.pem
@@ -31,7 +33,7 @@ quantum-encryptor-agent health --json
 
 Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and existing output files are rejected unless the command includes `--overwrite`. Private-key and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
 
-Private-key operations read passwords from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`.
+Private-key generation, decryption, and verification read passwords from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`. `inspect-key` does not unlock an encrypted private key by default. Supplying `--password-env NAME` explicitly requests an authenticated unlock and adds the corresponding `public_key_fingerprint` only when the password and private-key structure validate.
 
 ## Local Web API
 
@@ -61,6 +63,26 @@ The custom web UI is served by `api_app.py` at exactly `http://127.0.0.1:<PORT>`
 Every HTTP response under `/api/*` carries `Cache-Control: no-store` and `Pragma: no-cache`, including JSON successes and errors, authorization or body-limit middleware rejections, unmatched API routes, framework-generated 500 responses, and file downloads. The policy is applied centrally so new API handlers inherit it; static UI responses outside `/api/*` keep their own cache behavior. These directives reduce retention by conforming HTTP caches but do not securely erase browser or process memory.
 
 Key generation returns the public and encrypted private PEM directly in one response. The server does not retain a temporary downloadable key pair or provide a recovery endpoint; save both values immediately because explicit clearing removes the app's references and browser lifecycle transitions may lose the tab state. Browser history may also preserve and later restore a suspended document's state.
+
+### Public-key fingerprint contract
+
+Fingerprints are calculated only from canonically validated public-key bytes. The SHA3-256 preimage is the following exact byte sequence, where both lengths are unsigned big-endian integers:
+
+```
+b"QuantumEncryptor-PublicKey-Fingerprint-v1\x00"
+|| uint16_be(len(algorithm_ascii))
+|| algorithm_ascii
+|| uint32_be(len(canonical_public_key))
+|| canonical_public_key
+```
+
+The external representation is `QE1-SHA3-256:<64 lowercase hexadecimal characters>`. The exact ASCII algorithm label is covered, so relabeling the same bytes produces a different fingerprint. `QE1` versions this fingerprint construction independently; it does not change the encrypted-file format, PEM headers, or either existing format-version field.
+
+`POST /api/keys/inspect` returns `keyInfo.public_key_fingerprint` for a validated public PEM and includes the same value under the display label `Public Key Fingerprint`. Metadata-only encrypted private-key inspection omits the field. `POST /api/keys/generate` returns the new pair's fingerprint as `publicKeyFingerprint`. The web UI shows the complete value in Generate, validated public-key inspection, and the compatible-recipient review before encryption.
+
+The agent `generate-keys` and public `inspect-key` results use the JSON field `public_key_fingerprint`. For an encrypted private key, `inspect-key` omits it unless `--password-env NAME` is explicitly supplied; only a successful AES-GCM password authentication followed by canonical private-key validation permits derivation of the corresponding public key and fingerprint. No fingerprint is stored in or trusted from visible encrypted private-key metadata.
+
+Compare the complete fingerprint over an independently authenticated channel separate from key delivery. Equality identifies the same validated algorithm label and canonical public bytes, but it is not a certificate, signature, trust chain, proof of identity, proof of private-key control, or protection against a channel that substitutes both the key and comparison value.
 
 ### Agent JSON Contract
 
@@ -295,6 +317,16 @@ def load_key_pem(
         key_type is 'public' or 'private'.
     """
 ```
+
+```python
+def get_public_key_fingerprint(key_bytes: bytes, kem_alg: str) -> str:
+    """Validate canonical public-key bytes and return their versioned SHA3-256 fingerprint."""
+
+def get_private_key_public_fingerprint(private_key_bytes: bytes, kem_alg: str) -> str:
+    """Derive and fingerprint the public key from already authenticated private-key bytes."""
+```
+
+Callers must not pass encrypted PEM payload bytes or unauthenticated private-key metadata to either function. Public-key fingerprinting validates the supplied canonical key material; private-key fingerprinting additionally validates the private structure and its embedded ML-KEM public-key hash before deriving the public key.
 
 ### File Encryption/Decryption
 

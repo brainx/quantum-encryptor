@@ -25,6 +25,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Post-Quantum/Traditional Security**: Combines ML-KEM-768 with X25519 so confidentiality does not depend on one key-establishment algorithm
 - **Authenticated File Encryption**: Derives AES-256-GCM keys from both ML-KEM and X25519 shared secrets
 - **Password-Protected Keys**: Private keys are always encrypted with scrypt-derived AES-256-GCM keys
+- **Public-Key Fingerprints**: Full versioned SHA3-256 identifiers support independent public-key comparison
 - **User-Friendly Interface**: Custom local web UI with progressive technical details and a Python ASGI API
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
@@ -135,6 +136,12 @@ Every `/api/*` response, including generated-key JSON, errors, middleware reject
 
 The web app keeps its generated-result references in the current tab's in-memory UI state. Save both files before clearing the result or leaving, reloading, or closing the page because those actions may lose the in-app result. Downloaded files are separate copies controlled by the browser, operating system, and destination. While the PEMs remain in the app, it requests the browser's standard leave-page warning. The browser controls whether that warning appears and its wording. Explicit clearing drops the app's React references but cannot zeroize managed memory. Browser history may instead suspend the document in the back/forward cache and later restore the same tab state.
 
+### Public-key fingerprints
+
+Successful key generation and validated public-key inspection return a complete fingerprint in the form `QE1-SHA3-256:<64 lowercase hexadecimal characters>`. The Generate workflow shows the fingerprint for the new pair, Inspect key shows it for a validated public key, and Encrypt shows the recipient fingerprint before encryption. Compare the entire value with the key owner over an independently authenticated channel, separate from the channel that delivered the key.
+
+A matching fingerprint identifies the same validated algorithm label and canonical public-key bytes. It does not prove the owner's identity or control of the private key, certify that the key is trustworthy, or protect a comparison performed through the same compromised channel. Fingerprints are public identifiers and do not change the PEM or encrypted-file formats. Metadata-only inspection of an encrypted private key omits the fingerprint because deriving it requires an authenticated password unlock.
+
 ## Verification
 
 Run the Python test suite:
@@ -172,15 +179,16 @@ Do not treat the browser smoke test as proof that the native cryptographic backe
 1. Select "Generate keys" from the workflow navigation
 2. Enter and confirm a strong private-key password
 3. Save both files from the current tab before clearing the result or leaving the page
-4. Share your public key with others who want to send you encrypted files
+4. Share your public key and its complete fingerprint through independently authenticated channels
 
 ### File Encryption
 
 1. Select "Encrypt" from the workflow navigation
 2. Upload the file you want to encrypt
 3. Upload the recipient's public key (.pem file)
-4. Specify the output filename
-5. Download the encrypted file
+4. Compare the complete recipient fingerprint over an independently authenticated channel
+5. Specify the output filename
+6. Download the encrypted file
 
 ### File Decryption
 
@@ -206,6 +214,9 @@ python -m pqc_agent_tools generate-keys \
 
 python -m pqc_agent_tools inspect-key --key keys/agent-public.pem
 python -m pqc_agent_tools inspect-key --key keys/agent-private.pem
+python -m pqc_agent_tools inspect-key \
+  --key keys/agent-private.pem \
+  --password-env PQC_PRIVATE_KEY_PASSWORD
 
 python -m pqc_agent_tools encrypt \
   --input data/message.txt \
@@ -229,7 +240,7 @@ The installed console entry point is equivalent:
 quantum-encryptor-agent health --json
 ```
 
-The CLI prints JSON only and never includes plaintext, private keys, passwords, raw file bytes, or absolute local paths in its output. Private-key operations read passwords from the environment variable named by `--password-env`, defaulting to `PQC_PRIVATE_KEY_PASSWORD`.
+The CLI prints JSON only and never includes plaintext, private keys, passwords, raw file bytes, or absolute local paths in its output. Private-key generation, decryption, and verification read passwords from the environment variable named by `--password-env`, defaulting to `PQC_PRIVATE_KEY_PASSWORD`. `inspect-key` remains metadata-only for an encrypted private key unless `--password-env NAME` is explicitly supplied; after a successful authenticated unlock it returns the corresponding `public_key_fingerprint`.
 
 ## Security Considerations
 
@@ -241,6 +252,8 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - Decryption requires an exact private-key/container suite match. The ambiguous legacy `ML-KEM-768+X25519` suite is decrypt-only and selects ML-KEM or Kyber only after AES-GCM authentication succeeds; v3 uses its exact stored KEM identity
 - Existing v2 ML-KEM private keys can decrypt authenticated v3 files, but creating new encrypted files requires generating a new composite key pair; re-encrypt migrated data with that new public key
 - Legacy hybrid public keys must be regenerated before encryption; they are never relabeled or reused as current-suite keys
+- Public-key fingerprints cover the exact algorithm label and canonically validated public-key bytes. Compare the complete value over an independently authenticated channel; a fingerprint is not a certificate, signature, or proof of key ownership
+- Encrypted private-key metadata never claims a fingerprint before password authentication. The CLI derives the corresponding public fingerprint only after a successful opt-in unlock and canonical private-key validation
 - PEM/key reads are capped at 128 KiB before parsing; POSIX workspace inputs use descriptor-anchored, no-follow reads, and reads remain bounded even if a file changes during the operation
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
 - State-changing local web API requests require a per-process API token. Browser cookie requests require an exact allowed `Origin` that equals the direct `Host`; clients without an `Origin` header must send `X-Quantum-Encryptor-Token`, and an invalid header never falls back to the cookie. `GET /api/health` issues the cookie only for an allowed direct `Host` and, when present, a matching `Origin`; forwarding headers are not trusted

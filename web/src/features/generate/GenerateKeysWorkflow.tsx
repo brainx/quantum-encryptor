@@ -190,6 +190,15 @@ export function GenerateKeysWorkflow({ health, generate = generateKeys, onSensit
               <strong>{generatedKeys.privateFilename}</strong>
             </button>
           </div>
+          <dl className="metadata-list">
+            <div>
+              <dt>Public key fingerprint</dt>
+              <dd>{generatedKeys.publicKeyFingerprint}</dd>
+            </div>
+          </dl>
+          <p className="field-hint">
+            Share this complete fingerprint over a separate trusted channel so senders can verify your public key.
+          </p>
           <ActionButton busyLabel="Clearing generated keys" onClick={clearGeneratedKeys} type="button">
             Clear generated keys
           </ActionButton>

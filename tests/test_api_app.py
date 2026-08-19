@@ -826,7 +826,12 @@ def test_api_rejects_stream_that_exceeds_declared_limit():
 
 def test_inspect_key_endpoint_returns_metadata(monkeypatch):
     body, headers = _multipart_body("key", "public.pem", b"public pem")
-    key_info = {"key_type": "public", "kem": cfg.KEM_ALG}
+    fingerprint = "QE1-SHA3-256:" + "a" * 64
+    key_info = {
+        "key_type": "public",
+        "kem": cfg.KEM_ALG,
+        "public_key_fingerprint": fingerprint,
+    }
     monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: key_info)
 
     status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=_with_api_token(headers)))
@@ -834,6 +839,7 @@ def test_inspect_key_endpoint_returns_metadata(monkeypatch):
     assert status == 200
     assert payload["keyInfo"] == key_info
     assert payload["display"]["Key Type"] == "Public"
+    assert payload["display"]["Public Key Fingerprint"] == fingerprint
 
 
 def test_inspect_key_endpoint_returns_safe_unexpected_error(monkeypatch):
@@ -874,8 +880,16 @@ def test_generate_keys_rejects_weak_password():
 
 def test_generate_keys_returns_pem_payloads(monkeypatch):
     body, headers = _urlencoded_body({"password": "correct horse battery staple"})
+    fingerprint = "QE1-SHA3-256:" + "b" * 64
     monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem: cfg.KEM_ALG)
     monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: (b"public", b"private"))
+
+    def get_fingerprint(raw_key: bytes, kem_alg: str) -> str:
+        assert raw_key == b"public"
+        assert kem_alg == cfg.HYBRID_KEM_ALG
+        return fingerprint
+
+    monkeypatch.setattr(core, "get_public_key_fingerprint", get_fingerprint)
 
     def save_key(raw_key: bytes, kem_alg: str, key_type: str, password: str | None = None) -> str:
         assert kem_alg == cfg.HYBRID_KEM_ALG
@@ -894,6 +908,7 @@ def test_generate_keys_returns_pem_payloads(monkeypatch):
     assert payload["publicPem"] == "public:public"
     assert payload["privatePem"] == "private:private"
     assert payload["kem"] == cfg.HYBRID_KEM_ALG
+    assert payload["publicKeyFingerprint"] == fingerprint
     _assert_api_no_store(response_headers)
 
 

@@ -22,7 +22,11 @@ function deferred<T>(): Deferred<T> {
 function result(kem: string): KeyInspectResult {
   return {
     ok: true,
-    keyInfo: { kem, key_type: "public" },
+    keyInfo: {
+      kem,
+      key_type: "public",
+      public_key_fingerprint: `QE1-SHA3-256:${"a".repeat(64)}`
+    },
     display: { Algorithm: kem }
   };
 }

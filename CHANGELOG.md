@@ -13,6 +13,8 @@ This project follows a practical semantic-versioning style.
 - Polished monochrome local web workflows with progressive technical details,
   responsive navigation, component tests, accessibility checks, and a native
   browser encryption round trip.
+- Versioned full-length SHA3-256 public-key fingerprints in key generation,
+  canonical public-key inspection, recipient review, and agent JSON output.
 
 ### Changed
 
@@ -34,6 +36,7 @@ This project follows a practical semantic-versioning style.
 - State-changing browser requests now require exact allowed Host/Origin equality. Origin-less state-changing requests cannot authenticate with the cookie and must use the explicit token header. Vite development is an explicit `QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1` exception for `http://127.0.0.1:4001` only.
 - All local web responses now include a restrictive Content Security Policy (including `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
 - All local `/api/*` responses now opt out of HTTP caching, and the key-generation UI requests a browser page-leave warning only while its in-app PEM references remain, with explicit guidance about browser-memory limitations.
+- Public-key fingerprints bind the exact algorithm label and canonically validated public bytes. Encrypted private-key inspection omits a fingerprint until an explicit CLI password unlock authenticates and validates the private key; no PEM or encrypted-file format version changed.
 
 ## [1.0.1] - 2026-06-21
 

@@ -9,22 +9,33 @@ import { chromium } from "playwright";
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = path.join(rootDir, "tmp", "ui-smoke");
 const baseUrl = process.env.UI_SMOKE_URL ?? "http://127.0.0.1:4000/";
+const testPublicKeyFingerprint = `QE1-SHA3-256:${"a".repeat(64)}`;
 
 const publicInspection = {
   ok: true,
-  keyInfo: { kem: "ML-KEM-768+X25519-v2", key_type: "public" },
+  keyInfo: {
+    kem: "ML-KEM-768+X25519-v2",
+    key_type: "public",
+    public_key_fingerprint: testPublicKeyFingerprint
+  },
   display: {
     "Key Type": "Public key",
-    "Hybrid suite": "ML-KEM-768+X25519-v2"
+    "Hybrid suite": "ML-KEM-768+X25519-v2",
+    "Public Key Fingerprint": testPublicKeyFingerprint
   }
 };
 
 const outdatedPublicInspection = {
   ok: true,
-  keyInfo: { kem: "ML-KEM-768+X25519", key_type: "public" },
+  keyInfo: {
+    kem: "ML-KEM-768+X25519",
+    key_type: "public",
+    public_key_fingerprint: `QE1-SHA3-256:${"b".repeat(64)}`
+  },
   display: {
     "Key Type": "Public key",
-    "Hybrid suite": "ML-KEM-768+X25519"
+    "Hybrid suite": "ML-KEM-768+X25519",
+    "Public Key Fingerprint": `QE1-SHA3-256:${"b".repeat(64)}`
   }
 };
 
@@ -178,7 +189,8 @@ try {
         publicPem: "PUBLIC-PEM",
         privatePem: "PRIVATE-PEM",
         publicFilename: "quantum_public.pem",
-        privateFilename: "quantum_private_encrypted.pem"
+        privateFilename: "quantum_private_encrypted.pem",
+        publicKeyFingerprint: testPublicKeyFingerprint
       });
     }
     if (method === "POST" && pathname === "/api/files/encrypt") {
@@ -232,6 +244,7 @@ try {
   await page.getByLabel("File to encrypt").setInputFiles(file("report.txt", "local report", "text/plain"));
   await page.getByLabel("Recipient public key").setInputFiles(file("public.pem", "PUBLIC-PEM", "application/x-pem-file"));
   await expectText(page, "Compatible public key");
+  await expectText(page, testPublicKeyFingerprint);
   await page.getByRole("button", { name: "Encrypt file" }).waitFor({ state: "visible" });
   assert.equal(await page.getByRole("button", { name: "Encrypt file" }).isEnabled(), true);
   assert.equal(await page.getByLabel("Output filename").inputValue(), "report_encrypted.pqc");
@@ -272,6 +285,7 @@ try {
   await expectText(page, "Public key");
   await page.getByText("Technical details").first().click();
   await expectText(page, "ML-KEM-768+X25519-v2");
+  await expectText(page, testPublicKeyFingerprint);
   await page.getByLabel("Key file").setInputFiles(file("private.pem", "PRIVATE-PEM", "application/x-pem-file"));
   await expectText(page, "Encrypted private key");
   await page.getByText("Technical details").first().click();
@@ -291,6 +305,7 @@ try {
   await expectText(page, "Key pair generated");
   await expectText(page, "quantum_public.pem");
   await expectText(page, "quantum_private_encrypted.pem");
+  await expectText(page, testPublicKeyFingerprint);
   await page.getByRole("button", { name: "Clear generated keys" }).click();
   assert.equal(await page.getByRole("button", { name: "Download public key" }).count(), 0);
   assert.equal(await page.getByRole("button", { name: "Download encrypted private key" }).count(), 0);

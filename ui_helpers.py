@@ -24,7 +24,9 @@ def format_key_info_for_display(key_info: dict[str, object]) -> dict[str, str]:
         "Key Type": str(key_info["key_type"]).title(),
         "Algorithm": str(key_info["kem"]),
     }
-    if key_info.get("key_type") == "private":
+    if key_info.get("key_type") == "public" and key_info.get("public_key_fingerprint"):
+        display["Public Key Fingerprint"] = str(key_info["public_key_fingerprint"])
+    elif key_info.get("key_type") == "private":
         display["Password Encrypted"] = "Yes"
         display["Private Key Format"] = str(key_info.get("private_key_format_version", "Unknown"))
         display["KDF"] = str(key_info.get("private_key_kdf", "Unknown"))

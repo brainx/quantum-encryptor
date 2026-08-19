@@ -13,6 +13,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Encrypted `.pqc` containers and their authenticated metadata.
 - Local workspace file paths used by the agent CLI.
 - Generated public-key and encrypted private-key PEM strings while returned by the API and held by the current browser tab.
+- The binding between a validated public key and a fingerprint obtained through an independently authenticated channel.
 
 ## Trust Boundaries
 
@@ -23,6 +24,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - The local filesystem is trusted only inside the current workspace for agent CLI operations.
 - Sensitive `/api/*` responses cross into browser, client, and intermediary HTTP-cache behavior; static assets remain a separate response class.
 - Generated PEMs cross from the local API into one tab's JavaScript state and then into browser/operating-system download handling, none of which provides application-controlled zeroization or file permissions.
+- Public keys and fingerprints may arrive through different channels. The application can calculate and display a fingerprint but cannot establish whether the comparison channel authenticates the claimed key owner.
 
 ## Abuse Cases
 
@@ -41,6 +43,8 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Reloading, closing, or navigating away before both generated PEMs are saved.
 - Treating navigation as erasure even though browser history may suspend and restore the document's generated PEM state.
 - Registering an unconditional or stale leave-page warning after generated PEMs have been cleared.
+- Causing malformed, truncated, or non-canonical public-key bytes to receive a fingerprint.
+- Substituting both a public key and its fingerprint on the same untrusted channel, or treating a matching fingerprint as proof of identity or private-key control.
 
 ## Required Invariants
 
@@ -56,6 +60,10 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Agent CLI paths stay workspace-relative and cannot escape through symlinks.
 - Agent CLI JSON output never includes secret material or absolute local paths.
 - Private-key files and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
+- A public-key fingerprint is emitted only after canonical key validation and covers the NUL-terminated `QuantumEncryptor-PublicKey-Fingerprint-v1` domain, the two-byte unsigned big-endian length of the ASCII algorithm label, the label bytes, the four-byte unsigned big-endian canonical-key length, and the canonical public-key bytes.
+- Hybrid public-key validation rejects alternate X25519 encodings and low-order or otherwise unusable public coordinates before fingerprinting, serialization, or encryption.
+- Fingerprints use the complete `QE1-SHA3-256:<64 lowercase hexadecimal characters>` representation; the exact algorithm label prevents relabeling from preserving the fingerprint.
+- Metadata-only encrypted private-key inspection never emits a fingerprint. Deriving the corresponding public fingerprint from a private key requires an explicit CLI password unlock, successful AES-GCM authentication, and canonical private-key validation.
 
 ## Current Mitigations
 
@@ -74,6 +82,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - All local web responses include a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`, blocking clickjacking of the local UI.
 - Every `/api/*` response replaces its cache policy with `Cache-Control: no-store` and `Pragma: no-cache`; static responses retain their own policy.
 - The Generate workflow keeps its in-app PEM references in current-tab state, provides explicit clearing and in-app navigation confirmation, and requests a browser leave-page warning only while both references remain; downloaded files are separate browser/operating-system copies.
+- The API, web UI, and agent CLI expose the same versioned public fingerprint from the core implementation. Generate shows it for a new pair, validated public inspection returns it, and Encrypt shows it in the compatible-recipient review before encryption.
 
 ## Limitations
 
@@ -91,3 +100,4 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Browser back/forward cache may preserve and later restore a document's generated PEM state after navigation; leave, reload, and close must not be described as reliable clearing events.
 - Generated PEMs are returned directly to the tab; there is no server-side temporary key vault or recovery protocol.
 - Browser and operating-system settings determine downloaded file permissions; the web flow cannot guarantee the agent CLI's POSIX `0600` private-key mode.
+- Fingerprint comparison supplies no trust by itself. A match identifies the same validated algorithm label and canonical public bytes, but does not certify identity, ownership, private-key control, or a comparison channel that substituted both values.

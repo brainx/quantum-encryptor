@@ -5,11 +5,21 @@ import { ApiError } from "../../api";
 import { READY_HEALTH } from "../../test/fixtures";
 import { EncryptWorkflow } from "./EncryptWorkflow";
 
+const TEST_PUBLIC_KEY_FINGERPRINT = `QE1-SHA3-256:${"a".repeat(64)}`;
+
 function publicKeyInspection() {
   return {
     ok: true,
-    keyInfo: { kem: READY_HEALTH.kem, key_type: "public" as const },
-    display: { "Key Type": "Public", Algorithm: READY_HEALTH.kem }
+    keyInfo: {
+      kem: READY_HEALTH.kem,
+      key_type: "public" as const,
+      public_key_fingerprint: TEST_PUBLIC_KEY_FINGERPRINT
+    },
+    display: {
+      "Key Type": "Public",
+      Algorithm: READY_HEALTH.kem,
+      "Public Key Fingerprint": TEST_PUBLIC_KEY_FINGERPRINT
+    }
   };
 }
 
@@ -38,6 +48,13 @@ describe("EncryptWorkflow", () => {
     );
 
     expect(await screen.findByText("Compatible public key")).toBeVisible();
+    expect(screen.getByText(TEST_PUBLIC_KEY_FINGERPRINT)).toBeVisible();
+    expect(
+      screen.getByText(
+        "Compare this complete fingerprint with the recipient over a separate trusted channel before encrypting."
+      )
+    ).toBeVisible();
+    expect(screen.queryByText("PEM")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Output filename")).toHaveValue("report_encrypted.pqc");
 
     await user.click(screen.getByRole("button", { name: "Encrypt file" }));
@@ -112,6 +129,32 @@ describe("EncryptWorkflow", () => {
     expect(screen.getByRole("button", { name: "Encrypt file" })).toBeDisabled();
   });
 
+  it.each([undefined, `QE1-SHA3-256:${"A".repeat(64)}`, `${TEST_PUBLIC_KEY_FINGERPRINT}\n`])(
+    "keeps encryption disabled when a same-suite public key has no valid fingerprint (%s)",
+    async (publicKeyFingerprint) => {
+      const inspect = vi.fn().mockResolvedValue({
+        ok: true,
+        keyInfo: {
+          kem: READY_HEALTH.kem,
+          key_type: "public",
+          ...(publicKeyFingerprint ? { public_key_fingerprint: publicKeyFingerprint } : {})
+        },
+        display: { "Key Type": "Public", Algorithm: READY_HEALTH.kem }
+      });
+      const encrypt = vi.fn();
+      const user = userEvent.setup();
+
+      render(<EncryptWorkflow encrypt={encrypt} health={READY_HEALTH} inspect={inspect} />);
+      await user.upload(screen.getByLabelText("File to encrypt"), new File(["report"], "report.pdf"));
+      await user.upload(screen.getByLabelText("Recipient public key"), new File(["PEM"], "recipient.pem"));
+
+      expect(await screen.findByText("The recipient public key did not provide a valid fingerprint.")).toBeVisible();
+      expect(screen.getByRole("button", { name: "Encrypt file" })).toBeDisabled();
+      expect(screen.queryByText(/compare this complete fingerprint/i)).not.toBeInTheDocument();
+      expect(encrypt).not.toHaveBeenCalled();
+    }
+  );
+
   it("does not submit a second encryption request while one is in progress", async () => {
     let resolveEncryption: (value: { filename: string; blob: Blob }) => void;
     const inspect = vi.fn().mockResolvedValue(publicKeyInspection());
@@ -143,7 +186,11 @@ describe("EncryptWorkflow", () => {
   it("does not accept a public key from a different hybrid suite", async () => {
     const inspect = vi.fn().mockResolvedValue({
       ok: true,
-      keyInfo: { kem: "Kyber768", key_type: "public" },
+      keyInfo: {
+        kem: "Kyber768",
+        key_type: "public",
+        public_key_fingerprint: `QE1-SHA3-256:${"b".repeat(64)}`
+      },
       display: { "Key Type": "Public", Algorithm: "Kyber768" }
     });
     const user = userEvent.setup();

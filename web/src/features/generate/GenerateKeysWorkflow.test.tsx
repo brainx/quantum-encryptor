@@ -5,6 +5,8 @@ import { ApiError, type GeneratedKeys } from "../../api";
 import { READY_HEALTH } from "../../test/fixtures";
 import { GenerateKeysWorkflow } from "./GenerateKeysWorkflow";
 
+const TEST_PUBLIC_KEY_FINGERPRINT = `QE1-SHA3-256:${"a".repeat(64)}`;
+
 function generatedKeys(overrides: Partial<GeneratedKeys> = {}): GeneratedKeys {
   return {
     ok: true,
@@ -13,6 +15,7 @@ function generatedKeys(overrides: Partial<GeneratedKeys> = {}): GeneratedKeys {
     privatePem: "-----BEGIN PQC PRIVATE KEY-----\nPQC-Key-Format: 3\nENCRYPTED-PRIVATE-PEM\n-----END PQC PRIVATE KEY-----",
     publicFilename: "recipient-public.pem",
     privateFilename: "recipient-private.pem",
+    publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT,
     ...overrides
   };
 }
@@ -82,6 +85,12 @@ describe("GenerateKeysWorkflow", () => {
     ).toBeVisible();
     expect(screen.queryByText("PUBLIC-PEM")).not.toBeInTheDocument();
     expect(screen.queryByText("ENCRYPTED-PRIVATE-PEM")).not.toBeInTheDocument();
+    expect(screen.getByText(TEST_PUBLIC_KEY_FINGERPRINT)).toBeVisible();
+    expect(
+      screen.getByText(
+        "Share this complete fingerprint over a separate trusted channel so senders can verify your public key."
+      )
+    ).toBeVisible();
     expect(onSensitiveResultChange).toHaveBeenCalledWith(true);
     expect(screen.getByText("Private key format version").nextElementSibling).toHaveTextContent("3");
 
@@ -89,6 +98,7 @@ describe("GenerateKeysWorkflow", () => {
 
     expect(screen.queryByRole("button", { name: "Download public key" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Download encrypted private key" })).not.toBeInTheDocument();
+    expect(screen.queryByText(TEST_PUBLIC_KEY_FINGERPRINT)).not.toBeInTheDocument();
     expect(onSensitiveResultChange).toHaveBeenLastCalledWith(false);
   });
 

@@ -4,6 +4,7 @@ import struct
 import logging
 import base64
 import hashlib
+import hmac
 import io
 import binascii
 import ctypes.util
@@ -30,6 +31,10 @@ _oqs_load_error: Optional[str] = None
 
 # Setup Logger
 logger = logging.getLogger(__name__)
+
+PUBLIC_KEY_FINGERPRINT_DOMAIN = b"QuantumEncryptor-PublicKey-Fingerprint-v1\x00"
+X25519_FIELD_MODULUS = (1 << 255) - 19
+X25519_VALIDATION_PRIVATE_BYTES = bytes(range(32))
 
 
 class CryptoCoreError(RuntimeError):
@@ -113,6 +118,30 @@ class PrivateKeyPemMetadata:
     kdf_p: int
     salt: bytes
     nonce: bytes
+
+
+@dataclass(frozen=True)
+class ParsedPrivateKeyEnvelope:
+    """Validated encrypted-private PEM fields before password authentication."""
+
+    format_version: Optional[int]
+    kdf_name: str
+    kdf_n: int
+    kdf_r: int
+    kdf_p: int
+    salt: bytes
+    nonce: bytes
+
+
+@dataclass(frozen=True)
+class ParsedKeyPem:
+    """Canonical syntactic representation shared by every PEM consumer."""
+
+    kem_alg: str
+    key_type: str
+    is_encrypted: bool
+    payload: bytes
+    private_envelope: Optional[ParsedPrivateKeyEnvelope]
 
 
 COMMON_WEAK_PASSWORDS = {
@@ -204,6 +233,109 @@ def canonical_kem_algorithm(kem_alg: str) -> str:
     return kem_alg
 
 
+def _expected_key_bytes(kem_alg: str, key_type: str) -> int:
+    if not is_allowed_key_algorithm(kem_alg):
+        raise UnsupportedAlgorithmError(f"Unsupported key algorithm: {kem_alg!r}")
+    if key_type == "public":
+        return cfg.HYBRID_PUBLIC_KEY_BYTES if is_hybrid_key_algorithm(kem_alg) else cfg.MLKEM768_PUBLIC_KEY_BYTES
+    if key_type == "private":
+        return cfg.HYBRID_PRIVATE_KEY_BYTES if is_hybrid_key_algorithm(kem_alg) else cfg.MLKEM768_PRIVATE_KEY_BYTES
+    raise InvalidKeyFormatError("Key type must be public or private.")
+
+
+def _validate_key_length(key_bytes: bytes, kem_alg: str, key_type: str) -> None:
+    expected_bytes = _expected_key_bytes(kem_alg, key_type)
+    if len(key_bytes) != expected_bytes:
+        raise InvalidKeyFormatError(f"{key_type.title()} key length does not match the declared algorithm.")
+
+
+def _mlkem_key_component(key_bytes: bytes, kem_alg: str) -> bytes:
+    if is_hybrid_key_algorithm(kem_alg):
+        return key_bytes[cfg.X25519_KEY_BYTES :]
+    return key_bytes
+
+
+def _validate_mlkem_public_key(public_key: bytes) -> None:
+    if len(public_key) != cfg.MLKEM768_PUBLIC_KEY_BYTES:
+        raise InvalidKeyFormatError("ML-KEM-768 public key has an invalid length.")
+    encoded_coefficients = public_key[: cfg.MLKEM768_PUBLIC_POLY_BYTES]
+    for offset in range(0, len(encoded_coefficients), 3):
+        first, middle, last = encoded_coefficients[offset : offset + 3]
+        coefficient_0 = first | ((middle & 0x0F) << 8)
+        coefficient_1 = (middle >> 4) | (last << 4)
+        if coefficient_0 >= cfg.MLKEM_MODULUS or coefficient_1 >= cfg.MLKEM_MODULUS:
+            raise InvalidKeyFormatError("ML-KEM-768 public key has a noncanonical coefficient.")
+
+
+def _validate_mlkem_private_key(private_key: bytes) -> None:
+    if len(private_key) != cfg.MLKEM768_PRIVATE_KEY_BYTES:
+        raise InvalidKeyFormatError("ML-KEM-768 private key has an invalid length.")
+    public_start = cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES
+    public_end = public_start + cfg.MLKEM768_PUBLIC_KEY_BYTES
+    hash_end = public_end + hashlib.sha3_256().digest_size
+    embedded_public_key = private_key[public_start:public_end]
+    _validate_mlkem_public_key(embedded_public_key)
+    expected_hash = hashlib.sha3_256(embedded_public_key).digest()
+    if not hmac.compare_digest(expected_hash, private_key[public_end:hash_end]):
+        raise InvalidKeyFormatError("ML-KEM-768 private key has an invalid embedded-public hash.")
+
+
+def _validate_x25519_public_key(public_key: bytes) -> None:
+    if len(public_key) != cfg.X25519_KEY_BYTES:
+        raise InvalidKeyFormatError("X25519 public key has an invalid length.")
+    coordinate = int.from_bytes(public_key, "little")
+    if public_key[-1] & 0x80 or coordinate >= X25519_FIELD_MODULUS:
+        raise InvalidKeyFormatError("X25519 public key is not canonically encoded.")
+    try:
+        validation_private_key = x25519.X25519PrivateKey.from_private_bytes(X25519_VALIDATION_PRIVATE_BYTES)
+        shared_secret = validation_private_key.exchange(x25519.X25519PublicKey.from_public_bytes(public_key))
+    except ValueError as exc:
+        raise InvalidKeyFormatError("X25519 public key is not usable for key agreement.") from exc
+    if hmac.compare_digest(shared_secret, bytes(cfg.X25519_KEY_BYTES)):
+        raise InvalidKeyFormatError("X25519 public key is not usable for key agreement.")
+
+
+def _validate_key_material(key_bytes: bytes, kem_alg: str, key_type: str) -> None:
+    _validate_key_length(key_bytes, kem_alg, key_type)
+    if key_type == "public":
+        if is_hybrid_key_algorithm(kem_alg):
+            _validate_x25519_public_key(key_bytes[: cfg.X25519_KEY_BYTES])
+        _validate_mlkem_public_key(_mlkem_key_component(key_bytes, kem_alg))
+    else:
+        _validate_mlkem_private_key(_mlkem_key_component(key_bytes, kem_alg))
+
+
+def get_public_key_fingerprint(key_bytes: bytes, kem_alg: str) -> str:
+    """Return the versioned SHA3-256 fingerprint of canonical public-key bytes."""
+    _validate_key_material(key_bytes, kem_alg, "public")
+    algorithm_bytes = kem_alg.encode("ascii")
+    fingerprint_input = (
+        PUBLIC_KEY_FINGERPRINT_DOMAIN
+        + len(algorithm_bytes).to_bytes(2, "big")
+        + algorithm_bytes
+        + len(key_bytes).to_bytes(4, "big")
+        + key_bytes
+    )
+    return f"QE1-SHA3-256:{hashlib.sha3_256(fingerprint_input).hexdigest()}"
+
+
+def get_private_key_public_fingerprint(private_key_bytes: bytes, kem_alg: str) -> str:
+    """Fingerprint the public key derived from authenticated private-key bytes."""
+    _validate_key_material(private_key_bytes, kem_alg, "private")
+    mlkem_private_key = _mlkem_key_component(private_key_bytes, kem_alg)
+    public_start = cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES
+    public_end = public_start + cfg.MLKEM768_PUBLIC_KEY_BYTES
+    public_key = mlkem_private_key[public_start:public_end]
+    if is_hybrid_key_algorithm(kem_alg):
+        x25519_private_key = x25519.X25519PrivateKey.from_private_bytes(private_key_bytes[: cfg.X25519_KEY_BYTES])
+        x25519_public_key = x25519_private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        public_key = x25519_public_key + public_key
+    return get_public_key_fingerprint(public_key, kem_alg)
+
+
 def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
     """Resolve a configured KEM name to one enabled by the installed OQS backend."""
     requested = kem_alg or cfg.KEM_ALG
@@ -250,14 +382,6 @@ def is_kem_available(kem_alg: Optional[str] = None) -> bool:
         return True
     except Exception:
         return False
-
-
-def _b64decode_strict(value: str, label: str) -> Optional[bytes]:
-    try:
-        return base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        logger.error("Invalid base64 in %s: %s", label, exc)
-        return None
 
 
 def _decapsulate_shared_secret(
@@ -307,6 +431,9 @@ def generate_oqs_keys(
                 logger.error(f"Key generation for {resolved_kem_alg} produced unexpected key sizes or empty keys.")
                 return None, None
 
+            _validate_key_material(public_key, resolved_kem_alg, "public")
+            _validate_key_material(secret_key, resolved_kem_alg, "private")
+
             logger.info(f"Successfully generated raw keys for {resolved_kem_alg}.")
             return public_key, secret_key
     except AttributeError as e:
@@ -328,18 +455,30 @@ def generate_oqs_keys(
 
 def pack_hybrid_key(x25519_key: bytes, mlkem_key: bytes) -> bytes:
     """Encode a composite key as fixed-width X25519 material followed by ML-KEM material."""
-    if len(x25519_key) != cfg.X25519_KEY_BYTES or not mlkem_key:
+    if len(x25519_key) != cfg.X25519_KEY_BYTES:
         raise InvalidKeyFormatError("Composite key components have invalid lengths.")
-    return x25519_key + mlkem_key
+    if len(mlkem_key) == cfg.MLKEM768_PUBLIC_KEY_BYTES:
+        key_type = "public"
+    elif len(mlkem_key) == cfg.MLKEM768_PRIVATE_KEY_BYTES:
+        key_type = "private"
+    else:
+        raise InvalidKeyFormatError("Composite key components have invalid lengths.")
+    packed_key = x25519_key + mlkem_key
+    _validate_key_material(packed_key, cfg.HYBRID_KEM_ALG, key_type)
+    return packed_key
 
 
 def unpack_hybrid_key(key_bytes: bytes, key_type: str) -> Tuple[bytes, bytes]:
     """Decode the X25519 and ML-KEM components from a composite key."""
     if key_type not in {"public", "private"}:
         raise InvalidKeyFormatError("Composite key type must be public or private.")
-    if len(key_bytes) <= cfg.X25519_KEY_BYTES:
-        raise InvalidKeyFormatError("Composite key is missing an X25519 or ML-KEM component.")
-    return key_bytes[: cfg.X25519_KEY_BYTES], key_bytes[cfg.X25519_KEY_BYTES :]
+    expected_bytes = cfg.HYBRID_PUBLIC_KEY_BYTES if key_type == "public" else cfg.HYBRID_PRIVATE_KEY_BYTES
+    if len(key_bytes) != expected_bytes:
+        raise InvalidKeyFormatError("Composite key has an invalid length.")
+    _validate_key_material(key_bytes, cfg.HYBRID_KEM_ALG, key_type)
+    x25519_key = key_bytes[: cfg.X25519_KEY_BYTES]
+    mlkem_key = key_bytes[cfg.X25519_KEY_BYTES :]
+    return x25519_key, mlkem_key
 
 
 def generate_hybrid_keys(kem_alg: str = cfg.KEM_ALG) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -471,6 +610,8 @@ def _parse_private_key_format_line(line: str) -> int:
         format_version = int(value)
     except ValueError as exc:
         raise InvalidKeyFormatError("Encrypted private-key PEM has malformed format metadata.") from exc
+    if str(format_version) != value:
+        raise InvalidKeyFormatError("Encrypted private-key PEM has noncanonical format metadata.")
     if format_version not in cfg.SUPPORTED_PRIVATE_KEY_FORMAT_VERSIONS:
         raise InvalidKeyFormatError("Encrypted private-key PEM uses an unsupported format version.")
     return format_version
@@ -491,10 +632,15 @@ def _parse_private_key_kdf_line(line: str) -> Dict[str, int | str]:
         name, value = part.split("=", 1)
         if name not in {"n", "r", "p"}:
             raise UnsupportedKDFError("Private-key PEM has unsupported KDF parameters.")
+        if name in parsed:
+            raise UnsupportedKDFError("Private-key PEM has duplicate KDF parameters.")
         try:
-            parsed[name] = int(value)
+            numeric_value = int(value)
         except ValueError as exc:
             raise UnsupportedKDFError("Private-key PEM has non-numeric KDF parameters.") from exc
+        if str(numeric_value) != value:
+            raise UnsupportedKDFError("Private-key PEM has noncanonical KDF parameters.")
+        parsed[name] = numeric_value
 
     expected = _current_private_key_kdf_metadata()
     if parsed != expected:
@@ -663,12 +809,11 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
     if not is_allowed_key_algorithm(kem_alg):
         logger.error("Unsupported KEM algorithm specified for PEM saving.")
         return None
-    if is_hybrid_key_algorithm(kem_alg):
-        try:
-            unpack_hybrid_key(key_bytes, key_type)
-        except InvalidKeyFormatError as exc:
-            logger.error(str(exc))
-            return None
+    try:
+        _validate_key_material(key_bytes, kem_alg, key_type)
+    except (InvalidKeyFormatError, UnsupportedAlgorithmError) as exc:
+        logger.error(str(exc))
+        return None
 
     pem_data_lines = []
     dek_info = ""
@@ -720,244 +865,208 @@ def save_key_pem(key_bytes: bytes, kem_alg: str, key_type: str, password: Option
     return "\n".join(pem_data_lines) + "\n"
 
 
-def load_key_pem(
-    pem_content: str, password: Optional[str] = None
-) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    """
-    Loads key data from PEM string. Decrypts private key if necessary and password is provided.
+def _decode_pem_base64(value: str, label: str) -> bytes:
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidKeyFormatError(f"{label} is not valid base64.") from exc
+    if base64.b64encode(decoded).decode("ascii") != value:
+        raise InvalidKeyFormatError(f"{label} is not canonically encoded base64.")
+    return decoded
 
-    Returns:
-        Tuple (raw_key_bytes, kem_algorithm, key_type), or (None, None, None) on error.
-        key_type is 'public' or 'private'.
-    """
-    pem_content = pem_content.strip()
-    lines = pem_content.splitlines()
+
+def _parse_key_pem_strict(pem_content: str) -> ParsedKeyPem:
+    try:
+        pem_bytes = pem_content.encode("ascii")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise InvalidKeyFormatError("Key file must be ASCII PEM text.") from exc
+    if len(pem_bytes) > cfg.MAX_PEM_BYTES:
+        raise InvalidKeyFormatError("PEM key file exceeds the supported size.")
+
+    lines = pem_content.strip().splitlines()
     if not lines:
-        logger.error("PEM content is empty.")
-        return None, None, None
-
-    header = lines[0]
-    footer = lines[-1]
-    key_type = None
-    is_encrypted = False
-    kem_alg = None
-    private_key_format_version: Optional[int] = None
-    dek_parts: Dict[str, Any] = {}
-    kdf_parts: Dict[str, int | str] = {}
-    key_b64_lines = []
-
-    # Determine key type and check basic structure
+        raise InvalidKeyFormatError("PEM content is empty.")
+    header = lines[0].strip()
+    footer = lines[-1].strip()
     if header == cfg.PEM_PUBLIC_HEADER and footer == cfg.PEM_PUBLIC_FOOTER:
         key_type = "public"
-        if password:
-            logger.warning("Password provided when loading a public key. Ignoring password.")
     elif header == cfg.PEM_PRIVATE_HEADER and footer == cfg.PEM_PRIVATE_FOOTER:
         key_type = "private"
     else:
-        logger.error("Invalid PEM format: Missing or mismatched headers/footers.")
-        return None, None, None
+        raise InvalidKeyFormatError("PEM key has missing or mismatched boundaries.")
 
-    # Parse lines between header and footer
-    for line in lines[1:-1]:
-        line = line.strip()
+    kem_alg: Optional[str] = None
+    format_line: Optional[str] = None
+    proc_type_seen = False
+    dek_line: Optional[str] = None
+    kdf_line: Optional[str] = None
+    payload_lines = []
+
+    for raw_line in lines[1:-1]:
+        line = raw_line.strip()
         if not line:
-            continue  # Skip empty lines
-
+            continue
         if line.startswith(cfg.PEM_ALGORITHM_HEADER):
+            if kem_alg is not None:
+                raise InvalidKeyFormatError("PEM key has duplicate algorithm metadata.")
             kem_alg = line[len(cfg.PEM_ALGORITHM_HEADER) :].strip()
         elif line.startswith(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER):
-            if key_type == "private":
-                try:
-                    private_key_format_version = _parse_private_key_format_line(line)
-                except InvalidKeyFormatError as exc:
-                    logger.error(str(exc))
-                    return None, None, None
-            else:
-                logger.warning("Found private-key format header in a public key PEM. Ignoring.")
+            if key_type != "private":
+                raise InvalidKeyFormatError("Public PEM contains private-key format metadata.")
+            if format_line is not None:
+                raise InvalidKeyFormatError("PEM key has duplicate private-key format metadata.")
+            format_line = line
         elif line == cfg.PEM_PROC_TYPE_HEADER:
-            if key_type == "private":
-                is_encrypted = True
-            else:
-                logger.warning("Found encryption header in a public key PEM. Ignoring.")
+            if key_type != "private":
+                raise InvalidKeyFormatError("Public PEM contains private-key encryption metadata.")
+            if proc_type_seen:
+                raise InvalidKeyFormatError("PEM key has duplicate encryption metadata.")
+            proc_type_seen = True
         elif line.startswith(cfg.PEM_DEK_INFO_HEADER):
-            if key_type == "private" and is_encrypted:
-                try:
-                    dek_info_content = line[len(cfg.PEM_DEK_INFO_HEADER) :]
-                    salt_b64, nonce_b64 = dek_info_content.split(",", 1)
-                    salt = _b64decode_strict(salt_b64, "private-key salt")
-                    nonce = _b64decode_strict(nonce_b64, "private-key nonce")
-                    if salt is None or nonce is None:
-                        return None, None, None
-                    if len(salt) != cfg.SCRYPT_SALT_BYTES or len(nonce) != cfg.AES_NONCE_BYTES:
-                        logger.error("Encrypted private key PEM has invalid salt or nonce length.")
-                        return None, None, None
-                    dek_parts["salt"] = salt
-                    dek_parts["nonce"] = nonce
-                except ValueError as e:
-                    logger.error(f"Invalid DEK-Info line format: {e}")
-                    return None, None, None
-            else:
-                logger.warning("Found DEK-Info header unexpectedly. Ignoring.")
+            if key_type != "private":
+                raise InvalidKeyFormatError("Public PEM contains private-key encryption metadata.")
+            if dek_line is not None:
+                raise InvalidKeyFormatError("PEM key has duplicate DEK metadata.")
+            dek_line = line
         elif line.startswith(cfg.PEM_KDF_HEADER):
-            if key_type == "private" and is_encrypted:
-                try:
-                    kdf_parts = _parse_private_key_kdf_line(line)
-                except UnsupportedKDFError as exc:
-                    logger.error(str(exc))
-                    return None, None, None
-            else:
-                logger.warning("Found KDF header unexpectedly. Ignoring.")
+            if key_type != "private":
+                raise InvalidKeyFormatError("Public PEM contains private-key KDF metadata.")
+            if kdf_line is not None:
+                raise InvalidKeyFormatError("PEM key has duplicate KDF metadata.")
+            kdf_line = line
         else:
-            # Assume it's base64 key data
-            key_b64_lines.append(line)
+            payload_lines.append(line)
 
-    if not kem_alg:
-        logger.error("Algorithm not specified in PEM file.")
-        return None, None, None
-    if not is_allowed_key_algorithm(kem_alg):
-        logger.error("Unsupported KEM algorithm in PEM file.")
-        return None, None, None
-    if not key_b64_lines:
-        logger.error("No key data found in PEM file.")
-        return None, None, None
+    if not kem_alg or not is_allowed_key_algorithm(kem_alg):
+        raise InvalidKeyFormatError("PEM key does not declare a supported algorithm.")
+    if not payload_lines:
+        raise InvalidKeyFormatError("PEM key does not contain key data.")
 
-    # Decode base64 data
-    key_b64 = "".join(key_b64_lines)
-    raw_or_encrypted_bytes = _b64decode_strict(key_b64, "PEM key data")
-    if raw_or_encrypted_bytes is None:
-        return None, None, None
-    if len(raw_or_encrypted_bytes) > cfg.MAX_RAW_KEY_BYTES:
-        logger.error("PEM key payload exceeds maximum raw key size.")
-        return None, None, None
+    private_envelope: Optional[ParsedPrivateKeyEnvelope] = None
+    if key_type == "public":
+        is_encrypted = False
+    else:
+        private_metadata_seen = any((format_line, proc_type_seen, dek_line, kdf_line))
+        if private_metadata_seen and not proc_type_seen:
+            raise InvalidKeyFormatError("Private PEM has incomplete encryption metadata.")
+        is_encrypted = proc_type_seen
+        if is_encrypted:
+            if format_line is None and not cfg.ALLOW_LEGACY_PRIVATE_KEY_PEM:
+                raise InvalidKeyFormatError("Encrypted private-key PEM is missing format metadata.")
+            format_version = _parse_private_key_format_line(format_line) if format_line else None
+            if dek_line is None:
+                raise InvalidKeyFormatError("Encrypted private-key PEM is missing DEK metadata.")
+            if kdf_line is None:
+                raise UnsupportedKDFError("Encrypted private-key PEM is missing KDF metadata.")
 
-    # Handle decryption if necessary
-    if key_type == "private" and is_encrypted:
-        if not password:
-            logger.error("Private key is encrypted, but no password provided.")
-            return None, None, None  # Indicate password needed
-        if "salt" not in dek_parts or "nonce" not in dek_parts:
-            logger.error("Encrypted private key PEM is missing DEK-Info details (salt/nonce).")
+            dek_value = dek_line[len(cfg.PEM_DEK_INFO_HEADER) :]
+            try:
+                salt_b64, nonce_b64 = dek_value.split(",", 1)
+            except ValueError as exc:
+                raise InvalidKeyFormatError("Encrypted private-key PEM has malformed DEK metadata.") from exc
+            salt = _decode_pem_base64(salt_b64, "Private-key salt")
+            nonce = _decode_pem_base64(nonce_b64, "Private-key nonce")
+            if len(salt) != cfg.SCRYPT_SALT_BYTES or len(nonce) != cfg.AES_NONCE_BYTES:
+                raise InvalidKeyFormatError("Encrypted private-key PEM has invalid salt or nonce length.")
+            kdf_parts = _parse_private_key_kdf_line(kdf_line)
+            private_envelope = ParsedPrivateKeyEnvelope(
+                format_version=format_version,
+                kdf_name=str(kdf_parts["name"]),
+                kdf_n=int(kdf_parts["n"]),
+                kdf_r=int(kdf_parts["r"]),
+                kdf_p=int(kdf_parts["p"]),
+                salt=salt,
+                nonce=nonce,
+            )
+
+    payload = _decode_pem_base64("".join(payload_lines), "PEM key data")
+    if len(payload) > cfg.MAX_RAW_KEY_BYTES:
+        raise InvalidKeyFormatError("PEM key payload exceeds the supported size.")
+    if key_type == "public":
+        _validate_key_material(payload, kem_alg, "public")
+    elif is_encrypted:
+        expected_payload_bytes = _expected_key_bytes(kem_alg, "private") + cfg.AES_TAG_BYTES
+        if len(payload) != expected_payload_bytes:
+            raise InvalidKeyFormatError("Encrypted private-key payload has an invalid length.")
+    else:
+        _validate_key_material(payload, kem_alg, "private")
+
+    return ParsedKeyPem(
+        kem_alg=kem_alg,
+        key_type=key_type,
+        is_encrypted=is_encrypted,
+        payload=payload,
+        private_envelope=private_envelope,
+    )
+
+
+def load_key_pem(
+    pem_content: str, password: Optional[str] = None
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """Load validated PEM key material, returning an all-None tuple on failure."""
+    try:
+        parsed = _parse_key_pem_strict(pem_content)
+        if parsed.key_type == "public":
+            if password:
+                logger.warning("Password provided when loading a public key. Ignoring password.")
+            return parsed.payload, parsed.kem_alg, parsed.key_type
+        if not parsed.is_encrypted:
+            logger.error("Unencrypted private keys are rejected by the current security policy.")
             return None, None, None
-        if not kdf_parts:
-            logger.error("Encrypted private key PEM is missing required KDF metadata.")
-            return None, None, None
-        if private_key_format_version is None and not cfg.ALLOW_LEGACY_PRIVATE_KEY_PEM:
-            logger.error("Encrypted private key PEM is missing authenticated format metadata.")
+        if not password or parsed.private_envelope is None:
+            logger.error("Private key is encrypted, but no password was provided.")
             return None, None, None
 
-        dek_parts["encrypted_key"] = raw_or_encrypted_bytes
-        dek_parts["format_version"] = private_key_format_version
-        dek_parts["kem_alg"] = kem_alg
-        dek_parts["kdf"] = kdf_parts.get("name")
-        dek_parts["kdf_n"] = kdf_parts.get("n")
-        dek_parts["kdf_r"] = kdf_parts.get("r")
-        dek_parts["kdf_p"] = kdf_parts.get("p")
-        raw_key_bytes = decrypt_private_key(dek_parts, password)
-
+        envelope = parsed.private_envelope
+        encrypted_key_data: Dict[str, Any] = {
+            "encrypted_key": parsed.payload,
+            "format_version": envelope.format_version,
+            "kem_alg": parsed.kem_alg,
+            "kdf": envelope.kdf_name,
+            "kdf_n": envelope.kdf_n,
+            "kdf_r": envelope.kdf_r,
+            "kdf_p": envelope.kdf_p,
+            "salt": envelope.salt,
+            "nonce": envelope.nonce,
+        }
+        raw_key_bytes = decrypt_private_key(encrypted_key_data, password)
         if raw_key_bytes is None:
             logger.error("Private key decryption failed (likely wrong password or corruption).")
-            # Return None to signal failure, keep kem_alg and key_type known if needed?
-            # Let's return all None for consistency on failure.
             return None, None, None
-        else:
-            logger.info(f"Successfully loaded and decrypted private key for algorithm {kem_alg}.")
-            if is_hybrid_key_algorithm(kem_alg):
-                try:
-                    unpack_hybrid_key(raw_key_bytes, "private")
-                except InvalidKeyFormatError as exc:
-                    logger.error(str(exc))
-                    return None, None, None
-            # Drop local references to intermediate encrypted key material.
-            del raw_or_encrypted_bytes
-            del dek_parts
-            return raw_key_bytes, kem_alg, key_type
-
-    elif key_type == "private":  # Unencrypted private key
-        logger.error("Unencrypted private keys are rejected by the current security policy.")
+        _validate_key_material(raw_key_bytes, parsed.kem_alg, "private")
+        return raw_key_bytes, parsed.kem_alg, parsed.key_type
+    except (InvalidKeyFormatError, UnsupportedKDFError, UnsupportedAlgorithmError) as exc:
+        logger.error(str(exc))
         return None, None, None
-    else:  # Public key
-        if is_hybrid_key_algorithm(kem_alg):
-            try:
-                unpack_hybrid_key(raw_or_encrypted_bytes, "public")
-            except InvalidKeyFormatError as exc:
-                logger.error(str(exc))
-                return None, None, None
-        logger.info(f"Successfully loaded public key for algorithm {kem_alg}.")
-        return raw_or_encrypted_bytes, kem_alg, key_type
 
 
 def get_key_info_pem(pem_content: str) -> Tuple[Optional[str], Optional[str], bool]:
-    """
-    Quickly inspects PEM content to get Algorithm, Key Type, and Encryption Status.
-    Does not validate the key bytes themselves.
-
-    Returns:
-        Tuple (kem_algorithm, key_type, is_encrypted), or (None, None, False) on error.
-    """
-    pem_content = pem_content.strip()
-    lines = pem_content.splitlines()
-    if not lines:
+    """Return algorithm, title-cased key type, and encryption state for a valid PEM."""
+    try:
+        parsed = _parse_key_pem_strict(pem_content)
+    except (InvalidKeyFormatError, UnsupportedKDFError, UnsupportedAlgorithmError):
         return None, None, False
-
-    header = lines[0]
-    footer = lines[-1]
-    key_type = None
-    is_encrypted = False
-    kem_alg = None
-
-    if header == cfg.PEM_PUBLIC_HEADER and footer == cfg.PEM_PUBLIC_FOOTER:
-        key_type = "Public"
-    elif header == cfg.PEM_PRIVATE_HEADER and footer == cfg.PEM_PRIVATE_FOOTER:
-        key_type = "Private"
-    else:
-        return None, None, False  # Invalid format
-
-    for line in lines[1:-1]:
-        line = line.strip()
-        if line.startswith(cfg.PEM_ALGORITHM_HEADER):
-            kem_alg = line[len(cfg.PEM_ALGORITHM_HEADER) :].strip()
-        elif line == cfg.PEM_PROC_TYPE_HEADER and key_type == "Private":
-            is_encrypted = True
-        # No need to parse DEK-Info or key data for this function
-
-    if not kem_alg:
-        return None, key_type, is_encrypted  # Algo missing
-    if not is_allowed_key_algorithm(kem_alg):
-        return None, key_type, is_encrypted
-
-    return kem_alg, key_type, is_encrypted
+    return parsed.kem_alg, parsed.key_type.title(), parsed.is_encrypted
 
 
 def inspect_key_pem_strict(pem_content: str) -> Dict[str, Any]:
-    """Inspect key PEM metadata and enforce private-key security policy."""
-    kem_alg, key_type, is_encrypted = get_key_info_pem(pem_content)
-    if not kem_alg or not key_type:
-        raise InvalidKeyFormatError("Key file is not a supported PQC PEM key.")
-
+    """Inspect validated key PEM metadata and enforce private-key security policy."""
+    parsed = _parse_key_pem_strict(pem_content)
     result: Dict[str, Any] = {
-        "kem": kem_alg,
-        "key_type": key_type.lower(),
+        "kem": parsed.kem_alg,
+        "key_type": parsed.key_type,
     }
-    if key_type == "Private":
-        if not is_encrypted:
-            raise UnencryptedPrivateKeyError("Unencrypted private keys are rejected.")
-        format_line = None
-        kdf_line = None
-        for line in pem_content.strip().splitlines()[1:-1]:
-            stripped = line.strip()
-            if stripped.startswith(cfg.PEM_PRIVATE_KEY_FORMAT_HEADER):
-                format_line = stripped
-            if stripped.startswith(cfg.PEM_KDF_HEADER):
-                kdf_line = stripped
-        if format_line is None and not cfg.ALLOW_LEGACY_PRIVATE_KEY_PEM:
-            raise InvalidKeyFormatError("Encrypted private-key PEM is missing format metadata.")
-        if format_line is not None:
-            result["private_key_format_version"] = _parse_private_key_format_line(format_line)
-        if kdf_line is None:
-            raise UnsupportedKDFError("Encrypted private-key PEM is missing KDF metadata.")
-        kdf_parts = _parse_private_key_kdf_line(kdf_line)
-        result["private_key_encrypted"] = True
-        result["private_key_kdf"] = kdf_parts["name"]
+    if parsed.key_type == "public":
+        result["public_key_fingerprint"] = get_public_key_fingerprint(parsed.payload, parsed.kem_alg)
+        return result
+    if not parsed.is_encrypted:
+        raise UnencryptedPrivateKeyError("Unencrypted private keys are rejected.")
+    if parsed.private_envelope is None:
+        raise InvalidKeyFormatError("Encrypted private-key PEM has incomplete metadata.")
+    result["private_key_encrypted"] = True
+    if parsed.private_envelope.format_version is not None:
+        result["private_key_format_version"] = parsed.private_envelope.format_version
+    result["private_key_kdf"] = parsed.private_envelope.kdf_name
     return result
 
 
@@ -1159,7 +1268,7 @@ def encrypt_file_pro(
     except CryptoDependencyError as e:
         logger.error(str(e))
         return None
-    except ValueError as e:
+    except (ValueError, InvalidKeyFormatError, UnsupportedAlgorithmError) as e:
         logger.error(str(e))
         return None
     except AttributeError as e:
@@ -1208,6 +1317,8 @@ def decrypt_file_pro(
         ):
             logger.error("Private key algorithm does not match encrypted file algorithm.")
             return None, kem_alg_from_file
+
+        _validate_key_material(secret_key_bytes, kem_alg_from_file, "private")
 
         if parts.metadata.version == cfg.FORMAT_VERSION:
             x25519_private_bytes, mlkem_private_key = unpack_hybrid_key(secret_key_bytes, "private")
