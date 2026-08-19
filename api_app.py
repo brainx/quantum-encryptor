@@ -11,7 +11,7 @@ import sys
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
 from starlette.datastructures import UploadFile
@@ -27,16 +27,37 @@ from ui_helpers import format_key_info_for_display, guess_decrypted_filename
 
 logger = logging.getLogger(__name__)
 
+Authority = tuple[str, str, int]
+
+
+def _configured_port(value: str) -> int:
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("PORT must be an integer from 1 through 65535.")
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT must be an integer from 1 through 65535.")
+    return port
+
+
+def _allowed_browser_authorities(app_port: int, enable_vite_dev: bool) -> frozenset[Authority]:
+    authorities = {("http", "127.0.0.1", app_port)}
+    if enable_vite_dev:
+        authorities.add(("http", "127.0.0.1", 4001))
+    return frozenset(authorities)
+
+
 APP_ROOT = Path(__file__).resolve().parent
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 SMALL_FORM_MAX_BYTES = 64 * 1024
+LOCAL_API_PORT = _configured_port(os.environ.get("PORT", "4000"))
+LOCAL_API_HOST_HEADER = f"127.0.0.1:{LOCAL_API_PORT}"
+ALLOWED_BROWSER_AUTHORITIES = _allowed_browser_authorities(
+    LOCAL_API_PORT,
+    os.environ.get("QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV") == "1",
+)
 LOCAL_API_TOKEN = os.environ.get("QUANTUM_ENCRYPTOR_API_TOKEN") or secrets.token_urlsafe(32)
 # Cookie name, not a secret value.
 LOCAL_API_TOKEN_COOKIE = "qe_api_token"  # nosec B105
-ALLOWED_ORIGIN_PREFIXES = (
-    "http://127.0.0.1:",
-    "http://localhost:",
-)
 SECURITY_HEADERS = (
     (
         b"content-security-policy",
@@ -65,6 +86,10 @@ STATIC_APP_DIR = _static_app_dir()
 
 class RequestBodyTooLarge(Exception):
     """Raised when an API request body exceeds the configured pre-parse limit."""
+
+
+class _DuplicateHeaderError(Exception):
+    """Raised when a security-sensitive request header is repeated."""
 
 
 class ApiError(Exception):
@@ -172,8 +197,90 @@ def _header_value(scope: Scope, name: bytes) -> str | None:
     return None
 
 
+def _single_header_value(scope: Scope, name: bytes) -> str | None:
+    values = [value.decode("latin1") for header_name, value in scope.get("headers", []) if header_name.lower() == name]
+    if len(values) > 1:
+        raise _DuplicateHeaderError
+    return values[0] if values else None
+
+
+def _is_ascii_authority(value: str | None) -> bool:
+    return isinstance(value, str) and bool(value) and all(0x21 <= ord(character) < 0x7F for character in value)
+
+
+def _parse_origin(value: str | None) -> Authority | None:
+    if not _is_ascii_authority(value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port if parsed.port is not None else 80
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or not 1 <= port <= 65535
+    ):
+        return None
+    return ("http", hostname.lower(), port)
+
+
+def _parse_host_authority(value: str | None) -> tuple[str, int] | None:
+    if not _is_ascii_authority(value) or value.lower() == "null":
+        return None
+    try:
+        parsed = urlsplit(f"http://{value}")
+        hostname = parsed.hostname
+        port = parsed.port if parsed.port is not None else 80
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "http"
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or not 1 <= port <= 65535
+    ):
+        return None
+    return (hostname.lower(), port)
+
+
+def _validate_request_authorities(scope: Scope) -> tuple[bool, ApiError | None]:
+    try:
+        host_value = _single_header_value(scope, b"host")
+    except _DuplicateHeaderError:
+        host_value = None
+    parsed_host = _parse_host_authority(host_value)
+    host_authority = ("http", *parsed_host) if parsed_host is not None else None
+    if host_authority not in ALLOWED_BROWSER_AUTHORITIES:
+        return False, ApiError(403, "forbidden_host", "Request host is not allowed.")
+
+    try:
+        origin_value = _single_header_value(scope, b"origin")
+    except _DuplicateHeaderError:
+        return False, ApiError(403, "forbidden_origin", "Request origin is not allowed.")
+    if origin_value is None:
+        return False, None
+
+    origin_authority = _parse_origin(origin_value)
+    if origin_authority not in ALLOWED_BROWSER_AUTHORITIES or origin_authority != host_authority:
+        return False, ApiError(403, "forbidden_origin", "Request origin is not allowed.")
+    return True, None
+
+
 def _cookie_value(scope: Scope, name: str) -> str | None:
-    cookie_header = _header_value(scope, b"cookie")
+    cookie_header = _single_header_value(scope, b"cookie")
     if not cookie_header:
         return None
     jar = SimpleCookie()
@@ -189,12 +296,6 @@ def _is_state_changing_api(scope: Scope) -> bool:
     method = str(scope.get("method", "GET")).upper()
     path = str(scope.get("path", ""))
     return method in {"POST", "PUT", "PATCH", "DELETE"} and path.startswith("/api/")
-
-
-def _is_allowed_origin(origin: str | None) -> bool:
-    if not origin:
-        return True
-    return origin.startswith(ALLOWED_ORIGIN_PREFIXES)
 
 
 def _has_valid_local_api_token(token: str | None) -> bool:
@@ -219,12 +320,24 @@ class LocalApiGuardMiddleware:
             await self.app(scope, receive, send)
             return
 
-        origin = _header_value(scope, b"origin")
-        if not _is_allowed_origin(origin):
-            await _json_error(ApiError(403, "forbidden_origin", "Request origin is not allowed."))(scope, receive, send)
+        has_valid_origin, authority_error = _validate_request_authorities(scope)
+        if authority_error is not None:
+            await _json_error(authority_error)(scope, receive, send)
             return
 
-        token = _header_value(scope, b"x-quantum-encryptor-token") or _cookie_value(scope, LOCAL_API_TOKEN_COOKIE)
+        try:
+            header_token = _single_header_value(scope, b"x-quantum-encryptor-token")
+        except _DuplicateHeaderError:
+            header_token = ""
+        if header_token is not None:
+            token = header_token
+        elif has_valid_origin:
+            try:
+                token = _cookie_value(scope, LOCAL_API_TOKEN_COOKIE)
+            except _DuplicateHeaderError:
+                token = None
+        else:
+            token = None
         if not _has_valid_local_api_token(token):
             await _json_error(ApiError(403, "missing_api_token", "Missing or invalid local API token."))(
                 scope, receive, send
@@ -416,7 +529,10 @@ def _health_payload() -> dict[str, Any]:
     }
 
 
-async def health(_request: Request) -> JSONResponse:
+async def health(request: Request) -> JSONResponse:
+    _has_valid_origin, authority_error = _validate_request_authorities(request.scope)
+    if authority_error is not None:
+        return _json_error(authority_error)
     response = _success_json(_health_payload())
     # Deliver the per-process API token only as an HttpOnly, SameSite=Strict cookie so it
     # is never exposed in response bodies or to JavaScript, and is not sent cross-site.
@@ -619,8 +735,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - [%(module)s] - %(message)s",
     )
-    port = int(os.environ.get("PORT", "4000"))
-    uvicorn.run("api_app:app", host="127.0.0.1", port=port, reload=False)
+    uvicorn.run("api_app:app", host="127.0.0.1", port=LOCAL_API_PORT, reload=False)
 
 
 if __name__ == "__main__":
