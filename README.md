@@ -129,7 +129,11 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 
 ### Local-only interface privacy
 
-The custom interface processes selected files through the local Python service at `127.0.0.1`. It does not use browser persistence, telemetry, remote fonts, or remote application assets. The UI does not display plaintext previews, passwords, private-key content, or the local API token.
+The custom interface processes selected files through the local Python service at `127.0.0.1`. It does not write generated keys to persistent web storage, collect telemetry, or load remote fonts or remote application assets. The UI does not display plaintext previews, passwords, private-key content, or the local API token.
+
+Every `/api/*` response, including generated-key JSON, errors, middleware rejections, framework-generated 500 responses, and file downloads, is marked `Cache-Control: no-store` and `Pragma: no-cache`; static application assets keep their normal cache policy. These directives ask conforming HTTP caches not to retain API responses, but they are not secure deletion.
+
+The web app keeps its generated-result references in the current tab's in-memory UI state. Save both files before clearing the result or leaving, reloading, or closing the page because those actions may lose the in-app result. Downloaded files are separate copies controlled by the browser, operating system, and destination. While the PEMs remain in the app, it requests the browser's standard leave-page warning. The browser controls whether that warning appears and its wording. Explicit clearing drops the app's React references but cannot zeroize managed memory. Browser history may instead suspend the document in the back/forward cache and later restore the same tab state.
 
 ## Verification
 
@@ -167,7 +171,7 @@ Do not treat the browser smoke test as proof that the native cryptographic backe
 
 1. Select "Generate keys" from the workflow navigation
 2. Enter and confirm a strong private-key password
-3. Generate the keys and download both public and private key files
+3. Save both files from the current tab before clearing the result or leaving the page
 4. Share your public key with others who want to send you encrypted files
 
 ### File Encryption
@@ -240,6 +244,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - PEM/key reads are capped at 128 KiB before parsing; POSIX workspace inputs use descriptor-anchored, no-follow reads, and reads remain bounded even if a file changes during the operation
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
 - State-changing local web API requests require a per-process API token. Browser cookie requests require an exact allowed `Origin` that equals the direct `Host`; clients without an `Origin` header must send `X-Quantum-Encryptor-Token`, and an invalid header never falls back to the cookie. `GET /api/health` issues the cookie only for an allowed direct `Host` and, when present, a matching `Origin`; forwarding headers are not trusted
+- Generated-key cache and leave-page guards reduce accidental retention or loss but do not protect against developer tools, browser extensions, or malicious local software. Browser and operating-system settings determine downloaded private-key file permissions; the web app cannot guarantee POSIX mode `0600`.
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
 - CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.16.0 release commit; repository CodeQL default setup provides static analysis

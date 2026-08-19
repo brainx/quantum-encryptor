@@ -12,6 +12,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Plaintext input files and decrypted output files.
 - Encrypted `.pqc` containers and their authenticated metadata.
 - Local workspace file paths used by the agent CLI.
+- Generated public-key and encrypted private-key PEM strings while returned by the API and held by the current browser tab.
 
 ## Trust Boundaries
 
@@ -20,6 +21,8 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Public/private PEM files and `.pqc` files are attacker-controlled until parsed and authenticated.
 - Native `liboqs` and Python `cryptography` are trusted dependencies but may be unavailable or misconfigured.
 - The local filesystem is trusted only inside the current workspace for agent CLI operations.
+- Sensitive `/api/*` responses cross into browser, client, and intermediary HTTP-cache behavior; static assets remain a separate response class.
+- Generated PEMs cross from the local API into one tab's JavaScript state and then into browser/operating-system download handling, none of which provides application-controlled zeroization or file permissions.
 
 ## Abuse Cases
 
@@ -34,6 +37,10 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Using absolute paths, parent traversal, or symlinks to make the agent CLI read or write outside the workspace.
 - Triggering native backend failures during import, key generation, encryption, or decryption.
 - Leaking plaintext, private keys, passwords, raw bytes, or absolute local paths through JSON output or logs.
+- Retaining generated PEMs, plaintext downloads, or safe API error data in an HTTP cache.
+- Reloading, closing, or navigating away before both generated PEMs are saved.
+- Treating navigation as erasure even though browser history may suspend and restore the document's generated PEM state.
+- Registering an unconditional or stale leave-page warning after generated PEMs have been cleared.
 
 ## Required Invariants
 
@@ -65,6 +72,8 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Workspace-only agent CLI path validation, exclusive non-overwrite creation, atomic replacement on explicit overwrite, and JSON-only responses.
 - The local web API trusts only the exact `http://127.0.0.1:<PORT>` authority, plus `http://127.0.0.1:4001` only when `QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1` enables the Vite development proxy. Cookie-authenticated state-changing requests require an allowed parsed `Origin` exactly equal to the direct allowed `Host`; Origin-less clients must use the explicit token header, and an invalid supplied header cannot fall back to the cookie. `GET /api/health` issues its `HttpOnly` cookie only for an allowed direct Host and a matching Origin when present, without trusting forwarding headers. `SameSite=Strict` helps with cross-site cookie delivery but does not isolate loopback ports; exact authority validation provides that boundary, while page JavaScript still cannot read the cookie.
 - All local web responses include a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`, blocking clickjacking of the local UI.
+- Every `/api/*` response replaces its cache policy with `Cache-Control: no-store` and `Pragma: no-cache`; static responses retain their own policy.
+- The Generate workflow keeps its in-app PEM references in current-tab state, provides explicit clearing and in-app navigation confirmation, and requests a browser leave-page warning only while both references remain; downloaded files are separate browser/operating-system copies.
 
 ## Limitations
 
@@ -76,3 +85,9 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - The application-specific file and key formats are not interoperable with OpenPGP or another standardized container format.
 - The hybrid construction has not undergone an independent cryptographic audit.
 - Private-key recovery is impossible if the private-key password is lost.
+- `no-store` is an HTTP retention directive, not secure deletion, and does not prevent capture by developer tools, extensions, malicious local software, or a compromised browser or operating system.
+- The leave-page prompt is best effort and browser controlled; crashes, forced termination, and some lifecycle paths may provide no warning.
+- Explicit clearing drops React's references but does not guarantee JavaScript or Python memory zeroization.
+- Browser back/forward cache may preserve and later restore a document's generated PEM state after navigation; leave, reload, and close must not be described as reliable clearing events.
+- Generated PEMs are returned directly to the tab; there is no server-side temporary key vault or recovery protocol.
+- Browser and operating-system settings determine downloaded file permissions; the web flow cannot guarantee the agent CLI's POSIX `0600` private-key mode.

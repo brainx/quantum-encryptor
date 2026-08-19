@@ -72,6 +72,10 @@ SECURITY_HEADERS = (
     (b"x-frame-options", b"DENY"),
     (b"referrer-policy", b"no-referrer"),
 )
+API_NO_STORE_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"cache-control", b"no-store"),
+    (b"pragma", b"no-cache"),
+)
 
 
 def _static_app_dir() -> Path:
@@ -365,13 +369,24 @@ class SecurityHeadersMiddleware:
             await self.app(scope, receive, send)
             return
 
+        is_api_path = str(scope.get("path", "")).startswith("/api/")
+
         async def send_with_security_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
-                headers = message.setdefault("headers", [])
+                headers = list(message.get("headers", []))
                 existing = {name.lower() for name, _value in headers}
                 for name, value in SECURITY_HEADERS:
                     if name not in existing:
                         headers.append((name, value))
+                if is_api_path:
+                    for name, value in API_NO_STORE_HEADERS:
+                        headers[:] = [
+                            (existing_name, existing_value)
+                            for existing_name, existing_value in headers
+                            if existing_name.lower() != name
+                        ]
+                        headers.append((name, value))
+                message["headers"] = headers
             await send(message)
 
         await self.app(scope, receive, send_with_security_headers)
@@ -550,8 +565,6 @@ async def health(request: Request) -> JSONResponse:
         httponly=True,
         samesite="strict",
     )
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
     return response
 
 
@@ -713,7 +726,7 @@ async def frontend_missing(_request: Request) -> PlainTextResponse:
     )
 
 
-def create_app() -> Starlette:
+def create_app() -> ASGIApp:
     routes: list[BaseRoute] = [
         Route("/api/health", health, methods=["GET"]),
         Route("/api/keys/inspect", inspect_key, methods=["POST"]),
@@ -725,11 +738,10 @@ def create_app() -> Starlette:
         routes.append(Mount("/", StaticFiles(directory=STATIC_APP_DIR, html=True), name="web"))
     else:
         routes.append(Route("/{path:path}", frontend_missing, methods=["GET"]))
-    app = Starlette(debug=False, routes=routes)
-    app.add_middleware(ApiBodyLimitMiddleware)
-    app.add_middleware(LocalApiGuardMiddleware)
-    app.add_middleware(SecurityHeadersMiddleware)
-    return app
+    inner_app = Starlette(debug=False, routes=routes)
+    inner_app.add_middleware(ApiBodyLimitMiddleware)
+    inner_app.add_middleware(LocalApiGuardMiddleware)
+    return SecurityHeadersMiddleware(inner_app)
 
 
 app = create_app()

@@ -75,6 +75,11 @@ describe("GenerateKeysWorkflow", () => {
     expect(screen.queryByLabelText("Confirm private key password")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Download public key" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Download encrypted private key" })).toBeVisible();
+    expect(
+      screen.getByText(
+        "Save both files now. The app keeps this generated result in this tab, and you may lose it if you clear it, reload, or leave the page. The public key is safe to share; keep the encrypted private key and password secure."
+      )
+    ).toBeVisible();
     expect(screen.queryByText("PUBLIC-PEM")).not.toBeInTheDocument();
     expect(screen.queryByText("ENCRYPTED-PRIVATE-PEM")).not.toBeInTheDocument();
     expect(onSensitiveResultChange).toHaveBeenCalledWith(true);

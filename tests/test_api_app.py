@@ -148,6 +148,7 @@ async def _call_app_raw(
     headers: list[tuple[bytes, bytes]] | None = None,
     *,
     host: str | None = None,
+    expected_exception: type[Exception] | None = None,
 ) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
     app = api_app.create_app()
     sent: list[dict[str, Any]] = []
@@ -181,7 +182,15 @@ async def _call_app_raw(
         "client": ("127.0.0.1", 12345),
         "server": ("127.0.0.1", 4000),
     }
-    await app(scope, receive, send)
+    expected_exception_raised = False
+    try:
+        await app(scope, receive, send)
+    except Exception as exc:
+        if expected_exception is None or not isinstance(exc, expected_exception):
+            raise
+        expected_exception_raised = True
+    if expected_exception is not None and not expected_exception_raised:
+        raise AssertionError(f"Expected {expected_exception.__name__} to be raised by the ASGI app")
 
     start = next(message for message in sent if message["type"] == "http.response.start")
     status = int(start["status"])
@@ -207,6 +216,25 @@ def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> str | None:
         if header_name.lower() == name:
             return value.decode("latin1")
     return None
+
+
+def _assert_api_no_store(headers: list[tuple[bytes, bytes]]) -> None:
+    assert _header(headers, b"cache-control") == "no-store"
+    assert _header(headers, b"pragma") == "no-cache"
+
+
+def test_call_app_raw_requires_expected_exception_to_occur():
+    with pytest.raises(
+        AssertionError,
+        match="Expected RuntimeError to be raised by the ASGI app",
+    ):
+        asyncio.run(
+            _call_app_raw(
+                "/api/health",
+                method="GET",
+                expected_exception=RuntimeError,
+            )
+        )
 
 
 def _file_workflow_body() -> tuple[bytes, list[tuple[bytes, bytes]]]:
@@ -505,6 +533,41 @@ def test_security_headers_cover_middleware_rejections():
     assert status == 403
     assert _header(response_headers, b"x-content-type-options") == "nosniff"
     assert _header(response_headers, b"content-security-policy") is not None
+    _assert_api_no_store(response_headers)
+
+
+def test_api_cache_policy_replaces_weaker_handler_headers(monkeypatch):
+    async def cacheable_health(_request):
+        return api_app.Response(
+            b"health",
+            headers={"Cache-Control": "public, max-age=3600", "Pragma": "cache"},
+        )
+
+    monkeypatch.setattr(api_app, "health", cacheable_health)
+
+    status, response_headers, _response_body = asyncio.run(_call_app_raw("/api/health", method="GET"))
+
+    assert status == 200
+    assert [value for name, value in response_headers if name.lower() == b"cache-control"] == [b"no-store"]
+    assert [value for name, value in response_headers if name.lower() == b"pragma"] == [b"no-cache"]
+
+
+def test_unhandled_api_error_is_not_cacheable(monkeypatch):
+    async def failing_health(_request):
+        raise RuntimeError("failed before response start")
+
+    monkeypatch.setattr(api_app, "health", failing_health)
+
+    status, response_headers, _response_body = asyncio.run(
+        _call_app_raw(
+            "/api/health",
+            method="GET",
+            expected_exception=RuntimeError,
+        )
+    )
+
+    assert status == 500
+    _assert_api_no_store(response_headers)
 
 
 def test_post_api_accepts_auth_cookie():
@@ -719,10 +782,14 @@ def test_api_rejects_oversized_body_before_route_parsing():
         ]
     )
 
-    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers))
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/keys/inspect", body=body, headers=headers)
+    )
+    payload = json.loads(response_body.decode("utf-8"))
 
     assert status == 413
     assert payload["error_code"] == "request_too_large"
+    _assert_api_no_store(response_headers)
 
 
 def test_api_rejects_missing_content_length_after_token_validation():
@@ -818,12 +885,16 @@ def test_generate_keys_returns_pem_payloads(monkeypatch):
 
     monkeypatch.setattr(core, "save_key_pem", save_key)
 
-    status, payload = asyncio.run(_call_app("/api/keys/generate", body=body, headers=_with_api_token(headers)))
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/keys/generate", body=body, headers=_with_api_token(headers))
+    )
+    payload = json.loads(response_body.decode("utf-8"))
 
     assert status == 200
     assert payload["publicPem"] == "public:public"
     assert payload["privatePem"] == "private:private"
     assert payload["kem"] == cfg.HYBRID_KEM_ALG
+    _assert_api_no_store(response_headers)
 
 
 def test_generate_keys_reports_backend_unavailable(monkeypatch):
@@ -950,6 +1021,7 @@ def test_decrypt_file_returns_download(monkeypatch):
     assert status == 200
     assert response_body == b"plain:ciphertext"
     assert "plain.txt" in (_header(response_headers, b"content-disposition") or "")
+    _assert_api_no_store(response_headers)
 
 
 def test_decrypt_file_reports_failed_private_key_unlock(monkeypatch):
@@ -1026,3 +1098,46 @@ def test_frontend_missing_returns_setup_hint(monkeypatch, tmp_path):
 
     assert status == 503
     assert b"npm run build" in response_body
+
+
+def test_static_response_keeps_its_own_cache_policy(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text("<div>built UI</div>", encoding="utf-8")
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+
+    status, response_headers, response_body = asyncio.run(_call_app_raw("/", method="GET"))
+
+    assert status == 200
+    assert response_body == b"<div>built UI</div>"
+    assert _header(response_headers, b"cache-control") != "no-store"
+    assert _header(response_headers, b"pragma") != "no-cache"
+
+
+def test_api_cache_policy_does_not_mutate_reused_response(monkeypatch, tmp_path):
+    shared_response = api_app.Response(
+        b"shared",
+        headers={"Cache-Control": "public, max-age=3600", "Pragma": "cache"},
+    )
+
+    async def shared_handler(_request):
+        return shared_response
+
+    monkeypatch.setattr(api_app, "health", shared_handler)
+    monkeypatch.setattr(api_app, "frontend_missing", shared_handler)
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path / "missing-static-app")
+
+    api_status, api_headers, _api_body = asyncio.run(_call_app_raw("/api/health", method="GET"))
+    static_status, static_headers, _static_body = asyncio.run(_call_app_raw("/outside-api", method="GET"))
+
+    assert api_status == 200
+    assert [value for name, value in api_headers if name.lower() == b"cache-control"] == [b"no-store"]
+    assert [value for name, value in api_headers if name.lower() == b"pragma"] == [b"no-cache"]
+    assert static_status == 200
+    assert [value for name, value in static_headers if name.lower() == b"cache-control"] == [b"public, max-age=3600"]
+    assert [value for name, value in static_headers if name.lower() == b"pragma"] == [b"cache"]
+
+
+def test_unmatched_api_response_is_not_cacheable():
+    status, response_headers, _response_body = asyncio.run(_call_app_raw("/api/not-a-route", method="GET"))
+
+    assert status >= 400
+    _assert_api_no_store(response_headers)
