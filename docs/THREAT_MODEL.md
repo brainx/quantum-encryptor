@@ -63,14 +63,14 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - AES-256-GCM with full encrypted-file header as associated data.
 - Lazy native `liboqs` loading with dependency failures reported as unavailable backend state.
 - Workspace-only agent CLI path validation, exclusive non-overwrite creation, atomic replacement on explicit overwrite, and JSON-only responses.
-- The per-process local API token is delivered only as an `HttpOnly`, `SameSite=Strict` cookie and never appears in API response bodies, so cross-site requests cannot carry it and page JavaScript cannot read it.
+- The local web API trusts only the exact `http://127.0.0.1:<PORT>` authority, plus `http://127.0.0.1:4001` only when `QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1` enables the Vite development proxy. Cookie-authenticated state-changing requests require an allowed parsed `Origin` exactly equal to the direct allowed `Host`; Origin-less clients must use the explicit token header, and an invalid supplied header cannot fall back to the cookie. `GET /api/health` issues its `HttpOnly` cookie only for an allowed direct Host and a matching Origin when present, without trusting forwarding headers. `SameSite=Strict` helps with cross-site cookie delivery but does not isolate loopback ports; exact authority validation provides that boundary, while page JavaScript still cannot read the cookie.
 - All local web responses include a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`, blocking clickjacking of the local UI.
 
 ## Limitations
 
 - The app processes files in memory and is not suitable for very large streaming workflows.
 - Python cannot guarantee secure zeroization of immutable secret byte strings.
-- The loopback API trusts the local machine: any local process can call `GET /api/health` and read the auth cookie from the response headers, so the token guards against browser-based cross-site attacks, not against malicious local software. Keep the server bound to `127.0.0.1`; never expose it on a network interface.
+- The loopback API trusts the local machine: malicious local software can use the allowed authority to obtain and send the auth cookie, so this protection does not defend against a malicious local process. Keep the server bound to `127.0.0.1`; never expose it on a network interface.
 - The local web API does not rate-limit private-key password attempts. Each attempt costs a full scrypt derivation, and an attacker holding the encrypted PEM would brute force offline instead, so online throttling adds little.
 - No independent cryptographic audit or formal verification has been performed.
 - The application-specific file and key formats are not interoperable with OpenPGP or another standardized container format.

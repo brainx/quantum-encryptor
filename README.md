@@ -100,7 +100,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
    ./start.sh
    ```
 
-   The custom web app builds the frontend and listens on `127.0.0.1:4000` by default. Set `PORT` to override the local development port:
+   The custom web app builds the frontend and serves its UI and API at exactly `http://127.0.0.1:4000` by default. `PORT` selects the one trusted local UI/API authority; `localhost`, IPv6 and other loopback addresses, and sibling ports are not aliases for it. Set `PORT` to choose a different local development authority:
    ```bash
    PORT=4001 ./start.sh
    ```
@@ -111,10 +111,13 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
    PYTHON=.venv/bin/python ./test.sh
    ```
 
-   Frontend development can run Vite separately on `127.0.0.1:4001`:
+   Keep `./start.sh` as the normal path. For frontend development, explicitly opt both processes into the one additional Vite authority, `http://127.0.0.1:4001`, and its `/api` proxy:
    ```bash
-   npm run dev
+   QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1 SKIP_WEB_BUILD=1 ./start.sh
+   QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1 npm run dev
    ```
+
+   The switch must be set to exactly `1` for both processes; any other value leaves the Vite authority and proxy disabled.
 
 2. Open the web interface in your browser. Choose the intent that matches your task:
    - **Encrypt**: protect a file for the holder of a recipient public key.
@@ -236,7 +239,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - Legacy hybrid public keys must be regenerated before encryption; they are never relabeled or reused as current-suite keys
 - PEM/key reads are capped at 128 KiB before parsing; POSIX workspace inputs use descriptor-anchored, no-follow reads, and reads remain bounded even if a file changes during the operation
 - The web UI enforces a 100 MiB plaintext processing limit because files are handled in memory; encrypted containers allow bounded header and authentication overhead above that plaintext limit
-- State-changing local web API requests require a per-process API token and reject non-local browser origins when an `Origin` header is present
+- State-changing local web API requests require a per-process API token. Browser cookie requests require an exact allowed `Origin` that equals the direct `Host`; clients without an `Origin` header must send `X-Quantum-Encryptor-Token`, and an invalid header never falls back to the cookie. `GET /api/health` issues the cookie only for an allowed direct `Host` and, when present, a matching `Origin`; forwarding headers are not trusted
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
 - CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.16.0 release commit; repository CodeQL default setup provides static analysis
