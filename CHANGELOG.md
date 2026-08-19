@@ -37,6 +37,12 @@ This project follows a practical semantic-versioning style.
 - All local web responses now include a restrictive Content Security Policy (including `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
 - All local `/api/*` responses now opt out of HTTP caching, and the key-generation UI requests a browser page-leave warning only while its in-app PEM references remain, with explicit guidance about browser-memory limitations.
 - Public-key fingerprints bind the exact algorithm label and canonically validated public bytes. Encrypted private-key inspection omits a fingerprint until an explicit CLI password unlock authenticates and validates the private key; no PEM or encrypted-file format version changed.
+- Release publishing now fails closed unless the stable tag, all maintained
+  version fields, populated changelog section, checked-out main-line commit, and
+  GitHub-verified signed annotated tag agree. The live tag identity is checked
+  again after draft artifact upload and before publication, and build tooling
+  and wheel smoke-test dependencies install from hash-locked requirements.
+  Release workflow actions are pinned to immutable commits.
 
 ## [1.0.1] - 2026-06-21
 
