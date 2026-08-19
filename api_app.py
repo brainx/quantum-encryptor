@@ -205,7 +205,13 @@ def _single_header_value(scope: Scope, name: bytes) -> str | None:
 
 
 def _is_ascii_authority(value: str | None) -> bool:
-    return isinstance(value, str) and bool(value) and all(0x21 <= ord(character) < 0x7F for character in value)
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and "?" not in value
+        and "#" not in value
+        and all(0x21 <= ord(character) < 0x7F for character in value)
+    )
 
 
 def _parse_origin(value: str | None) -> Authority | None:
