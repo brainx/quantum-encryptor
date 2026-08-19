@@ -142,11 +142,23 @@ def _inspect_key_body_limit() -> int:
 
 
 async def _call_app_raw(
-    path: str, method: str = "POST", body: bytes = b"", headers: list[tuple[bytes, bytes]] | None = None
+    path: str,
+    method: str = "POST",
+    body: bytes = b"",
+    headers: list[tuple[bytes, bytes]] | None = None,
+    *,
+    host: str | None = None,
 ) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
     app = api_app.create_app()
     sent: list[dict[str, Any]] = []
     request_sent = False
+    request_headers = list(headers) if headers is not None else [
+        (b"content-length", str(len(body)).encode("ascii"))
+    ]
+    if host is None:
+        host = api_app.LOCAL_API_HOST_HEADER
+    if host:
+        request_headers.append((b"host", host.encode("ascii")))
 
     async def receive():
         nonlocal request_sent
@@ -167,7 +179,7 @@ async def _call_app_raw(
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "headers": headers or [(b"content-length", str(len(body)).encode("ascii"))],
+        "headers": request_headers,
         "client": ("127.0.0.1", 12345),
         "server": ("127.0.0.1", 4000),
     }
@@ -181,9 +193,14 @@ async def _call_app_raw(
 
 
 async def _call_app(
-    path: str, method: str = "POST", body: bytes = b"", headers: list[tuple[bytes, bytes]] | None = None
+    path: str,
+    method: str = "POST",
+    body: bytes = b"",
+    headers: list[tuple[bytes, bytes]] | None = None,
+    *,
+    host: str | None = None,
 ) -> tuple[int, dict[str, object]]:
-    status, _response_headers, response_body = await _call_app_raw(path, method, body, headers)
+    status, _response_headers, response_body = await _call_app_raw(path, method, body, headers, host=host)
     return status, json.loads(response_body.decode("utf-8"))
 
 
@@ -212,6 +229,91 @@ def _decrypt_workflow_body() -> tuple[bytes, list[tuple[bytes, bytes]]]:
         ],
         {"password": "correct horse battery staple", "output_filename": "../plain.txt"},
     )
+
+
+def _invalid_key_request_headers(*extra_headers: tuple[bytes, bytes]) -> tuple[bytes, list[tuple[bytes, bytes]]]:
+    body, headers = _multipart_body("key", "bad.pem", b"not a supported key")
+    return body, headers + list(extra_headers)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("http://127.0.0.1:4000", ("http", "127.0.0.1", 4000)),
+        ("HTTP://127.0.0.1:4000", ("http", "127.0.0.1", 4000)),
+        ("http://127.0.0.1", ("http", "127.0.0.1", 80)),
+    ],
+)
+def test_parse_origin_normalizes_valid_http_authorities(value, expected):
+    assert api_app._parse_origin(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "null",
+        "https://127.0.0.1:4000",
+        "http://localhost:4000",
+        "http://user@127.0.0.1:4000",
+        "http://127.0.0.1:4000/path",
+        "http://127.0.0.1:4000?query=1",
+        "http://127.0.0.1:4000#fragment",
+        " http://127.0.0.1:4000",
+        "http://127.0.0.1:4000 ",
+        "http://127.0.0.1:4000\n",
+        "http://127.0.0.1:not-a-port",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:65536",
+        "http://127.0.0.1:4000.evil",
+    ],
+)
+def test_parse_origin_rejects_non_exact_local_authorities(value):
+    assert api_app._parse_origin(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("127.0.0.1:4000", ("127.0.0.1", 4000))],
+)
+def test_parse_host_authority_normalizes_valid_authority(value, expected):
+    assert api_app._parse_host_authority(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "null",
+        "localhost:4000",
+        "user@127.0.0.1:4000",
+        "http://127.0.0.1:4000",
+        "127.0.0.1:4000/path",
+        "127.0.0.1:4000?query=1",
+        "127.0.0.1:4000#fragment",
+        " 127.0.0.1:4000",
+        "127.0.0.1:4000 ",
+        "127.0.0.1:4000\n",
+        "127.0.0.1:not-a-port",
+        "127.0.0.1:0",
+        "127.0.0.1:65536",
+        "127.0.0.1:4000.evil",
+    ],
+)
+def test_parse_host_authority_rejects_non_exact_local_authorities(value):
+    assert api_app._parse_host_authority(value) is None
+
+
+def test_allowed_browser_authorities_are_finite_and_exact():
+    assert api_app._allowed_browser_authorities(4000, enable_vite_dev=False) == {
+        ("http", "127.0.0.1", 4000),
+    }
+    assert api_app._allowed_browser_authorities(4000, enable_vite_dev=True) == {
+        ("http", "127.0.0.1", 4000),
+        ("http", "127.0.0.1", 4001),
+    }
 
 
 def test_form_text_handles_optional_missing_and_rejects_upload_value():
@@ -282,6 +384,74 @@ def test_health_route_sets_auth_cookie_without_disclosing_token():
     assert _header(response_headers, b"pragma") == "no-cache"
 
 
+def test_health_route_sets_auth_cookie_for_matching_browser_authority():
+    status, response_headers, _response_body = asyncio.run(
+        _call_app_raw(
+            "/api/health",
+            method="GET",
+            headers=[(b"origin", b"http://127.0.0.1:4000")],
+            host="127.0.0.1:4000",
+        )
+    )
+
+    assert status == 200
+    assert _header(response_headers, b"set-cookie") is not None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:4001", "localhost:4000", "127.0.0.1:4000.evil", ""])
+def test_health_route_rejects_invalid_or_missing_host_without_setting_cookie(host):
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/health", method="GET", host=host)
+    )
+    payload = json.loads(response_body.decode("utf-8"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_host"
+    assert _header(response_headers, b"set-cookie") is None
+
+
+def test_health_route_rejects_duplicate_host_without_setting_cookie():
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw(
+            "/api/health",
+            method="GET",
+            headers=[(b"host", b"127.0.0.1:4000")],
+            host="127.0.0.1:4000",
+        )
+    )
+    payload = json.loads(response_body.decode("utf-8"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_host"
+    assert _header(response_headers, b"set-cookie") is None
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:4001", "http://127.0.0.1:4000.evil"])
+def test_health_route_rejects_present_invalid_origin_without_setting_cookie(origin):
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw(
+            "/api/health",
+            method="GET",
+            headers=[(b"origin", origin.encode("ascii"))],
+            host="127.0.0.1:4000",
+        )
+    )
+    payload = json.loads(response_body.decode("utf-8"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_origin"
+    assert _header(response_headers, b"set-cookie") is None
+
+
+def test_health_route_allows_direct_navigation_without_origin():
+    status, response_headers, _response_body = asyncio.run(
+        _call_app_raw("/api/health", method="GET", host="127.0.0.1:4000")
+    )
+
+    assert status == 200
+    assert _header(response_headers, b"set-cookie") is not None
+
+
 def test_security_headers_are_applied_to_api_responses():
     status, response_headers, _body = asyncio.run(_call_app_raw("/api/health", method="GET"))
 
@@ -308,11 +478,132 @@ def test_security_headers_cover_middleware_rejections():
 def test_post_api_accepts_auth_cookie():
     body, headers = _multipart_body("key", "bad.pem", b"not a supported key")
     headers.append((b"cookie", f"{api_app.LOCAL_API_TOKEN_COOKIE}={api_app.LOCAL_API_TOKEN}".encode("ascii")))
+    headers.append((b"origin", b"http://127.0.0.1:4000"))
 
-    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers))
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
 
     assert status == 400
     assert payload["error_code"] == "unsupported_key"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://127.0.0.1:4001",
+        "http://localhost:4000",
+    ],
+)
+def test_post_api_rejects_cookie_from_non_exact_browser_authority(origin):
+    body, headers = _invalid_key_request_headers(
+        (b"cookie", f"{api_app.LOCAL_API_TOKEN_COOKIE}={api_app.LOCAL_API_TOKEN}".encode("ascii")),
+        (b"origin", origin.encode("ascii")),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_origin"
+
+
+def test_post_api_rejects_cookie_without_origin():
+    body, headers = _invalid_key_request_headers(
+        (b"cookie", f"{api_app.LOCAL_API_TOKEN_COOKIE}={api_app.LOCAL_API_TOKEN}".encode("ascii")),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "missing_api_token"
+
+
+@pytest.mark.parametrize("origin", [None, "http://127.0.0.1:4000"])
+def test_post_api_accepts_explicit_token_from_exact_local_client(origin):
+    extra_headers = [(b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii"))]
+    if origin is not None:
+        extra_headers.append((b"origin", origin.encode("ascii")))
+    body, headers = _invalid_key_request_headers(*extra_headers)
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 400
+    assert payload["error_code"] == "unsupported_key"
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:4001", "http://127.0.0.1:4000.evil"])
+def test_post_api_rejects_explicit_token_with_invalid_origin(origin):
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+        (b"origin", origin.encode("ascii")),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_origin"
+
+
+def test_post_api_rejects_invalid_explicit_token_even_with_valid_cookie():
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", b"invalid-token"),
+        (b"cookie", f"{api_app.LOCAL_API_TOKEN_COOKIE}={api_app.LOCAL_API_TOKEN}".encode("ascii")),
+        (b"origin", b"http://127.0.0.1:4000"),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "missing_api_token"
+
+
+@pytest.mark.parametrize("host", ["", "127.0.0.1:4001", "127.0.0.1:4000.evil"])
+def test_post_api_rejects_missing_malformed_or_sibling_host(host):
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host=host))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_host"
+
+
+def test_post_api_rejects_duplicate_host():
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+        (b"host", b"127.0.0.1:4000"),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_host"
+
+
+def test_post_api_rejects_duplicate_origin():
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+        (b"origin", b"http://127.0.0.1:4000"),
+        (b"origin", b"http://127.0.0.1:4000"),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4000"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_origin"
+
+
+def test_forwarded_headers_do_not_rescue_an_invalid_direct_host():
+    body, headers = _invalid_key_request_headers(
+        (b"x-quantum-encryptor-token", api_app.LOCAL_API_TOKEN.encode("ascii")),
+        (b"origin", b"http://127.0.0.1:4000"),
+        (b"x-forwarded-host", b"127.0.0.1:4000"),
+        (b"x-forwarded-proto", b"http"),
+    )
+
+    status, payload = asyncio.run(_call_app("/api/keys/inspect", body=body, headers=headers, host="127.0.0.1:4001"))
+
+    assert status == 403
+    assert payload["error_code"] == "forbidden_host"
 
 
 def test_post_api_rejects_missing_local_api_token():

@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
+
+import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,3 +44,30 @@ def test_start_script_uses_api_app_when_legacy_flag_is_set(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert argv_log.read_text(encoding="utf-8").splitlines() == ["-m", "api_app"]
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "abc", " 4000 "])
+def test_import_rejects_invalid_port_configuration_without_token_leakage(port):
+    token = "test-token-must-not-appear"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PORT": port,
+            "PYTHONPATH": str(REPOSITORY_ROOT),
+            "QUANTUM_ENCRYPTOR_API_TOKEN": token,
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "import api_app"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert "PORT must be an integer from 1 through 65535." in output
+    assert token not in output
