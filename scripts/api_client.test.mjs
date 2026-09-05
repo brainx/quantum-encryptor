@@ -150,6 +150,42 @@ test("an unrelated authorization rejection is not retried", async (t) => {
   );
 });
 
+test("a busy response preserves server guidance without retrying the POST", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const message = "The local service is processing another operation. Wait for it to finish, then try again.";
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, method: init.method ?? "GET" });
+    if (url === "/api/health") return jsonResponse(healthPayload());
+    if (url === "/api/keys/generate") {
+      const response = jsonResponse({ ok: false, error_code: "server_busy", message }, 429);
+      response.headers.set("Retry-After", "1");
+      return response;
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  const api = await loadApiModule();
+
+  await assert.rejects(
+    api.generateKeys("correct horse battery staple"),
+    (error) =>
+      error instanceof api.ApiError &&
+      error.status === 429 &&
+      error.code === "server_busy" &&
+      error.message === message
+  );
+  assert.deepEqual(calls, [
+    { url: "/api/health", method: "GET" },
+    { url: "/api/keys/generate", method: "POST" }
+  ]);
+});
+
 test("sensitive operation signals reach each state-changing fetch", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {

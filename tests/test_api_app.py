@@ -1,11 +1,15 @@
 import asyncio
 import io
 import json
+import threading
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Awaitable, Callable, cast
 from urllib.parse import urlencode
 
 import pytest
+from starlette.applications import Starlette
+from starlette.types import ASGIApp
 
 from crypto_config import cfg
 import crypto_core as core
@@ -47,6 +51,198 @@ def test_health_payload_reports_ready_backend(monkeypatch):
     assert payload["kemComponent"] == "ML-KEM-768"
 
 
+@pytest.mark.parametrize("operation", ["generate", "encrypt", "decrypt"])
+def test_crypto_operations_run_outside_event_loop(monkeypatch, operation):
+    event_loop_thread = threading.get_ident()
+    worker_threads = []
+
+    def record_thread(result):
+        worker_threads.append(threading.get_ident())
+        return result
+
+    monkeypatch.setattr(core, "resolve_kem_algorithm", lambda _kem: cfg.KEM_ALG)
+    monkeypatch.setattr(core, "get_public_key_fingerprint", lambda *_args: "fingerprint")
+    if operation == "generate":
+        path = "/api/keys/generate"
+        body, headers = _urlencoded_body({"password": "correct horse battery staple"})
+        monkeypatch.setattr(core, "generate_hybrid_keys", lambda _kem: record_thread((b"public", b"private")))
+        monkeypatch.setattr(core, "save_key_pem", lambda *_args, **_kwargs: "pem")
+    elif operation == "encrypt":
+        path = "/api/files/encrypt"
+        body, headers = _file_workflow_body()
+        monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
+        monkeypatch.setattr(core, "encrypt_file_pro", lambda *_args: record_thread(b"encrypted"))
+    else:
+        path = "/api/files/decrypt"
+        body, headers = _decrypt_workflow_body()
+        monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: {"key_type": "private"})
+        monkeypatch.setattr(core, "load_key_pem", lambda *_args, **_kwargs: (b"private", cfg.HYBRID_KEM_ALG, "private"))
+        monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", lambda _kem: (cfg.KEM_ALG,))
+        monkeypatch.setattr(core, "decrypt_file_pro", lambda *_args, **_kwargs: record_thread((b"plain", cfg.KEM_ALG)))
+
+    status, _, _ = asyncio.run(_call_app_raw(path, body=body, headers=_with_api_token(headers)))
+
+    assert status == 200
+    assert worker_threads and all(thread != event_loop_thread for thread in worker_threads)
+
+
+@pytest.mark.parametrize("busy_path", ["/api/keys/generate", "/api/files/encrypt", "/api/files/decrypt"])
+def test_busy_crypto_request_is_rejected_before_reading_uploads(busy_path):
+    async def exercise():
+        async with _running_app() as application:
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_first_upload():
+                started.set()
+                await release.wait()
+
+            async def unexpected_read():
+                pytest.fail("A rejected busy request must not read or parse its body")
+
+            body, headers = _urlencoded_body({"password": "short"})
+            first = asyncio.create_task(
+                _call_app_raw(
+                    "/api/keys/generate",
+                    body=body,
+                    headers=_with_api_token(headers),
+                    application=application,
+                    before_receive=hold_first_upload,
+                )
+            )
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                unauthorized_status, _, _ = await _call_app_raw(
+                    busy_path,
+                    body=body,
+                    headers=headers,
+                    application=application,
+                    before_receive=unexpected_read,
+                )
+                assert unauthorized_status == 403
+                oversized_headers = [
+                    (name, b"9999999999" if name == b"content-length" else value) for name, value in headers
+                ]
+                oversized_status, _, _ = await _call_app_raw(
+                    busy_path,
+                    body=body,
+                    headers=_with_api_token(oversized_headers),
+                    application=application,
+                    before_receive=unexpected_read,
+                )
+                assert oversized_status == 413
+                status, response_headers, response_body = await _call_app_raw(
+                    busy_path,
+                    body=body,
+                    headers=_with_api_token(headers),
+                    application=application,
+                    before_receive=unexpected_read,
+                )
+                assert status == 429
+                assert json.loads(response_body)["error_code"] == "server_busy"
+                assert _header(response_headers, b"retry-after") == "1"
+                _assert_api_no_store(response_headers)
+            finally:
+                release.set()
+                await first
+
+            status, _, response_body = await _call_app_raw(
+                "/api/keys/generate",
+                body=body,
+                headers=_with_api_token(headers),
+                application=application,
+            )
+            assert status == 400
+            assert json.loads(response_body)["error_code"] == "weak_password"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("cancel_request", [False, True])
+def test_service_remains_responsive_until_crypto_worker_finishes(monkeypatch, tmp_path, cancel_request):
+    (tmp_path / "index.html").write_text("local interface", encoding="utf-8")
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+    monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: {"key_type": "public", "kem": cfg.HYBRID_KEM_ALG})
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        event_loop_thread = threading.get_ident()
+        started = asyncio.Event()
+        unblock = threading.Event()
+
+        def blocked_generation(_password):
+            loop.call_soon_threadsafe(started.set)
+            assert unblock.wait(timeout=5)
+            return {"publicPem": "public", "privatePem": "encrypted private"}
+
+        def health_payload():
+            assert threading.get_ident() != event_loop_thread
+            return {"backendReady": True}
+
+        monkeypatch.setattr(api_app, "_generate_key_pair", blocked_generation)
+        monkeypatch.setattr(api_app, "_health_payload", health_payload)
+        async with _running_app() as application:
+            body, headers = _urlencoded_body({"password": "correct horse battery staple"})
+            first = asyncio.create_task(
+                _call_app_raw(
+                    "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+                )
+            )
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                health_status, _, health_body = await asyncio.wait_for(
+                    _call_app_raw("/api/health", method="GET", application=application), timeout=2
+                )
+                assert health_status == 200
+                assert json.loads(health_body)["backendReady"] is True
+                static_status, _, static_body = await asyncio.wait_for(
+                    _call_app_raw("/", method="GET", application=application), timeout=2
+                )
+                assert static_status == 200
+                assert static_body == b"local interface"
+                inspect_body, inspect_headers = _multipart_body("key", "public.pem", b"public")
+                inspect_status, _, _ = await asyncio.wait_for(
+                    _call_app_raw(
+                        "/api/keys/inspect",
+                        body=inspect_body,
+                        headers=_with_api_token(inspect_headers),
+                        application=application,
+                    ),
+                    timeout=2,
+                )
+                assert inspect_status == 200
+                if cancel_request:
+                    first.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await first
+
+                status, _, _ = await _call_app_raw(
+                    "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+                )
+                assert status == 429
+                unblock.set()
+                if not cancel_request:
+                    status, _, _ = await asyncio.wait_for(first, timeout=2)
+                    assert status == 200
+
+                async def retry_when_worker_finishes():
+                    while True:
+                        status, _, _ = await _call_app_raw(
+                            "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+                        )
+                        if status != 429:
+                            return status
+                        await asyncio.sleep(0.001)
+
+                assert await asyncio.wait_for(retry_when_worker_finishes(), timeout=2) == 200
+            finally:
+                unblock.set()
+                if not first.done():
+                    await asyncio.wait_for(first, timeout=2)
+
+    asyncio.run(exercise())
+
+
 def test_health_payload_reports_partial_capabilities(monkeypatch):
     def missing_current_backend(_kem):
         raise core.CryptoDependencyError("private backend detail")
@@ -70,6 +266,74 @@ def test_health_payload_reports_partial_capabilities(monkeypatch):
         "decrypt": {"available": True, "reason": ""},
     }
     assert "private backend detail" not in str(payload)
+
+
+def test_crypto_admission_is_retained_until_response_is_sent(monkeypatch):
+    monkeypatch.setattr(
+        api_app, "_generate_key_pair", lambda _password: {"publicPem": "public", "privatePem": "private"}
+    )
+
+    async def exercise():
+        async with _running_app() as application:
+            sending = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_response(message):
+                if message["type"] == "http.response.body":
+                    sending.set()
+                    await release.wait()
+
+            body, headers = _urlencoded_body({"password": "correct horse battery staple"})
+            first = asyncio.create_task(
+                _call_app_raw(
+                    "/api/keys/generate",
+                    body=body,
+                    headers=_with_api_token(headers),
+                    application=application,
+                    before_send=hold_response,
+                )
+            )
+            try:
+                await asyncio.wait_for(sending.wait(), timeout=2)
+                status, _, _ = await _call_app_raw(
+                    "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+                )
+                assert status == 429
+            finally:
+                release.set()
+                await first
+            status, _, _ = await _call_app_raw(
+                "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+            )
+            assert status == 200
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["parse", "worker"])
+def test_crypto_admission_recovers_after_request_failure(monkeypatch, failure):
+    def generate(_password):
+        if failure == "worker":
+            raise RuntimeError("test worker failure")
+        return {"publicPem": "public", "privatePem": "private"}
+
+    monkeypatch.setattr(api_app, "_generate_key_pair", generate)
+
+    async def exercise():
+        async with _running_app() as application:
+            body, headers = _urlencoded_body({} if failure == "parse" else {"password": "test"})
+            status, _, _ = await _call_app_raw(
+                "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+            )
+            assert status == (400 if failure == "parse" else 500)
+            monkeypatch.setattr(api_app, "_generate_key_pair", lambda _password: {"publicPem": "public"})
+            body, headers = _urlencoded_body({"password": "test"})
+            status, _, _ = await _call_app_raw(
+                "/api/keys/generate", body=body, headers=_with_api_token(headers), application=application
+            )
+            assert status == 200
+
+    asyncio.run(exercise())
 
 
 def test_content_disposition_quotes_download_filename():
@@ -149,8 +413,11 @@ async def _call_app_raw(
     *,
     host: str | None = None,
     expected_exception: type[Exception] | None = None,
+    application: ASGIApp | None = None,
+    before_receive: Callable[[], Awaitable[None]] | None = None,
+    before_send: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
-    app = api_app.create_app()
+    app = application
     sent: list[dict[str, Any]] = []
     request_sent = False
     request_headers = list(headers) if headers is not None else [(b"content-length", str(len(body)).encode("ascii"))]
@@ -164,9 +431,13 @@ async def _call_app_raw(
         if request_sent:
             return {"type": "http.disconnect"}
         request_sent = True
+        if before_receive is not None:
+            await before_receive()
         return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message):
+        if before_send is not None:
+            await before_send(message)
         sent.append(message)
 
     scope = {
@@ -184,7 +455,10 @@ async def _call_app_raw(
     }
     expected_exception_raised = False
     try:
-        await app(scope, receive, send)
+        async with AsyncExitStack() as lifecycle:
+            if app is None:
+                app = await lifecycle.enter_async_context(_running_app())
+            await app(scope, receive, send)
     except Exception as exc:
         if expected_exception is None or not isinstance(exc, expected_exception):
             raise
@@ -197,6 +471,14 @@ async def _call_app_raw(
     response_headers = [(bytes(name), bytes(value)) for name, value in start.get("headers", [])]
     response_body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
     return status, response_headers, response_body
+
+
+@asynccontextmanager
+async def _running_app() -> AsyncIterator[ASGIApp]:
+    app = api_app.create_app()
+    inner = cast(Starlette, cast(api_app.SecurityHeadersMiddleware, app).app)
+    async with inner.router.lifespan_context(inner):
+        yield app
 
 
 async def _call_app(

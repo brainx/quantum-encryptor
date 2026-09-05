@@ -38,7 +38,7 @@ Issues = "https://github.com/brainx/Quantum-Encryptor/issues"
 quantum-encryptor-agent = "pqc_agent_tools:main"
 
 [tool.setuptools]
-py-modules = ["api_app", "crypto_config", "crypto_core", "pqc_agent_tools", "ui_helpers"]
+py-modules = ["api_app", "api_worker", "crypto_config", "crypto_core", "pqc_agent_tools", "ui_helpers"]
 
 [tool.setuptools.data-files]
 "static/app" = ["static/app/index.html"]

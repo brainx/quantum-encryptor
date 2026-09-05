@@ -58,6 +58,16 @@ The custom web UI is served by `api_app.py` at exactly `http://127.0.0.1:<PORT>`
 
 `backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception.
 
+### Concurrent requests
+
+`POST /api/keys/generate`, `POST /api/files/encrypt`, and `POST /api/files/decrypt` share one processing slot per server process. Requests are admitted after authorization and `Content-Length` checks, before body parsing. Cryptographic work runs in a dedicated pool with one worker, outside the API event loop. Health checks run separately; health, static assets, and key inspection do not require this processing slot.
+
+When the slot is occupied, another expensive request receives HTTP `429` with `error_code: "server_busy"` and `Retry-After: 1`. Its body is not parsed or queued for later processing. Wait at least one second and retry manually after the current operation finishes; the header does not guarantee the slot will be free then. The web client does not automatically resubmit passwords, files, or key-generation requests.
+
+The slot remains occupied until both the request/response lifecycle and its cryptographic worker have finished. Canceling or closing the browser request does not interrupt native work already running or permit a second operation to overlap it. This is a concurrency limit per process; additional server processes have separate limits. It does not provide password-attempt rate limiting or memory zeroization.
+
+Successful response bodies, algorithm selection, and encrypted-file and PEM formats are unchanged.
+
 ### Response caching and generated-key custody
 
 Every HTTP response under `/api/*` carries `Cache-Control: no-store` and `Pragma: no-cache`, including JSON successes and errors, authorization or body-limit middleware rejections, unmatched API routes, framework-generated 500 responses, and file downloads. The policy is applied centrally so new API handlers inherit it; static UI responses outside `/api/*` keep their own cache behavior. These directives reduce retention by conforming HTTP caches but do not securely erase browser or process memory.

@@ -8,6 +8,7 @@ This project follows a practical semantic-versioning style.
 
 ### Added
 
+- Responsive API cryptographic processing with one admitted generate/encrypt/decrypt request per server process, separate health work, and HTTP `429` busy responses with `Retry-After: 1`. Cancellation keeps the slot occupied until native work and the request/response lifecycle finish; sensitive requests are retried manually.
 - ML-KEM-768 + X25519 composite key generation and format-v4 encrypted containers.
 - SHA3-256 hybrid key combiner binding both key shares, X25519 context, suite identifier, and application domain.
 - Polished monochrome local web workflows with progressive technical details,

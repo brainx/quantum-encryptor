@@ -128,6 +128,8 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 
    Each workflow starts with plain-language guidance. Expand **Technical details** only when you need suite, format, or key-policy information.
 
+Key generation, encryption, and decryption share one processing slot per local server process. Cryptographic work runs outside the API event loop so other requests can proceed. If another tab is already using the slot, the service returns a busy response; wait for that operation to finish and retry manually. Canceling a browser request does not stop native work already running. See the [concurrent request contract](docs/API.md#concurrent-requests) for client behavior and limits.
+
 ### Local-only interface privacy
 
 The custom interface processes selected files through the local Python service at `127.0.0.1`. It does not write generated keys to persistent web storage, collect telemetry, or load remote fonts or remote application assets. The UI does not display plaintext previews, passwords, private-key content, or the local API token.

@@ -36,6 +36,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Supplying weak, missing, or reused private-key passwords.
 - Tampering with encrypted-file headers, KEM ciphertext, nonce, AES ciphertext, or authentication tag.
 - Feeding oversized PEM, plaintext, or encrypted-container inputs to exhaust process memory.
+- Overlapping expensive API requests to exhaust CPU or memory, block the event loop, or bypass the concurrency limit by canceling requests while native work continues.
 - Using absolute paths, parent traversal, or symlinks to make the agent CLI read or write outside the workspace.
 - Triggering native backend failures during import, key generation, encryption, or decryption.
 - Leaking plaintext, private keys, passwords, raw bytes, or absolute local paths through JSON output or logs.
@@ -56,6 +57,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Encrypted files must be authenticated format version 4 or decrypt-only version 3 and must authenticate the complete header as AES-GCM associated data.
 - Version 4 AES keys must bind both key shares, both X25519 public values, the suite identifier, and the application domain separator.
 - PEM, plaintext, and encrypted-container inputs must be bounded before expensive parsing or cryptographic work.
+- Each server process admits at most one key-generation, encryption, or decryption request before body parsing and retains its slot until both the request/response lifecycle and native work finish.
 - Decryption failures do not produce plaintext output files.
 - Agent CLI paths stay workspace-relative and cannot escape through symlinks.
 - Agent CLI JSON output never includes secret material or absolute local paths.
@@ -77,6 +79,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Application-specific SHA3-256 combiner inspired by RFC 9980's component binding, with domain separation and full-header AES-GCM authentication.
 - AES-256-GCM with full encrypted-file header as associated data.
 - Lazy native `liboqs` loading with dependency failures reported as unavailable backend state.
+- Expensive API cryptography runs outside the event loop in a dedicated pool with one worker. Admission follows authorization and `Content-Length` checks; busy requests receive HTTP `429`, `server_busy`, and `Retry-After: 1` before body parsing. Health work runs separately, and health, static assets, and key inspection do not occupy this slot. Clients retry manually.
 - Workspace-only agent CLI path validation, exclusive non-overwrite creation, atomic replacement on explicit overwrite, and JSON-only responses.
 - The local web API trusts only the exact `http://127.0.0.1:<PORT>` authority, plus `http://127.0.0.1:4001` only when `QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1` enables the Vite development proxy. Cookie-authenticated state-changing requests require an allowed parsed `Origin` exactly equal to the direct allowed `Host`; Origin-less clients must use the explicit token header, and an invalid supplied header cannot fall back to the cookie. `GET /api/health` issues its `HttpOnly` cookie only for an allowed direct Host and a matching Origin when present, without trusting forwarding headers. `SameSite=Strict` helps with cross-site cookie delivery but does not isolate loopback ports; exact authority validation provides that boundary, while page JavaScript still cannot read the cookie.
 - All local web responses include a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`, blocking clickjacking of the local UI.
@@ -89,7 +92,8 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - The app processes files in memory and is not suitable for very large streaming workflows.
 - Python cannot guarantee secure zeroization of immutable secret byte strings.
 - The loopback API trusts the local machine: malicious local software can use the allowed authority to obtain and send the auth cookie, so this protection does not defend against a malicious local process. Keep the server bound to `127.0.0.1`; never expose it on a network interface.
-- The local web API does not rate-limit private-key password attempts. Each attempt costs a full scrypt derivation, and an attacker holding the encrypted PEM would brute force offline instead, so online throttling adds little.
+- The API concurrency limit applies separately to each server process. It does not rate-limit password attempts or protect against offline password guessing by someone holding an encrypted PEM.
+- Canceling a browser request does not stop native work already running; its processing slot and required in-memory inputs remain until that work finishes. This does not provide memory zeroization.
 - No independent cryptographic audit or formal verification has been performed.
 - The application-specific file and key formats are not interoperable with OpenPGP or another standardized container format.
 - The hybrid construction has not undergone an independent cryptographic audit.
