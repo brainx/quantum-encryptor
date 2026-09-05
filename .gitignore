@@ -133,6 +133,7 @@ dmypy.json
 *.swo
 
 # Project specific
+.oqs/
 *.pem
 *.pqc
 test_files/ 

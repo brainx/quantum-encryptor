@@ -8,12 +8,14 @@ import os
 import re
 import secrets
 import sys
+from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -22,6 +24,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from crypto_config import cfg
+from api_worker import CryptoWorker
 import crypto_core as core
 from ui_helpers import format_key_info_for_display, guess_decrypted_filename
 
@@ -447,6 +450,39 @@ class ApiBodyLimitMiddleware:
             )
 
 
+class CryptoAdmissionMiddleware:
+    """Bound uploaded data and expensive work before reading an admitted request."""
+
+    paths = frozenset({"/api/keys/generate", "/api/files/encrypt", "/api/files/decrypt"})
+
+    def __init__(self, app: ASGIApp, worker: CryptoWorker) -> None:
+        self.app = app
+        self.worker = worker
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "POST" or scope.get("path") not in self.paths:
+            await self.app(scope, receive, send)
+            return
+        lease = self.worker.acquire()
+        if lease is None:
+            response = _json_error(
+                ApiError(
+                    429,
+                    "server_busy",
+                    "The local service is processing another operation. Wait for it to finish, then try again.",
+                )
+            )
+            response.headers["Retry-After"] = "1"
+            await response(scope, receive, send)
+            return
+        scope.setdefault("state", {})["crypto_lease"] = lease
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            # The lease also waits for any worker left running after cancellation.
+            lease.close()
+
+
 def _form_text(form: Any, name: str, required: bool = True) -> str:
     value = form.get(name)
     if value is None:
@@ -555,7 +591,7 @@ async def health(request: Request) -> JSONResponse:
     _has_valid_origin, authority_error = _validate_request_authorities(request.scope)
     if authority_error is not None:
         return _json_error(authority_error)
-    response = _success_json(_health_payload())
+    response = _success_json(await run_in_threadpool(_health_payload))
     # Deliver the per-process API token only as an HttpOnly, SameSite=Strict cookie so it
     # is never exposed in response bodies or to JavaScript, and is not sent cross-site.
     response.set_cookie(
@@ -588,44 +624,67 @@ async def inspect_key(request: Request) -> JSONResponse:
         return _safe_unexpected("inspect-key", exc)
 
 
+def _generate_key_pair(password: str) -> dict[str, Any]:
+    try:
+        core.validate_private_key_password(password)
+    except (core.PasswordRequiredError, core.WeakPasswordError) as exc:
+        raise ApiError(400, "weak_password", str(exc)) from exc
+
+    active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
+    raw_public_key, raw_private_key = core.generate_hybrid_keys(active_kem_alg)
+    if not raw_public_key or not raw_private_key:
+        raise ApiError(503, "backend_unavailable", "Could not generate a hybrid key pair.")
+
+    public_key_fingerprint = core.get_public_key_fingerprint(raw_public_key, cfg.HYBRID_KEM_ALG)
+    public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
+    private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
+    del raw_public_key
+    del raw_private_key
+    if not public_pem or not private_pem:
+        raise ApiError(500, "pem_format_failed", "Could not format generated keys.")
+
+    return {
+        "kem": cfg.HYBRID_KEM_ALG,
+        "publicPem": public_pem,
+        "privatePem": private_pem,
+        "publicKeyFingerprint": public_key_fingerprint,
+        "publicFilename": "ml-kem-768_x25519_public.pem",
+        "privateFilename": "ml-kem-768_x25519_private.pem",
+    }
+
+
 async def generate_keys(request: Request) -> JSONResponse:
     try:
         form = await _form(request, max_files=0)
         password = _form_text(form, "password")
-        try:
-            core.validate_private_key_password(password)
-        except (core.PasswordRequiredError, core.WeakPasswordError) as exc:
-            raise ApiError(400, "weak_password", str(exc)) from exc
-
-        active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
-        raw_public_key, raw_private_key = core.generate_hybrid_keys(active_kem_alg)
-        if not raw_public_key or not raw_private_key:
-            raise ApiError(503, "backend_unavailable", "Could not generate a hybrid key pair.")
-
-        public_key_fingerprint = core.get_public_key_fingerprint(raw_public_key, cfg.HYBRID_KEM_ALG)
-        public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
-        private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
-        del raw_public_key
-        del raw_private_key
-        if not public_pem or not private_pem:
-            raise ApiError(500, "pem_format_failed", "Could not format generated keys.")
-
-        return _success_json(
-            {
-                "kem": cfg.HYBRID_KEM_ALG,
-                "publicPem": public_pem,
-                "privatePem": private_pem,
-                "publicKeyFingerprint": public_key_fingerprint,
-                "publicFilename": "ml-kem-768_x25519_public.pem",
-                "privateFilename": "ml-kem-768_x25519_private.pem",
-            }
-        )
+        payload = await request.state.crypto_lease.run(_generate_key_pair, password)
+        return _success_json(payload)
     except ApiError as exc:
         return _json_error(exc)
     except core.CryptoDependencyError:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("generate-keys", exc)
+
+
+def _encrypt_bytes(input_data: bytes, public_pem: str) -> bytes:
+    public_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(public_pem)
+    if not public_key_bytes or not kem_alg_from_key or key_type != "public":
+        raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
+    if kem_alg_from_key != cfg.HYBRID_KEM_ALG:
+        raise ApiError(
+            400,
+            "legacy_public_key",
+            "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
+        )
+
+    encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
+    del input_data
+    del public_key_bytes
+    if encrypted_blob is None:
+        raise ApiError(503, "encryption_failed", "Encryption failed. Check backend readiness and key compatibility.")
+
+    return encrypted_blob
 
 
 async def encrypt_file(request: Request) -> Response:
@@ -641,23 +700,8 @@ async def encrypt_file(request: Request) -> Response:
 
         input_data = await _read_upload_bytes(uploaded_file, cfg.MAX_FILE_BYTES, "Input file")
         public_pem = await _read_upload_text(public_key_file, cfg.MAX_PEM_BYTES, "Public key file")
-        public_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(public_pem)
-        if not public_key_bytes or not kem_alg_from_key or key_type != "public":
-            raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
-        if kem_alg_from_key != cfg.HYBRID_KEM_ALG:
-            raise ApiError(
-                400,
-                "legacy_public_key",
-                "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
-            )
-
-        encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
+        encrypted_blob = await request.state.crypto_lease.run(_encrypt_bytes, input_data, public_pem)
         del input_data
-        del public_key_bytes
-        if encrypted_blob is None:
-            raise ApiError(
-                503, "encryption_failed", "Encryption failed. Check backend readiness and key compatibility."
-            )
 
         return _download_response(encrypted_blob, output_filename)
     except ApiError as exc:
@@ -666,6 +710,33 @@ async def encrypt_file(request: Request) -> Response:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("encrypt-file", exc)
+
+
+def _decrypt_bytes(encrypted_blob: bytes, private_pem: str, password: str) -> bytes:
+    key_info = core.inspect_key_pem_strict(private_pem)
+    if key_info.get("key_type") != "private":
+        raise ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
+
+    private_key_bytes, kem_alg_key, key_type = core.load_key_pem(private_pem, password=password)
+    if not private_key_bytes or not kem_alg_key or key_type != "private":
+        raise ApiError(400, "private_key_failed", "Could not unlock the private key. Check the password and key file.")
+
+    core.resolve_decryption_kem_algorithms(kem_alg_key)
+    decrypted_data, _detected_alg = core.decrypt_file_pro(
+        encrypted_blob,
+        private_key_bytes,
+        expected_kem_alg=kem_alg_key,
+    )
+    del encrypted_blob
+    del private_key_bytes
+    if decrypted_data is None:
+        raise ApiError(
+            400,
+            "decryption_failed",
+            "Decryption failed. Check the private key, password, and encrypted file integrity.",
+        )
+
+    return decrypted_data
 
 
 async def decrypt_file(request: Request) -> Response:
@@ -682,30 +753,8 @@ async def decrypt_file(request: Request) -> Response:
 
         encrypted_blob = await _read_upload_bytes(encrypted_upload, cfg.MAX_ENCRYPTED_FILE_BYTES, "Encrypted file")
         private_pem = await _read_upload_text(private_key_file, cfg.MAX_PEM_BYTES, "Private key file")
-        key_info = core.inspect_key_pem_strict(private_pem)
-        if key_info.get("key_type") != "private":
-            raise ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
-
-        private_key_bytes, kem_alg_key, key_type = core.load_key_pem(private_pem, password=password)
-        if not private_key_bytes or not kem_alg_key or key_type != "private":
-            raise ApiError(
-                400, "private_key_failed", "Could not unlock the private key. Check the password and key file."
-            )
-
-        core.resolve_decryption_kem_algorithms(kem_alg_key)
-        decrypted_data, _detected_alg = core.decrypt_file_pro(
-            encrypted_blob,
-            private_key_bytes,
-            expected_kem_alg=kem_alg_key,
-        )
+        decrypted_data = await request.state.crypto_lease.run(_decrypt_bytes, encrypted_blob, private_pem, password)
         del encrypted_blob
-        del private_key_bytes
-        if decrypted_data is None:
-            raise ApiError(
-                400,
-                "decryption_failed",
-                "Decryption failed. Check the private key, password, and encrypted file integrity.",
-            )
 
         media_type, _ = mimetypes.guess_type(output_filename)
         return _download_response(decrypted_data, output_filename, media_type or "application/octet-stream")
@@ -729,6 +778,15 @@ async def frontend_missing(_request: Request) -> PlainTextResponse:
 
 
 def create_app() -> ASGIApp:
+    worker = CryptoWorker()
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await run_in_threadpool(worker.close)
+
     routes: list[BaseRoute] = [
         Route("/api/health", health, methods=["GET"]),
         Route("/api/keys/inspect", inspect_key, methods=["POST"]),
@@ -740,7 +798,8 @@ def create_app() -> ASGIApp:
         routes.append(Mount("/", StaticFiles(directory=STATIC_APP_DIR, html=True), name="web"))
     else:
         routes.append(Route("/{path:path}", frontend_missing, methods=["GET"]))
-    inner_app = Starlette(debug=False, routes=routes)
+    inner_app = Starlette(debug=False, routes=routes, lifespan=lifespan)
+    inner_app.add_middleware(CryptoAdmissionMiddleware, worker=worker)
     inner_app.add_middleware(ApiBodyLimitMiddleware)
     inner_app.add_middleware(LocalApiGuardMiddleware)
     return SecurityHeadersMiddleware(inner_app)

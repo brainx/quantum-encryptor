@@ -8,6 +8,7 @@ This project follows a practical semantic-versioning style.
 
 ### Added
 
+- Responsive API cryptographic processing with one admitted generate/encrypt/decrypt request per server process, separate health work, and HTTP `429` busy responses with `Retry-After: 1`. Cancellation keeps the slot occupied until native work and the request/response lifecycle finish; sensitive requests are retried manually.
 - ML-KEM-768 + X25519 composite key generation and format-v4 encrypted containers.
 - SHA3-256 hybrid key combiner binding both key shares, X25519 context, suite identifier, and application domain.
 - Polished monochrome local web workflows with progressive technical details,
@@ -26,6 +27,7 @@ This project follows a practical semantic-versioning style.
 
 ### Security
 
+- Updated development and CI lock tooling to pip 26.2.1 and compatible pip-tools 7.6.1 to address GHSA-qwm4-qh6w-59xr, with matching dependency floors and generated hashes.
 - Updated the locked Nano ID and PostCSS transitive dependencies to releases that address their current security advisories.
 - Raised the minimum `cryptography` version to 50.0.0 and refreshed the hash-locked runtime and development dependency sets to exclude the vulnerable 49.0.0 release.
 - New encryption requires composite public keys and cannot silently downgrade to the legacy single-KEM format.

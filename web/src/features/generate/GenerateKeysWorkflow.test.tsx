@@ -222,6 +222,34 @@ describe("GenerateKeysWorkflow", () => {
     expect(screen.queryByText(/private socket detail/i)).not.toBeInTheDocument();
   });
 
+  it("shows server-busy guidance and preserves passwords for a manual retry", async () => {
+    const message = "The local service is processing another operation. Wait for it to finish, then try again.";
+    const generate = vi.fn()
+      .mockRejectedValueOnce(new ApiError(429, "server_busy", message))
+      .mockResolvedValueOnce(generatedKeys());
+    const user = userEvent.setup();
+
+    render(<GenerateKeysWorkflow generate={generate} health={READY_HEALTH} />);
+    await enterValidPasswords(user);
+    await user.click(screen.getByRole("button", { name: "Generate key pair" }));
+
+    expect(await screen.findByText(message)).toBeVisible();
+    for (const label of ["Private key password", "Confirm private key password"]) {
+      expect(screen.getByLabelText(label)).toHaveValue("correct horse battery staple");
+      expect(screen.getByLabelText(label)).toBeEnabled();
+    }
+    expect(screen.getByRole("button", { name: "Generate key pair" })).toBeEnabled();
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "Download public key" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Generate key pair" }));
+
+    expect(await screen.findByRole("button", { name: "Download public key" })).toBeVisible();
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(generate).toHaveBeenLastCalledWith("correct horse battery staple", expect.any(AbortSignal));
+    expect(screen.queryByText(message)).not.toBeInTheDocument();
+  });
+
   it("preserves safe server password-policy guidance", async () => {
     const generate = vi.fn().mockRejectedValue(
       new ApiError(400, "weak_password", "Private-key password is too common.")
