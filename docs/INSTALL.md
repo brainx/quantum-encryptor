@@ -45,7 +45,7 @@ For reproducible development installs:
 pip install --require-hashes -r requirements-dev-lock.txt
 ```
 
-Regenerate the lock files only after intentionally changing dependency inputs. Lock generation is canonical on Ubuntu 24.04 x86-64 with Python 3.13.15, pip 25.3, pip-tools 7.5.3, packaging 26.2, build 1.5.0, click 8.4.2, pyproject-hooks 1.2.0, setuptools 83.0.0, wheel 0.47.0, Node 22.23.1, and npm 10.9.8. Use an isolated environment with those exact versions, then run:
+Regenerate the lock files only after intentionally changing dependency inputs. Lock generation is canonical on Ubuntu 24.04 x86-64 with Python 3.13.15, pip 26.2.1, pip-tools 7.6.1, packaging 26.2, build 1.5.0, click 8.4.2, pyproject-hooks 1.2.0, setuptools 83.0.0, wheel 0.47.0, Node 22.23.1, and npm 10.9.8. Use an isolated environment with those exact versions, then run:
 
 ```bash
 CUSTOM_COMPILE_COMMAND='pip-compile --generate-hashes --output-file=requirements-lock.txt requirements.txt' \
