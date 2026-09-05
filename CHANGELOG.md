@@ -27,6 +27,7 @@ This project follows a practical semantic-versioning style.
 
 ### Security
 
+- Updated development and CI lock tooling to pip 26.2.1 and compatible pip-tools 7.6.1 to address GHSA-qwm4-qh6w-59xr, with matching dependency floors and generated hashes.
 - Updated the locked Nano ID and PostCSS transitive dependencies to releases that address their current security advisories.
 - Raised the minimum `cryptography` version to 50.0.0 and refreshed the hash-locked runtime and development dependency sets to exclude the vulnerable 49.0.0 release.
 - New encryption requires composite public keys and cannot silently downgrade to the legacy single-KEM format.
