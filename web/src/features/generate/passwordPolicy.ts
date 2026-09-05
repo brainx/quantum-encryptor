@@ -23,14 +23,15 @@ export function passwordPolicyChecks(
   confirmation: string,
   policy: Health["passwordPolicy"]
 ): PasswordPolicyCheck[] {
+  const characters = Array.from(password);
   return [
     {
       label: `${policy.minChars} or more characters`,
-      met: password.length >= policy.minChars
+      met: characters.length >= policy.minChars
     },
     {
       label: `${policy.minUniqueChars} or more unique characters`,
-      met: new Set(password).size >= policy.minUniqueChars
+      met: new Set(characters).size >= policy.minUniqueChars
     },
     {
       label: "Not a common password",

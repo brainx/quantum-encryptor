@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import secrets
 import stat
 import sys
 import tempfile
@@ -121,7 +122,10 @@ def _resolve_input_path(path_text: str, workspace: Path) -> Path:
 
 def _resolve_output_path(path_text: str, workspace: Path, overwrite: bool) -> Path:
     relative_path = _reject_unsafe_path_text(path_text)
-    parent = (workspace / relative_path).parent.resolve(strict=True)
+    try:
+        parent = (workspace / relative_path).parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AgentCommandError("invalid_path", "Output directory could not be resolved.", EXIT_INVALID_INPUT) from exc
     if not _is_relative_to(parent, workspace):
         raise AgentCommandError("path_outside_workspace", "Output path escapes the workspace.", EXIT_PATH_VIOLATION)
 
@@ -149,17 +153,23 @@ def _current_umask() -> int:
     return current
 
 
-def _target_file_mode(path: Path, private_file: bool) -> int:
+def _target_file_mode(path: Path, private_file: bool, directory_fd: Optional[int] = None) -> int:
     if private_file:
         return 0o600
     try:
-        return path.stat().st_mode & 0o777
+        file_stat = (
+            path.stat() if directory_fd is None else os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        )
+        return file_stat.st_mode & 0o777
     except FileNotFoundError:
         return 0o666 & ~_current_umask()
 
 
-def _fsync_parent_dir(path: Path) -> None:
+def _fsync_parent_dir(path: Path, directory_fd: Optional[int] = None) -> None:
     if os.name == "nt":
+        return
+    if directory_fd is not None:
+        os.fsync(directory_fd)
         return
     dir_fd = os.open(path.parent, os.O_RDONLY)
     try:
@@ -168,59 +178,86 @@ def _fsync_parent_dir(path: Path) -> None:
         os.close(dir_fd)
 
 
-def _write_new_file_exclusive(path: Path, data: bytes, mode: int) -> None:
+def _write_new_file_exclusive(path: Path, data: bytes, mode: int, directory_fd: Optional[int] = None) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    target = path.name if directory_fd is not None else path
     fd: Optional[int] = None
     created = False
     try:
-        fd = os.open(path, flags, mode)
+        fd = os.open(target, flags, mode, dir_fd=directory_fd)
         created = True
         with os.fdopen(fd, "wb") as out:
             fd = None
             out.write(data)
             out.flush()
+            if os.name != "nt":
+                os.fchmod(out.fileno(), mode)
             os.fsync(out.fileno())
-        os.chmod(path, mode)
-        _fsync_parent_dir(path)
+        if os.name == "nt":
+            os.chmod(path, mode)
+        _fsync_parent_dir(path, directory_fd)
     except Exception:
         if created:
-            path.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(target, dir_fd=directory_fd)
         raise
     finally:
         if fd is not None:
             os.close(fd)
 
 
-def _replace_file_atomically(path: Path, data: bytes, mode: int) -> None:
-    tmp_path: Optional[Path] = None
+def _create_temporary_output(path: Path, directory_fd: Optional[int]) -> tuple[int, str]:
+    if directory_fd is None:
+        return tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    for _ in range(10):
+        name = f".pqc-output.{secrets.token_hex(8)}.tmp"
+        try:
+            return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd), name
+        except FileExistsError:
+            continue
+    raise FileExistsError("Could not create a unique temporary output file.")
+
+
+def _replace_file_atomically(path: Path, data: bytes, mode: int, directory_fd: Optional[int] = None) -> None:
+    tmp_name: Optional[str] = None
     fd: Optional[int] = None
     try:
-        raw_fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        raw_fd, tmp_name = _create_temporary_output(path, directory_fd)
         fd = raw_fd
-        tmp_path = Path(tmp_name)
         with os.fdopen(raw_fd, "wb") as tmp_file:
             fd = None
             tmp_file.write(data)
             tmp_file.flush()
+            if os.name != "nt":
+                os.fchmod(tmp_file.fileno(), mode)
             os.fsync(tmp_file.fileno())
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
-        os.chmod(path, mode)
-        _fsync_parent_dir(path)
+        if os.name == "nt":
+            os.chmod(tmp_name, mode)
+        target = path.name if directory_fd is not None else path
+        os.replace(tmp_name, target, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        _fsync_parent_dir(path, directory_fd)
     finally:
         if fd is not None:
             os.close(fd)
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+        if tmp_name is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_name, dir_fd=directory_fd)
 
 
-def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: bool, operation: str) -> None:
-    mode = _target_file_mode(path, private_file)
+def _atomic_write_file(
+    path: Path,
+    data: bytes,
+    overwrite: bool,
+    private_file: bool,
+    operation: str,
+    directory_fd: Optional[int] = None,
+) -> None:
+    mode = _target_file_mode(path, private_file, directory_fd)
     if overwrite:
-        _replace_file_atomically(path, data, mode)
+        _replace_file_atomically(path, data, mode, directory_fd)
         return
     try:
-        _write_new_file_exclusive(path, data, mode)
+        _write_new_file_exclusive(path, data, mode, directory_fd)
     except FileExistsError as exc:
         raise AgentCommandError(
             "output_exists",
@@ -230,23 +267,33 @@ def _atomic_write_file(path: Path, data: bytes, overwrite: bool, private_file: b
         ) from exc
 
 
-def _open_workspace_input(path: Path, workspace: Path) -> int:
-    """Open a resolved workspace file without following replacement symlinks."""
-    if os.name == "nt":
-        return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-
+def _open_workspace_directory(path: Path, workspace: Path) -> int:
+    """Anchor POSIX file operations to a directory without following replacement symlinks."""
     relative_path = path.relative_to(workspace)
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_fd = os.open(workspace, directory_flags)
     try:
-        for part in relative_path.parts[:-1]:
+        for part in relative_path.parts:
             next_fd = os.open(part, directory_flags | nofollow, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_fd
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _open_workspace_input(path: Path, workspace: Path) -> int:
+    """Open a resolved workspace file without following replacement symlinks."""
+    if os.name == "nt":
+        return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+    directory_fd = _open_workspace_directory(path.parent, workspace)
+    try:
         return os.open(
-            relative_path.name,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0) | nofollow,
+            path.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=directory_fd,
         )
     finally:
@@ -322,12 +369,18 @@ def _write_workspace_file(
     private_file: bool = False,
 ) -> Path:
     path = _resolve_output_path(path_text, workspace, overwrite)
+    directory_fd: Optional[int] = None
     try:
-        _atomic_write_file(path, data, overwrite, private_file, operation)
+        if os.name != "nt":
+            directory_fd = _open_workspace_directory(path.parent, workspace)
+        _atomic_write_file(path, data, overwrite, private_file, operation, directory_fd)
     except AgentCommandError:
         raise
     except OSError as exc:
         raise AgentCommandError("write_failed", "Could not write output file.", EXIT_INVALID_INPUT, operation) from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
     return path
 
 

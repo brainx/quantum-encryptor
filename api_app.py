@@ -586,6 +586,8 @@ async def inspect_key(request: Request) -> JSONResponse:
         return _json_error(ApiError(400, "unsupported_key", "Unsupported or insecure PEM key file."))
     except Exception as exc:
         return _safe_unexpected("inspect-key", exc)
+    finally:
+        await request.close()
 
 
 async def generate_keys(request: Request) -> JSONResponse:
@@ -626,6 +628,8 @@ async def generate_keys(request: Request) -> JSONResponse:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("generate-keys", exc)
+    finally:
+        await request.close()
 
 
 async def encrypt_file(request: Request) -> Response:
@@ -666,6 +670,8 @@ async def encrypt_file(request: Request) -> Response:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("encrypt-file", exc)
+    finally:
+        await request.close()
 
 
 async def decrypt_file(request: Request) -> Response:
@@ -719,6 +725,8 @@ async def decrypt_file(request: Request) -> Response:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("decrypt-file", exc)
+    finally:
+        await request.close()
 
 
 async def frontend_missing(_request: Request) -> PlainTextResponse:

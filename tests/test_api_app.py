@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import pytest
+import starlette.formparsers
 
 from crypto_config import cfg
 import crypto_core as core
@@ -404,6 +405,50 @@ def test_read_upload_bytes_rejects_oversized_upload():
             raise AssertionError("Oversized upload should fail")
     finally:
         asyncio.run(upload.close())
+
+
+@pytest.mark.parametrize(
+    ("path", "files", "fields", "error_code"),
+    [
+        ("/api/keys/inspect", [("wrong_field", "key.pem", b"key")], {}, "missing_file"),
+        ("/api/files/encrypt", [("file", "plain.txt", b"plaintext")], {}, "missing_file"),
+        (
+            "/api/files/decrypt",
+            [("file", "file.pqc", b"ciphertext"), ("private_key", "private.pem", b"private key")],
+            {},
+            "missing_field",
+        ),
+        (
+            "/api/files/encrypt",
+            [("file", "plain.txt", b"too large"), ("public_key", "public.pem", b"public key")],
+            {},
+            "file_too_large",
+        ),
+    ],
+)
+def test_api_closes_all_uploads_after_validation_error(monkeypatch, path, files, fields, error_code):
+    uploads = []
+    original_tempfile = starlette.formparsers.SpooledTemporaryFile
+
+    def track_upload(*args, **kwargs):
+        upload = original_tempfile(*args, **kwargs)
+        uploads.append(upload)
+        return upload
+
+    monkeypatch.setattr(starlette.formparsers, "SpooledTemporaryFile", track_upload)
+    monkeypatch.setattr(api_app.cfg, "MAX_FILE_BYTES", 4)
+    body, headers = _multipart_form(files, fields)
+
+    try:
+        status, payload = asyncio.run(_call_app(path, body=body, headers=_with_api_token(headers)))
+
+        assert status in {400, 413}
+        assert payload["error_code"] == error_code
+        assert len(uploads) == len(files)
+        assert all(upload.closed for upload in uploads)
+    finally:
+        for upload in uploads:
+            upload.close()
 
 
 def test_health_route_sets_auth_cookie_without_disclosing_token():

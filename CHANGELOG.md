@@ -6,6 +6,14 @@ This project follows a practical semantic-versioning style.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep POSIX CLI output writes anchored to the validated directory when a parent path changes during a write.
+- Report missing output directories as invalid input and support overwriting long filenames.
+- Close all parsed API uploads when a request fails validation.
+- Allow selecting a file again after replacing it through drag and drop.
+- Count Unicode password characters consistently between the browser and Python API.
+
 ### Added
 
 - ML-KEM-768 + X25519 composite key generation and format-v4 encrypted containers.

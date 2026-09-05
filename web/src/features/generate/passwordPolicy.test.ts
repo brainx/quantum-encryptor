@@ -18,6 +18,16 @@ describe("passwordPolicyChecks", () => {
   });
 
   it.each([
+    ["😀😁😂😃😄😅😆😉", false],
+    ["Abcdefghijklmn😀", false],
+    ["Abcdefghijklmno😀", true]
+  ])("counts Unicode code points for password length %j", (password, expected) => {
+    const checks = passwordPolicyChecks(password, password, { minChars: 16, minUniqueChars: 5 });
+
+    expect(checks.find((check) => check.label === "16 or more characters")?.met).toBe(expected);
+  });
+
+  it.each([
     "passwordpassword",
     "password12345678",
     "qwertyuiopasdfgh",
