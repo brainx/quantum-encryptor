@@ -880,6 +880,103 @@ def test_output_path_rejects_existing_directory_even_with_overwrite(tmp_path):
     assert exc.value.error_code == "invalid_path"
 
 
+def test_output_path_reports_missing_parent_as_invalid_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "message.txt").write_bytes(b"hello")
+    (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
+
+    code, payload = _run_agent(
+        ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "missing/message.pqc"],
+        capsys,
+    )
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["operation"] == "encrypt"
+    assert payload["error_code"] == "invalid_path"
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "O_NOFOLLOW"), reason="POSIX no-follow open required")
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_workspace_write_rejects_parent_replaced_by_symlink(monkeypatch, tmp_path, overwrite):
+    workspace = tmp_path / "workspace"
+    output_directory = workspace / "output"
+    output_directory.mkdir(parents=True)
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    outside_file = outside_directory / "message.bin"
+    if overwrite:
+        (output_directory / "message.bin").write_bytes(b"inside")
+        outside_file.write_bytes(b"outside")
+    original_resolve = tools._resolve_output_path
+
+    def replace_parent_after_resolution(*args, **kwargs):
+        resolved = original_resolve(*args, **kwargs)
+        output_directory.rename(workspace / "original-output")
+        output_directory.symlink_to(outside_directory, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(tools, "_resolve_output_path", replace_parent_after_resolution)
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._write_workspace_file("output/message.bin", workspace, b"secret", overwrite, "decrypt", private_file=True)
+
+    assert exc.value.error_code == "write_failed"
+    if overwrite:
+        assert outside_file.read_bytes() == b"outside"
+    else:
+        assert not outside_file.exists()
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "O_NOFOLLOW"), reason="POSIX no-follow open required")
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("fail_write", [False, True])
+def test_workspace_write_stays_anchored_after_parent_is_opened(monkeypatch, tmp_path, overwrite, fail_write):
+    workspace = tmp_path / "workspace"
+    output_directory = workspace / "output"
+    output_directory.mkdir(parents=True)
+    original_directory = workspace / "original-output"
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    outside_file = outside_directory / "message.bin"
+    outside_file.write_bytes(b"outside")
+    outside_file.chmod(0o640)
+    if overwrite:
+        (output_directory / "message.bin").write_bytes(b"inside")
+    original_write = tools._atomic_write_file
+
+    def replace_parent_after_open(*args, **kwargs):
+        output_directory.rename(original_directory)
+        output_directory.symlink_to(outside_directory, target_is_directory=True)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(tools, "_atomic_write_file", replace_parent_after_open)
+    if fail_write:
+
+        def fail_file_write(_fd):
+            raise OSError("Injected output flush failure")
+
+        monkeypatch.setattr(tools.os, "fsync", fail_file_write)
+
+        with pytest.raises(tools.AgentCommandError) as exc:
+            tools._write_workspace_file(
+                "output/message.bin", workspace, b"secret", overwrite, "decrypt", private_file=True
+            )
+        assert exc.value.error_code == "write_failed"
+        if overwrite:
+            assert (original_directory / "message.bin").read_bytes() == b"inside"
+        else:
+            assert not (original_directory / "message.bin").exists()
+    else:
+        tools._write_workspace_file("output/message.bin", workspace, b"secret", overwrite, "decrypt", private_file=True)
+        assert (original_directory / "message.bin").read_bytes() == b"secret"
+        assert stat.S_IMODE((original_directory / "message.bin").stat().st_mode) == 0o600
+
+    assert outside_file.read_bytes() == b"outside"
+    assert stat.S_IMODE(outside_file.stat().st_mode) == 0o640
+    assert not list(original_directory.glob("*.tmp"))
+    assert list(outside_directory.iterdir()) == [outside_file]
+
+
 def test_read_workspace_text_rejects_invalid_utf8(tmp_path):
     (tmp_path / "bad.pem").write_bytes(b"\xff")
 
@@ -887,6 +984,20 @@ def test_read_workspace_text_rejects_invalid_utf8(tmp_path):
         tools._read_workspace_text("bad.pem", tmp_path)
 
     assert exc.value.error_code == "invalid_input"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-anchored output required")
+def test_workspace_overwrite_accepts_long_output_filename(tmp_path):
+    output_path = tmp_path / ("m" * 236 + ".bin")
+    output_path.write_bytes(b"old")
+    output_path.chmod(0o640)
+
+    written_path = tools._write_workspace_file(output_path.name, tmp_path, b"new", overwrite=True, operation="encrypt")
+
+    assert written_path == output_path
+    assert output_path.read_bytes() == b"new"
+    assert stat.S_IMODE(output_path.stat().st_mode) == 0o640
+    assert list(tmp_path.iterdir()) == [output_path]
 
 
 def test_atomic_write_overwrite_replaces_file_and_preserves_mode(tmp_path):

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { FilePicker } from "./FilePicker";
@@ -21,6 +21,31 @@ describe("shared controls", () => {
     const file = new File(["hello"], "hello.txt", { type: "text/plain" });
     await user.upload(screen.getByLabelText("File to protect"), file);
     expect(onFile).toHaveBeenCalledWith(file);
+  });
+
+  it("can select the prior native file again after another file is dropped", async () => {
+    const user = userEvent.setup();
+    const onFile = vi.fn();
+    render(
+      <FilePicker
+        id="drop-file"
+        label="File to protect"
+        hint="Select locally"
+        file={null}
+        onFile={onFile}
+      />
+    );
+    const firstFile = new File(["first"], "first.txt", { type: "text/plain" });
+    const droppedFile = new File(["second"], "second.txt", { type: "text/plain" });
+    const input = screen.getByLabelText("File to protect");
+
+    await user.upload(input, firstFile);
+    fireEvent.drop(input.closest("label")!, {
+      dataTransfer: { files: { item: () => droppedFile } }
+    });
+    await user.upload(input, firstFile);
+
+    expect(onFile.mock.calls.map(([file]) => file)).toEqual([firstFile, droppedFile, firstFile]);
   });
 
   it("displays selected file sizes with the shared binary precision", () => {

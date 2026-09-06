@@ -19,7 +19,10 @@ export function FilePicker({ id, label, hint, accept, file, error, disabled = fa
 
   function selectFile(event: ChangeEvent<HTMLInputElement>) {
     if (disabled) return;
-    onFile(event.target.files?.item(0) ?? null);
+    const selectedFile = event.currentTarget.files?.item(0) ?? null;
+    // Selection lives in the parent, so allow choosing this file again after a drop.
+    event.currentTarget.value = "";
+    onFile(selectedFile);
   }
 
   function allowDrop(event: DragEvent<HTMLLabelElement>) {
