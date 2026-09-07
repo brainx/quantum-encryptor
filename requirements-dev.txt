@@ -15,7 +15,7 @@ twine>=5.0.0
 SecretStorage>=3.2; sys_platform == "linux"
 jeepney>=0.6; sys_platform == "linux"
 setuptools>=69.0.0
-wheel>=0.42.0
+wheel>=0.48.0
 sphinx>=6.0.0
 # Sphinx 9.1 still caps docutils below 0.23; keep the dev lock resolvable.
 docutils<0.23
