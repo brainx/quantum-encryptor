@@ -3,18 +3,21 @@ import { fetchHealth } from "../api/client";
 import type { Health } from "../api/contracts";
 import { DecryptWorkflow } from "../features/decrypt/DecryptWorkflow";
 import { EncryptWorkflow } from "../features/encrypt/EncryptWorkflow";
+import { BatchEncryptWorkflow } from "../features/encrypt/BatchEncryptWorkflow";
 import { GenerateKeysWorkflow } from "../features/generate/GenerateKeysWorkflow";
 import { InspectKeyWorkflow } from "../features/inspect/InspectKeyWorkflow";
 import { AppShell } from "./AppShell";
 import type { View } from "./navigation";
 
 const SENSITIVE_RESULT_CONFIRMATION = "Generated keys are still available. Leave this workflow and clear them?";
+const BATCH_RESULT_CONFIRMATION = "Encrypted files are waiting to be downloaded. Leave this workflow and clear them?";
 
 export default function App() {
   const [activeView, setActiveView] = useState<View>("encrypt");
   const [health, setHealth] = useState<Health | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [hasGeneratedKeys, setHasGeneratedKeys] = useState(false);
+  const [hasBatchResults, setHasBatchResults] = useState(false);
   const healthRequestId = useRef(0);
   const initialHealthRequest = useRef<Promise<Health> | null>(null);
 
@@ -45,7 +48,7 @@ export default function App() {
   }, [loadHealth]);
 
   useEffect(() => {
-    if (!hasGeneratedKeys) return;
+    if (!hasGeneratedKeys && !hasBatchResults) return;
 
     function warnBeforeUnload(event: BeforeUnloadEvent) {
       event.preventDefault();
@@ -54,13 +57,17 @@ export default function App() {
 
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
-  }, [hasGeneratedKeys]);
+  }, [hasGeneratedKeys, hasBatchResults]);
 
   function navigate(nextView: View) {
     if (nextView === activeView) return;
     if (activeView === "generate" && hasGeneratedKeys) {
       if (!window.confirm(SENSITIVE_RESULT_CONFIRMATION)) return;
       setHasGeneratedKeys(false);
+    }
+    if (activeView === "batch-encrypt" && hasBatchResults) {
+      if (!window.confirm(BATCH_RESULT_CONFIRMATION)) return;
+      setHasBatchResults(false);
     }
     setActiveView(nextView);
   }
@@ -86,6 +93,9 @@ export default function App() {
   return (
     <AppShell activeView={activeView} health={health} onNavigate={navigate}>
       {activeView === "encrypt" && <EncryptWorkflow health={health} />}
+      {activeView === "batch-encrypt" && (
+        <BatchEncryptWorkflow health={health} onPendingResultsChange={setHasBatchResults} />
+      )}
       {activeView === "decrypt" && <DecryptWorkflow health={health} />}
       {activeView === "generate" && (
         <GenerateKeysWorkflow health={health} onSensitiveResultChange={setHasGeneratedKeys} />

@@ -82,6 +82,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - All local web responses include a restrictive Content Security Policy with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`, blocking clickjacking of the local UI.
 - Every `/api/*` response replaces its cache policy with `Cache-Control: no-store` and `Pragma: no-cache`; static responses retain their own policy.
 - The Generate workflow keeps its in-app PEM references in current-tab state, provides explicit clearing and in-app navigation confirmation, and requests a browser leave-page warning only while both references remain; downloaded files are separate browser/operating-system copies.
+- Batch encryption accepts at most 25 files whose combined plaintext size fits the configured file limit. One request runs at a time in that workflow, and failed requests are not automatically retried. Completed ciphertexts stay in tab memory for explicit downloads; clearing or leaving releases the application's references without guaranteeing zeroization. These client-side limits do not replace server-side request limits or provide a global concurrency limit across tabs.
 - The API, web UI, and agent CLI expose the same versioned public fingerprint from the core implementation. Generate shows it for a new pair, validated public inspection returns it, and Encrypt shows it in the compatible-recipient review before encryption.
 
 ## Limitations

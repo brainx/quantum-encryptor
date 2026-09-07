@@ -27,6 +27,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Password-Protected Keys**: Private keys are always encrypted with scrypt-derived AES-256-GCM keys
 - **Public-Key Fingerprints**: Full versioned SHA3-256 identifiers support independent public-key comparison
 - **User-Friendly Interface**: Custom local web UI with progressive technical details and a Python ASGI API
+- **Batch Encryption**: Encrypt up to 25 files for one recipient with sequential processing, per-file results, cancellation, and explicit downloads
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Screenshots
@@ -122,6 +123,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 
 2. Open the web interface in your browser. Choose the intent that matches your task:
    - **Encrypt**: protect a file for the holder of a recipient public key.
+   - **Batch encrypt**: protect multiple files for the same recipient, then download each encrypted result.
    - **Decrypt**: recover a file with the matching encrypted private key and password.
    - **Generate keys**: create a new public key and password-protected private key.
    - **Inspect key**: check supported key metadata without exposing key material.
@@ -197,6 +199,16 @@ Do not treat the browser smoke test as proof that the native cryptographic backe
 3. Upload your private key (.pem file)
 4. Enter your private-key password
 5. Download the decrypted file
+
+### Batch Encryption
+
+1. Choose **Batch encrypt** and select or drop up to 25 files. Their combined plaintext size must fit the displayed file limit (100 MiB by default).
+2. Select the recipient's public key and compare its complete fingerprint over an independently authenticated channel.
+3. Choose **Encrypt batch**. Files run one at a time, with separate progress and error states. A failed file does not discard successful results or automatically retry the failed request.
+4. Download each completed result. Batch output names retain the original extension, such as `report.pdf.pqc`; duplicate names receive a numeric suffix.
+5. Choose **Clear batch** when finished. Results live only in the current tab; there is no persistent batch history or server-side recovery.
+
+**Cancel batch** stops scheduling further files and aborts the active browser request. Native work already running may still finish on the server. Completed results remain available for download. If starting a download fails, retry that download without re-encrypting the file. The interface reports when a download starts; the browser determines whether it finishes. Navigation and page-leave warnings help protect results whose downloads have not been started, but browser-controlled warnings cannot guarantee recovery after a crash or forced close.
 
 ## Automation Usage
 
