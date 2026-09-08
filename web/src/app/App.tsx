@@ -8,6 +8,8 @@ import { BatchEncryptWorkflow } from "../features/encrypt/BatchEncryptWorkflow";
 import { GenerateKeysWorkflow } from "../features/generate/GenerateKeysWorkflow";
 import { InspectKeyWorkflow } from "../features/inspect/InspectKeyWorkflow";
 import { ChangeKeyPasswordWorkflow } from "../features/keys/ChangeKeyPasswordWorkflow";
+import { RecoverPublicKeyWorkflow } from "../features/keys/RecoverPublicKeyWorkflow";
+import { VerifyFileWorkflow } from "../features/inspect/VerifyFileWorkflow";
 import { AppShell } from "./AppShell";
 import type { View } from "./navigation";
 
@@ -118,6 +120,8 @@ export default function App() {
         <GenerateKeysWorkflow health={health} onSensitiveResultChange={setHasGeneratedKeys} />
       )}
       {activeView === "inspect" && <InspectKeyWorkflow health={health} />}
+      {activeView === "verify-file" && <VerifyFileWorkflow health={health} />}
+      {activeView === "recover-public" && <RecoverPublicKeyWorkflow health={health} />}
       {activeView === "change-password" && (
         <ChangeKeyPasswordWorkflow health={health} onSensitiveResultChange={setHasUpdatedKey} />
       )}

@@ -30,6 +30,8 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Batch Encryption**: Encrypt up to 25 files for one recipient with sequential processing, per-file results, cancellation, and explicit downloads
 - **Batch Decryption**: Restore up to 25 encrypted files with one private key and password, retaining successful results when another file fails
 - **Private-Key Password Changes**: Download a newly password-protected copy of the same private key without replacing your public key or re-encrypting existing files
+- **Public-Key Recovery**: Recover the public PEM from an unlocked private key and check whether a supplied public key matches
+- **File Verification**: Inspect encrypted-file metadata and authenticate an entire file without downloading its plaintext
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Screenshots
@@ -128,8 +130,10 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
    - **Batch encrypt**: protect multiple files for the same recipient, then download each encrypted result.
    - **Decrypt**: recover a file with the matching encrypted private key and password.
    - **Batch decrypt**: recover several files with the same private key and download each successful result.
+   - **Verify file**: inspect a container, then authenticate it using its private key without a plaintext download.
    - **Generate keys**: create a new public key and password-protected private key.
    - **Change password**: create an updated encrypted copy of an existing private key.
+   - **Recover public key**: restore a lost public PEM and optionally check an existing public key against the private key.
    - **Inspect key**: check supported key metadata without exposing key material.
 
    Each workflow starts with plain-language guidance. Expand **Technical details** only when you need suite, format, or key-policy information.
@@ -231,7 +235,23 @@ Decrypted files are sensitive plaintext. The app warns before navigating away wh
 
 This uses the existing scrypt/AES-GCM private-key format with fresh salt and nonce, and does not require a native post-quantum backend. It creates a separate download and does not overwrite the uploaded file. Copies protected with the old password still work with that password; this operation does not revoke old copies or recover a lost password.
 
-The local API exposes `POST /api/keys/change-password` with multipart fields `private_key`, `current_password`, and `new_password`. Its JSON response contains the updated encrypted `privatePem`, `privateFilename`, `kem`, and authenticated `publicKeyFingerprint`. It follows the existing local API authentication and origin requirements, bounds uploads and password lengths, and admits only one password-change operation at a time. Health advertises support through `supportsKeyPasswordChange`.
+The local API exposes `POST /api/keys/change-password` with multipart fields `private_key`, `current_password`, and `new_password`. Its JSON response contains the updated encrypted `privatePem`, `privateFilename`, `kem`, and authenticated `publicKeyFingerprint`. Health advertises support through `supportsKeyPasswordChange`.
+
+### Public-Key Recovery and Pair Checking
+
+Choose **Recover public key**, upload the encrypted private PEM, and enter its password. Optionally select a public PEM to compare. Recovery authenticates the private-key envelope, reconstructs its embedded or derived public key, and offers an explicit public-key download. The exact algorithm label and canonical public-key bytes are preserved, including compatible legacy key formats. A comparison reports whether both keys represent the same algorithm and public material; it does not certify their owner's identity. Compare the displayed fingerprint through a trusted channel when sharing the recovered key.
+
+Recovery does not require the native post-quantum backend, change the private key, or recover a forgotten password. The password field is cleared when the request starts. `POST /api/keys/recover-public` accepts multipart `private_key`, `password`, and optional `public_key`; it returns `publicPem`, `publicFilename`, `kem`, `publicKeyFingerprint`, and `matchesSuppliedPublicKey` (`null` when no comparison was requested). Health advertises `supportsPublicKeyRecovery`.
+
+### Encrypted-File Inspection and Verification
+
+Choose **Verify file** and select an encrypted file. Inspection reads its format version, algorithm, and container sizes without a private key or native backend. These values remain unauthenticated until verification succeeds. To verify, select the matching encrypted private PEM, enter its password, and choose **Verify file**. Success reports the authenticated byte count and recipient fingerprint; corruption, a different key, or an incorrect password produces an error. Empty files are valid. Changing an input clears the previous result.
+
+Verification requires the native backend and decrypts the bounded file in local service memory before discarding plaintext references. It returns no plaintext to the browser and initiates no download. It does not identify the sender or guarantee secure erasure of process memory. The password field is cleared when the request starts. Leaving the workflow aborts the browser request, although work already running in the local service may finish.
+
+`POST /api/files/inspect` accepts multipart `file` and returns `authenticated: false` with a `metadata` object. `POST /api/files/verify` accepts `file`, `private_key`, and `password`; a successful report contains `verified: true`, `kem`, `formatVersion`, `bytesVerified`, and `publicKeyFingerprint`. Health advertises `supportsFileVerification`. Both use the existing encrypted-file size limit.
+
+These endpoints follow the existing local API authentication, exact-origin, no-store, and upload-cleanup rules. Password changes, public-key recovery, file inspection, and file verification share one worker admission slot, retained until the operation finishes even if its HTTP request is cancelled. Busy requests receive `429` with `Retry-After: 1`; passwords are bounded to 4096 UTF-8 bytes and PEM files to the advertised limit.
 
 ## Automation Usage
 

@@ -584,7 +584,7 @@ button:disabled {
 
   .app-mobile-navigation {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     border-bottom: 1px solid var(--color-border);
     background: var(--color-rail);
   }
@@ -609,6 +609,7 @@ button:disabled {
 }
 
 .batch-encryption-form,
+.verify-file-form,
 .change-key-password-form,
 .batch-results {
   display: grid;

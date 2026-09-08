@@ -1,4 +1,4 @@
-import type { ChangedPrivateKey, DownloadResult, GeneratedKeys, Health, KeyInspectResult } from "./contracts";
+import type { ChangedPrivateKey, DownloadResult, EncryptedFileInspection, FileVerification, GeneratedKeys, Health, KeyInspectResult, RecoveredPublicKey } from "./contracts";
 
 type ApiErrorPayload = {
   ok: false;
@@ -116,6 +116,44 @@ export async function changeKeyPassword(
   const response = await fetchStateChanging("/api/keys/change-password", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return (await response.json()) as ChangedPrivateKey;
+}
+
+export async function recoverPublicKey(
+  privateKey: File,
+  password: string,
+  publicKey: File | null,
+  signal?: AbortSignal
+): Promise<RecoveredPublicKey> {
+  const form = new FormData();
+  form.append("private_key", privateKey);
+  form.append("password", password);
+  if (publicKey) form.append("public_key", publicKey);
+  const response = await fetchStateChanging("/api/keys/recover-public", { method: "POST", body: form, signal });
+  if (!response.ok) await parseError(response);
+  return (await response.json()) as RecoveredPublicKey;
+}
+
+export async function inspectEncryptedFile(file: File, signal?: AbortSignal): Promise<EncryptedFileInspection> {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetchStateChanging("/api/files/inspect", { method: "POST", body: form, signal });
+  if (!response.ok) await parseError(response);
+  return (await response.json()) as EncryptedFileInspection;
+}
+
+export async function verifyFile(
+  file: File,
+  privateKey: File,
+  password: string,
+  signal?: AbortSignal
+): Promise<FileVerification> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("private_key", privateKey);
+  form.append("password", password);
+  const response = await fetchStateChanging("/api/files/verify", { method: "POST", body: form, signal });
+  if (!response.ok) await parseError(response);
+  return (await response.json()) as FileVerification;
 }
 
 export async function encryptFile(

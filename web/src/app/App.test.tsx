@@ -95,6 +95,16 @@ beforeEach(() => {
 });
 
 describe("App", () => {
+  it("opens the file verification and public-key recovery workflows", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Verify file" }));
+    expect(screen.getByRole("heading", { name: "Inspect and verify a file" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Recover public key" }));
+    expect(screen.getByRole("heading", { name: "Recover public key" })).toBeVisible();
+  });
+
   it("guards retained plaintext even after download until the batch is cleared", async () => {
     const user = userEvent.setup();
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);

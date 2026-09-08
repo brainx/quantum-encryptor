@@ -150,6 +150,93 @@ async function runPasswordChange(page, temporaryDirectory, privateKeyPath, encry
   }
 }
 
+async function runPublicKeyRecovery(page, temporaryDirectory, publicKeyPath, privateKeyPath) {
+  const recoveredPath = path.join(temporaryDirectory, "recovered-public.pem");
+  const downloads = [];
+  const recordDownload = (download) => downloads.push(download);
+  page.on("download", recordDownload);
+  try {
+    await page.getByRole("navigation", { name: "Workflows", exact: true })
+      .getByRole("button", { name: "Recover public key", exact: true }).click();
+    await page.getByRole("heading", { name: "Recover public key", exact: true }).waitFor();
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    await page.getByLabel("Public key to compare (optional)", { exact: true }).setInputFiles(publicKeyPath);
+    await page.getByRole("main").getByRole("button", { name: "Recover public key", exact: true }).click();
+    await page.getByRole("button", { name: "Download public key", exact: true }).waitFor({ state: "visible" });
+    await page.getByText("The supplied public key matches this private key.", { exact: true }).waitFor({ state: "visible" });
+    assert.equal(downloads.length, 0, "The recovered public key must wait for an explicit download.");
+    await downloadFromButton(page, "Download public key", recoveredPath);
+    assert.equal(downloads.length, 1, "The public key download button must download exactly one key.");
+    assert.deepEqual(await readFile(recoveredPath), await readFile(publicKeyPath), "The recovered public key differs from the generated public key.");
+    await page.getByRole("button", { name: "Clear result", exact: true }).click();
+    assert.equal(await page.getByRole("button", { name: "Download public key", exact: true }).count(), 0);
+  } finally {
+    page.off("download", recordDownload);
+  }
+}
+
+async function runFileVerification(page, temporaryDirectory, privateKeyPath, encryptedPath) {
+  const encryptedBytes = await readFile(encryptedPath);
+  const tamperedBytes = Buffer.from(encryptedBytes);
+  tamperedBytes[tamperedBytes.length - 1] ^= 1;
+  const tamperedPath = path.join(temporaryDirectory, "tampered.pqc");
+  await writeFile(tamperedPath, tamperedBytes);
+
+  const downloads = [];
+  const recordDownload = (download) => downloads.push(download);
+  const apiResponse = (pathname) => page.waitForResponse((response) =>
+    new URL(response.url()).pathname === pathname && response.request().method() === "POST"
+  );
+  page.on("download", recordDownload);
+  try {
+    await page.getByRole("navigation", { name: "Workflows", exact: true })
+      .getByRole("button", { name: "Verify file", exact: true }).click();
+    await page.getByRole("heading", { name: "Inspect and verify a file", exact: true }).waitFor();
+    const inspectionResponse = apiResponse("/api/files/inspect");
+    await page.getByLabel("Encrypted file", { exact: true }).setInputFiles(encryptedPath);
+    const inspection = await (await inspectionResponse).json();
+    assert.equal(inspection.ok, true, "Selecting a file must inspect its metadata automatically.");
+    assert.equal(inspection.authenticated, false, "Metadata inspection must not claim file authentication.");
+    assert.equal(inspection.metadata.totalBytes, encryptedBytes.length);
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    const verificationResponse = apiResponse("/api/files/verify");
+    await page.getByRole("main").getByRole("button", { name: "Verify file", exact: true }).click();
+    const verification = await (await verificationResponse).json();
+    assert.deepEqual(Object.keys(verification).sort(), ["bytesVerified", "formatVersion", "kem", "ok", "publicKeyFingerprint", "verified"],
+      "Verification must return only an authentication report, never plaintext.");
+    assert.equal(verification.ok, true);
+    assert.equal(verification.verified, true);
+    assert.equal(verification.bytesVerified, inputBytes.length);
+    await page.getByText("File authenticated", { exact: true }).waitFor({ state: "visible" });
+    await page.getByText(`${inputBytes.length.toLocaleString()} bytes authenticated.`, { exact: true }).waitFor({ state: "visible" });
+    assert.equal(downloads.length, 0, "File verification must not start a plaintext download.");
+    assert.equal((await page.getByRole("main").innerText()).includes(inputBytes.toString("utf8")), false,
+      "File verification must not display the authenticated plaintext.");
+
+    const tamperedInspectionResponse = apiResponse("/api/files/inspect");
+    await page.getByLabel("Encrypted file", { exact: true }).setInputFiles(tamperedPath);
+    const tamperedInspection = await (await tamperedInspectionResponse).json();
+    assert.equal(tamperedInspection.ok, true, "Ciphertext tampering must still allow structural metadata inspection.");
+    assert.equal(tamperedInspection.authenticated, false);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    const rejectedVerificationResponse = apiResponse("/api/files/verify");
+    await page.getByRole("main").getByRole("button", { name: "Verify file", exact: true }).click();
+    const rejectedResponse = await rejectedVerificationResponse;
+    assert.equal(rejectedResponse.status(), 400);
+    const rejection = await rejectedResponse.json();
+    assert.equal(rejection.ok, false);
+    assert.equal(rejection.error_code, "verification_failed");
+    await page.getByRole("main").getByRole("alert").waitFor({ state: "visible" });
+    assert.equal(await page.getByText("File authenticated", { exact: true }).count(), 0);
+    assert.equal(downloads.length, 0, "A tampered file must not start a plaintext download.");
+    assert.equal((await page.getByRole("main").innerText()).includes(inputBytes.toString("utf8")), false);
+  } finally {
+    page.off("download", recordDownload);
+  }
+}
+
 async function run() {
   let temporaryDirectory;
   let browser;
@@ -205,7 +292,9 @@ async function run() {
 
     await runBatchRoundTrips(page, temporaryDirectory, publicKeyPath, privateKeyPath);
     await runPasswordChange(page, temporaryDirectory, privateKeyPath, encryptedPath);
-    console.log("Native browser single-file, batch encryption/decryption, and private-key password-change round trips passed.");
+    await runPublicKeyRecovery(page, temporaryDirectory, publicKeyPath, privateKeyPath);
+    await runFileVerification(page, temporaryDirectory, privateKeyPath, encryptedPath);
+    console.log("Native browser encryption/decryption, key password change, public-key recovery, and file verification checks passed.");
   } finally {
     try {
       await browser?.close();
@@ -218,6 +307,6 @@ async function run() {
 try {
   await run();
 } catch {
-  console.error("Native browser encryption, decryption, or key password-change round trip failed.");
+  console.error("Native browser encryption, decryption, key recovery/password change, or file verification check failed.");
   process.exitCode = 1;
 }

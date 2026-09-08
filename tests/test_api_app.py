@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import pytest
 import starlette.formparsers
 
@@ -271,6 +272,257 @@ def _password_change_body(
     return _multipart_form([("private_key", "../my?private.pem", pem)], passwords)
 
 
+@pytest.fixture
+def tracked_uploads(monkeypatch):
+    uploads = []
+    original_tempfile = starlette.formparsers.SpooledTemporaryFile
+
+    def track(*args, **kwargs):
+        upload = original_tempfile(*args, **kwargs)
+        uploads.append(upload)
+        return upload
+
+    monkeypatch.setattr(starlette.formparsers, "SpooledTemporaryFile", track)
+    try:
+        yield uploads
+    finally:
+        for upload in uploads:
+            upload.close()
+
+
+@pytest.fixture
+def recovery_key():
+    public = bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES)
+    private = bytes(cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES) + public + hashlib.sha3_256(public).digest() + bytes(32)
+    password = "river metal orbit cactus 47"
+    private_pem = core.save_key_pem(private, cfg.KEM_ALG, "private", password)
+    public_pem = core.save_key_pem(public, cfg.KEM_ALG, "public")
+    assert private_pem is not None and public_pem is not None
+    return private, private_pem, public_pem, password
+
+
+@pytest.fixture
+def verifiable_file(monkeypatch, recovery_key):
+    private, private_pem, _public_pem, password = recovery_key
+
+    class FakeKEM:
+        details = {"length_secret_key": len(private), "length_ciphertext": 32}
+
+        def __init__(self, _alg):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    class FakeOQS:
+        KeyEncapsulation = FakeKEM
+
+    def shared_secret(raw_private):
+        start = cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES
+        return hashlib.sha256(raw_private[start : start + cfg.MLKEM768_PUBLIC_KEY_BYTES]).digest()
+
+    monkeypatch.setattr(core, "_require_oqs", lambda: FakeOQS)
+    monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", lambda _alg: (cfg.KEM_ALG,))
+    monkeypatch.setattr(core, "_decapsulate_shared_secret", lambda _oqs, _alg, raw, _ct: shared_secret(raw))
+
+    def encrypt(plaintext):
+        alg = cfg.KEM_ALG.encode("ascii")
+        nonce = bytes(cfg.AES_NONCE_BYTES)
+        header = (
+            cfg.MAGIC_BYTES
+            + cfg.LEGACY_FORMAT_VERSION.to_bytes(2, "big")
+            + len(alg).to_bytes(2, "big")
+            + alg
+            + (32).to_bytes(4, "big")
+            + bytes(32)
+            + nonce
+        )
+        return header + AESGCM(core.derive_symmetric_key_hkdf(shared_secret(private))).encrypt(nonce, plaintext, header)
+
+    return encrypt, private_pem, password
+
+
+def test_recovery_and_verification_health_flags_are_independent_of_native_backend(monkeypatch):
+    def unavailable(_alg):
+        raise core.CryptoDependencyError()
+
+    monkeypatch.setattr(core, "resolve_kem_algorithm", unavailable)
+    monkeypatch.setattr(core, "available_decryption_kem_algorithms", lambda: ())
+    payload = api_app._health_payload()
+    assert payload["supportsPublicKeyRecovery"] is True
+    assert payload["supportsFileVerification"] is True
+    assert payload["capabilities"]["decrypt"]["available"] is False
+
+
+@pytest.mark.parametrize("supplied", ["none", "match", "different", "different_algorithm"])
+def test_recover_public_api_preserves_key_and_reports_optional_match(
+    monkeypatch, recovery_key, supplied, tracked_uploads
+):
+    private, private_pem, public_pem, password = recovery_key
+    files = [("private_key", "../my?private.pem", private_pem.encode())]
+    expected_match = None
+    if supplied != "none":
+        supplied_pem = public_pem.replace("\n", "\r\n")
+        expected_match = supplied == "match"
+        if supplied == "different":
+            supplied_pem = core.save_key_pem(
+                bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES - 32) + bytes(range(32)), cfg.KEM_ALG, "public"
+            )
+        elif supplied == "different_algorithm":
+            supplied_pem = public_pem.replace(cfg.KEM_ALG, "Kyber768")
+        assert supplied_pem is not None
+        files.append(("public_key", "public.pem", supplied_pem.encode()))
+    monkeypatch.setattr(core, "_require_oqs", lambda: pytest.fail("Recovery must not require native backend"))
+    body, headers = _multipart_form(files, {"password": password})
+
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/keys/recover-public", body=body, headers=_with_api_token(headers))
+    )
+
+    assert status == 200
+    assert json.loads(response_body) == {
+        "ok": True,
+        "publicPem": public_pem,
+        "kem": cfg.KEM_ALG,
+        "publicKeyFingerprint": core.get_private_key_public_fingerprint(private, cfg.KEM_ALG),
+        "publicFilename": "my_private_public.pem",
+        "matchesSuppliedPublicKey": expected_match,
+    }
+    assert b"privatePem" not in response_body and password.encode() not in response_body
+    assert tracked_uploads and all(upload.closed for upload in tracked_uploads)
+    _assert_api_no_store(response_headers)
+
+
+@pytest.mark.parametrize("supplied", [b"invalid public", b""])
+def test_recover_public_api_rejects_invalid_optional_public_before_unlock(monkeypatch, supplied):
+    monkeypatch.setattr(
+        core, "recover_public_key_pem", lambda *_args: pytest.fail("Invalid public must fail before scrypt")
+    )
+    body, headers = _multipart_form(
+        [("private_key", "private.pem", b"private pem"), ("public_key", "public.pem", supplied)],
+        {"password": "password"},
+    )
+    status, payload = asyncio.run(_call_app("/api/keys/recover-public", body=body, headers=_with_api_token(headers)))
+    assert status == 400
+    assert payload["error_code"] == "invalid_public_key"
+
+
+def test_inspect_file_api_explicitly_reports_unauthenticated_metadata(monkeypatch, verifiable_file, tracked_uploads):
+    encrypt, _private_pem, _password = verifiable_file
+    blob = encrypt(b"confidential plaintext")
+    # Even a structurally valid file with a corrupted tag is only inspected, never verified.
+    blob = blob[:-1] + bytes([blob[-1] ^ 1])
+    monkeypatch.setattr(core, "_require_oqs", lambda: pytest.fail("Inspection must not use liboqs"))
+    body, headers = _multipart_body("file", "file.pqc", blob)
+
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/files/inspect", body=body, headers=_with_api_token(headers))
+    )
+    metadata = core.inspect_encrypted_file_strict(blob)
+    assert status == 200
+    assert json.loads(response_body) == {
+        "ok": True,
+        "authenticated": False,
+        "metadata": {
+            "formatVersion": cfg.LEGACY_FORMAT_VERSION,
+            "kem": cfg.KEM_ALG,
+            "headerBytes": metadata.header_bytes,
+            "kemCiphertextBytes": 32,
+            "x25519CiphertextBytes": 0,
+            "encryptedPayloadBytes": metadata.encrypted_payload_bytes,
+            "totalBytes": len(blob),
+        },
+    }
+    _assert_api_no_store(response_headers)
+    assert tracked_uploads and all(upload.closed for upload in tracked_uploads)
+
+
+@pytest.mark.parametrize("plaintext", [b"", b"confidential plaintext"])
+def test_verify_file_api_authenticates_without_returning_plaintext(
+    verifiable_file, recovery_key, plaintext, tracked_uploads
+):
+    encrypt, private_pem, password = verifiable_file
+    private, _private_pem, _public_pem, _password = recovery_key
+    body, headers = _multipart_form(
+        [("file", "file.pqc", encrypt(plaintext)), ("private_key", "private.pem", private_pem.encode())],
+        {"password": password},
+    )
+
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/files/verify", body=body, headers=_with_api_token(headers))
+    )
+    assert status == 200
+    assert json.loads(response_body) == {
+        "ok": True,
+        "verified": True,
+        "kem": cfg.KEM_ALG,
+        "formatVersion": cfg.LEGACY_FORMAT_VERSION,
+        "bytesVerified": len(plaintext),
+        "publicKeyFingerprint": core.get_private_key_public_fingerprint(private, cfg.KEM_ALG),
+    }
+    assert b"confidential plaintext" not in response_body
+    assert _header(response_headers, b"content-disposition") is None
+    _assert_api_no_store(response_headers)
+    assert tracked_uploads and all(upload.closed for upload in tracked_uploads)
+
+
+@pytest.mark.parametrize(
+    "failure, code",
+    [
+        ("tag", "verification_failed"),
+        ("header", "verification_failed"),
+        ("wrong_key", "verification_failed"),
+        ("algorithm", "verification_failed"),
+        ("malformed", "invalid_encrypted_file"),
+        ("password", "private_key_failed"),
+        ("backend", "backend_unavailable"),
+    ],
+)
+def test_verify_file_api_rejects_failed_authentication_safely(
+    monkeypatch, verifiable_file, recovery_key, failure, code
+):
+    encrypt, private_pem, password = verifiable_file
+    blob = encrypt(b"confidential plaintext")
+    if failure in {"tag", "header"}:
+        index = -1 if failure == "tag" else core.inspect_encrypted_file_strict(blob).header_bytes - 1
+        changed = bytearray(blob)
+        changed[index] ^= 1
+        blob = bytes(changed)
+    elif failure == "wrong_key":
+        public = bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES - 32) + bytes(range(32))
+        private = bytes(cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES) + public + hashlib.sha3_256(public).digest() + bytes(32)
+        private_pem = core.save_key_pem(private, cfg.KEM_ALG, "private", password)
+    elif failure == "algorithm":
+        private_pem = core.save_key_pem(recovery_key[0], "Kyber768", "private", password)
+    elif failure == "malformed":
+        blob = b"not an encrypted container"
+    elif failure == "password":
+        password = "incorrect but strong password 83"
+    else:
+
+        def unavailable(_alg):
+            raise core.CryptoDependencyError("private backend detail")
+
+        monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", unavailable)
+    assert private_pem is not None
+    body, headers = _multipart_form(
+        [("file", "file.pqc", blob), ("private_key", "private.pem", private_pem.encode())], {"password": password}
+    )
+
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/files/verify", body=body, headers=_with_api_token(headers))
+    )
+    payload = json.loads(response_body)
+    assert status == (503 if failure == "backend" else 400)
+    assert payload["error_code"] == code
+    assert "verified" not in payload and "bytesVerified" not in payload and "publicKeyFingerprint" not in payload
+    assert b"confidential plaintext" not in response_body and b"private backend detail" not in response_body
+    _assert_api_no_store(response_headers)
+
+
 def test_password_change_health_capability_does_not_require_native_backend(monkeypatch):
     def unavailable(*_args):
         raise core.CryptoDependencyError("unavailable")
@@ -326,7 +578,7 @@ def test_password_change_api_returns_safe_errors_and_recovers(monkeypatch, excep
     def fail(*_args):
         raise exception
 
-    monkeypatch.setattr(core, "change_private_key_password", fail)
+    monkeypatch.setattr(core, "rewrap_private_key_pem", fail)
     body, headers = _password_change_body()
     status, response_headers, response_body = asyncio.run(
         _call_app_raw("/api/keys/change-password", body=body, headers=_with_api_token(headers))
@@ -339,7 +591,7 @@ def test_password_change_api_returns_safe_errors_and_recovers(monkeypatch, excep
     assert "privatePem" not in payload
     _assert_api_no_store(response_headers)
 
-    monkeypatch.setattr(core, "change_private_key_password", lambda *_args: ("updated", cfg.KEM_ALG, "fingerprint"))
+    monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: ("updated", cfg.KEM_ALG, "fingerprint"))
     recovered_status, _payload = asyncio.run(
         _call_app("/api/keys/change-password", body=body, headers=_with_api_token(headers))
     )
@@ -355,7 +607,7 @@ def test_password_change_api_returns_safe_errors_and_recovers(monkeypatch, excep
 def test_password_change_api_bounds_password_fields_before_crypto(
     monkeypatch, field, value, expected_status, error_code
 ):
-    monkeypatch.setattr(core, "change_private_key_password", lambda *_args: pytest.fail("Crypto must not run"))
+    monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: pytest.fail("Crypto must not run"))
     body, headers = _password_change_body(**{field: value})
 
     status, payload = asyncio.run(_call_app("/api/keys/change-password", body=body, headers=_with_api_token(headers)))
@@ -365,7 +617,7 @@ def test_password_change_api_bounds_password_fields_before_crypto(
 
 
 def test_password_change_api_bounds_pem_upload_before_crypto(monkeypatch):
-    monkeypatch.setattr(core, "change_private_key_password", lambda *_args: pytest.fail("Crypto must not run"))
+    monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: pytest.fail("Crypto must not run"))
     monkeypatch.setattr(cfg, "MAX_PEM_BYTES", 4)
     body, headers = _password_change_body(b"12345")
 
@@ -384,7 +636,12 @@ def test_password_change_api_bounds_pem_upload_before_crypto(monkeypatch):
         ("origin", 403, "forbidden_origin"),
     ],
 )
-def test_password_change_api_rejects_invalid_request_before_parse(monkeypatch, failure, expected_status, error_code):
+@pytest.mark.parametrize(
+    "path", ["/api/keys/change-password", "/api/keys/recover-public", "/api/files/inspect", "/api/files/verify"]
+)
+def test_protected_crypto_api_rejects_invalid_request_before_parse(
+    monkeypatch, failure, expected_status, error_code, path
+):
     async def must_not_parse(*_args, **_kwargs):
         pytest.fail("Invalid request must not be parsed")
 
@@ -393,9 +650,9 @@ def test_password_change_api_rejects_invalid_request_before_parse(monkeypatch, f
     headers = _with_api_token(headers)
     if failure == "body_size":
         headers = [(name, value) for name, value in headers if name != b"content-length"]
-        headers.append(
-            (b"content-length", str(cfg.MAX_PEM_BYTES + api_app.MULTIPART_OVERHEAD_BYTES + 1).encode("ascii"))
-        )
+        limit = api_app._api_body_limit(path)
+        assert limit is not None
+        headers.append((b"content-length", str(limit + 1).encode("ascii")))
     elif failure == "missing_length":
         headers = [(name, value) for name, value in headers if name != b"content-length"]
     elif failure == "missing_token":
@@ -403,9 +660,7 @@ def test_password_change_api_rejects_invalid_request_before_parse(monkeypatch, f
     else:
         headers.append((b"origin", b"https://evil.example"))
 
-    status, response_headers, response_body = asyncio.run(
-        _call_app_raw("/api/keys/change-password", body=body, headers=headers)
-    )
+    status, response_headers, response_body = asyncio.run(_call_app_raw(path, body=body, headers=headers))
 
     assert status == expected_status
     assert json.loads(response_body)["error_code"] == error_code
@@ -437,7 +692,7 @@ def test_password_change_api_cancellation_keeps_capacity_until_worker_finishes(m
             assert release.wait(timeout=5), "Worker was not released"
             return "updated", cfg.KEM_ALG, "fingerprint"
 
-        monkeypatch.setattr(core, "change_private_key_password", change)
+        monkeypatch.setattr(core, "rewrap_private_key_pem", change)
         body, headers = _password_change_body()
         request = asyncio.create_task(
             _call_app("/api/keys/change-password", body=body, headers=_with_api_token(headers))
@@ -462,17 +717,131 @@ def test_password_change_api_cancellation_keeps_capacity_until_worker_finishes(m
         finally:
             release.set()
             # Wait for the synchronous wrapper's finally, not merely the core call's return.
-            acquired = await asyncio.to_thread(api_app._password_change_lock.acquire, True, 2)
+            acquired = await asyncio.to_thread(api_app._crypto_operation_lock.acquire, True, 2)
             assert acquired
-            api_app._password_change_lock.release()
+            api_app._crypto_operation_lock.release()
             if not request.done():
                 await request
 
-        monkeypatch.setattr(core, "change_private_key_password", lambda *_args: ("new result", cfg.KEM_ALG, "fp"))
+        monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: ("new result", cfg.KEM_ALG, "fp"))
         status, payload = await _call_app("/api/keys/change-password", body=body, headers=_with_api_token(headers))
         assert status == 200
         assert payload["privatePem"] == "new result"
         assert all(upload.closed for upload in uploads)
+
+    asyncio.run(exercise())
+
+
+def _new_crypto_workflow_body(path: str, password: str = "river metal orbit cactus 47"):
+    if path == "/api/keys/recover-public":
+        return _multipart_form([("private_key", "private.pem", b"private pem")], {"password": password})
+    if path == "/api/files/inspect":
+        return _multipart_body("file", "file.pqc", b"encrypted file")
+    return _multipart_form(
+        [("file", "file.pqc", b"encrypted file"), ("private_key", "private.pem", b"private pem")],
+        {"password": password},
+    )
+
+
+@pytest.mark.parametrize("path", ["/api/keys/recover-public", "/api/files/verify"])
+@pytest.mark.parametrize(
+    "password, status_code, code",
+    [("", 400, "password_required"), ("é" * 2049, 413, "field_too_large")],
+    ids=["missing", "oversized_utf8"],
+)
+def test_new_crypto_api_password_bounds_precede_worker(monkeypatch, path, password, status_code, code):
+    monkeypatch.setattr(api_app, "_run_crypto_operation", lambda *_args: pytest.fail("Worker must not start"))
+    body, headers = _new_crypto_workflow_body(path, password)
+    status, payload = asyncio.run(_call_app(path, body=body, headers=_with_api_token(headers)))
+    assert status == status_code
+    assert payload["error_code"] == code
+
+
+@pytest.mark.parametrize(
+    "path, field, limit_name",
+    [
+        ("/api/keys/recover-public", "private_key", "MAX_PEM_BYTES"),
+        ("/api/keys/recover-public", "public_key", "MAX_PEM_BYTES"),
+        ("/api/files/verify", "private_key", "MAX_PEM_BYTES"),
+        ("/api/files/verify", "file", "MAX_ENCRYPTED_FILE_BYTES"),
+        ("/api/files/inspect", "file", "MAX_ENCRYPTED_FILE_BYTES"),
+    ],
+)
+def test_new_crypto_api_bounds_each_upload_before_worker(monkeypatch, path, field, limit_name):
+    monkeypatch.setattr(cfg, limit_name, 4)
+    monkeypatch.setattr(api_app, "_run_crypto_operation", lambda *_args: pytest.fail("Worker must not start"))
+    files = [("file", "file.pqc", b"123"), ("private_key", "key.pem", b"123")]
+    if path.endswith("recover-public"):
+        files = [("private_key", "key.pem", b"123"), ("public_key", "public.pem", b"123")]
+    elif path.endswith("inspect"):
+        files = files[:1]
+    files = [(name, filename, b"12345" if name == field else content) for name, filename, content in files]
+    body, headers = _multipart_form(files, {} if path.endswith("inspect") else {"password": "pw"})
+    status, payload = asyncio.run(_call_app(path, body=body, headers=_with_api_token(headers)))
+    assert status == 413
+    assert payload["error_code"] == "file_too_large"
+
+
+@pytest.mark.parametrize(
+    "path, operation",
+    [
+        ("/api/keys/recover-public", "_recover_public_key"),
+        ("/api/files/verify", "_verify_encrypted_file"),
+        ("/api/files/inspect", "_inspect_encrypted_file"),
+    ],
+)
+def test_new_crypto_api_cancellation_retains_shared_worker_capacity(monkeypatch, path, operation, tracked_uploads):
+    release = threading.Event()
+
+    async def exercise():
+        started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def blocked(*_args):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+            raise core.CryptoCoreError("late worker error")
+
+        monkeypatch.setattr(api_app, operation, blocked)
+        body, headers = _new_crypto_workflow_body(path)
+        request = asyncio.create_task(_call_app(path, body=body, headers=_with_api_token(headers)))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            assert tracked_uploads and all(upload.closed for upload in tracked_uploads)
+            for busy_path in (
+                "/api/keys/change-password",
+                "/api/keys/recover-public",
+                "/api/files/verify",
+                "/api/files/inspect",
+            ):
+                busy_body, busy_headers = (
+                    _password_change_body()
+                    if busy_path.endswith("change-password")
+                    else _new_crypto_workflow_body(busy_path)
+                )
+                status, response_headers, response_body = await asyncio.wait_for(
+                    _call_app_raw(busy_path, body=busy_body, headers=_with_api_token(busy_headers)), timeout=1
+                )
+                assert status == 429
+                assert json.loads(response_body)["error_code"] == "server_busy"
+                assert _header(response_headers, b"retry-after") == "1"
+                _assert_api_no_store(response_headers)
+                assert all(upload.closed for upload in tracked_uploads)
+        finally:
+            release.set()
+            acquired = await asyncio.to_thread(api_app._crypto_operation_lock.acquire, True, 2)
+            assert acquired
+            api_app._crypto_operation_lock.release()
+            if not request.done():
+                await request
+        monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: ("updated", cfg.KEM_ALG, "fingerprint"))
+        body, headers = _password_change_body()
+        status, payload = await _call_app("/api/keys/change-password", body=body, headers=_with_api_token(headers))
+        assert status == 200
+        assert payload["privatePem"] == "updated"
 
     asyncio.run(exercise())
 
@@ -632,6 +1001,20 @@ def test_read_upload_bytes_rejects_oversized_upload():
         ("/api/keys/inspect", [("wrong_field", "key.pem", b"key")], {}, "missing_file"),
         ("/api/keys/change-password", [("private_key", "key.pem", b"key")], {}, "password_required"),
         ("/api/keys/change-password", [("wrong_field", "key.pem", b"key")], {}, "missing_file"),
+        ("/api/keys/recover-public", [("private_key", "key.pem", b"key")], {}, "password_required"),
+        (
+            "/api/keys/recover-public",
+            [("private_key", "key.pem", b"key")],
+            {"password": "secret"},
+            "invalid_private_key",
+        ),
+        ("/api/files/inspect", [("file", "file.pqc", b"bad")], {}, "invalid_encrypted_file"),
+        (
+            "/api/files/verify",
+            [("file", "file.pqc", b"bad"), ("private_key", "key.pem", b"key")],
+            {"password": "secret"},
+            "invalid_encrypted_file",
+        ),
         ("/api/files/encrypt", [("file", "plain.txt", b"plaintext")], {}, "missing_file"),
         (
             "/api/files/decrypt",

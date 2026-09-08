@@ -8,6 +8,8 @@ export type Capability = {
 export type Health = {
   ok: boolean;
   supportsKeyPasswordChange?: boolean;
+  supportsPublicKeyRecovery?: boolean;
+  supportsFileVerification?: boolean;
   backendReady: boolean;
   backendMessage: string;
   capabilities: Record<CapabilityName, Capability>;
@@ -78,6 +80,53 @@ export type ChangeKeyPasswordOperation = (
   newPassword: string,
   signal?: AbortSignal
 ) => Promise<ChangedPrivateKey>;
+
+export type RecoveredPublicKey = {
+  ok: boolean;
+  publicPem: string;
+  publicFilename: string;
+  kem: string;
+  publicKeyFingerprint: string;
+  matchesSuppliedPublicKey: boolean | null;
+};
+
+export type RecoverPublicKeyOperation = (
+  privateKey: File,
+  password: string,
+  publicKey: File | null,
+  signal?: AbortSignal
+) => Promise<RecoveredPublicKey>;
+
+export type EncryptedFileInspection = {
+  ok: boolean;
+  authenticated: false;
+  metadata: {
+    formatVersion: number;
+    kem: string;
+    headerBytes: number;
+    kemCiphertextBytes: number;
+    x25519CiphertextBytes: number;
+    encryptedPayloadBytes: number;
+    totalBytes: number;
+  };
+};
+
+export type FileVerification = {
+  ok: boolean;
+  verified: true;
+  kem: string;
+  formatVersion: number;
+  bytesVerified: number;
+  publicKeyFingerprint: string;
+};
+
+export type InspectEncryptedFileOperation = (file: File, signal?: AbortSignal) => Promise<EncryptedFileInspection>;
+export type VerifyFileOperation = (
+  file: File,
+  privateKey: File,
+  password: string,
+  signal?: AbortSignal
+) => Promise<FileVerification>;
 
 export type InspectKeyOperation = (file: File, signal?: AbortSignal) => Promise<KeyInspectResult>;
 export type GenerateKeysOperation = (password: string, signal?: AbortSignal) => Promise<GeneratedKeys>;

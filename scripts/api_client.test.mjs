@@ -200,3 +200,43 @@ test("sensitive operation signals reach each state-changing fetch", async (t) =>
   );
   assert.equal(calls.filter(({ url }) => url === "/api/health").length, 1);
 });
+
+test("recovery, inspection, and verification send bounded-workflow inputs with cancellation", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const controller = new AbortController();
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url === "/api/health") return jsonResponse(healthPayload());
+    calls.push(url);
+    assert.equal(init.method, "POST");
+    assert.equal(init.signal, controller.signal);
+    if (url === "/api/keys/recover-public") {
+      assert.equal(init.body.get("password"), "test password");
+      assert.equal(await init.body.get("private_key").text(), "private PEM");
+      const publicKey = init.body.get("public_key");
+      if (calls.length === 1) assert.equal(publicKey, null);
+      else assert.equal(await publicKey.text(), "public PEM");
+      return jsonResponse({ ok: true, matchesSuppliedPublicKey: publicKey ? true : null });
+    }
+    assert.equal(await init.body.get("file").text(), "ciphertext");
+    if (url === "/api/files/inspect") {
+      assert.deepEqual([...init.body.keys()], ["file"]);
+      return jsonResponse({ ok: true, authenticated: false });
+    }
+    assert.equal(url, "/api/files/verify");
+    assert.equal(await init.body.get("private_key").text(), "private PEM");
+    assert.equal(init.body.get("password"), "test password");
+    return jsonResponse({ ok: true, verified: true, bytesVerified: 0 });
+  };
+  const api = await loadApiModule();
+  const privateKey = new Blob(["private PEM"]);
+  const publicKey = new Blob(["public PEM"]);
+  const file = new Blob(["ciphertext"]);
+  assert.equal((await api.recoverPublicKey(privateKey, "test password", null, controller.signal)).matchesSuppliedPublicKey, null);
+  assert.equal((await api.recoverPublicKey(privateKey, "test password", publicKey, controller.signal)).matchesSuppliedPublicKey, true);
+  assert.equal((await api.inspectEncryptedFile(file, controller.signal)).authenticated, false);
+  assert.equal((await api.verifyFile(file, privateKey, "test password", controller.signal)).bytesVerified, 0);
+  assert.equal(calls.length, 4);
+});
