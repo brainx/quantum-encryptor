@@ -1070,6 +1070,31 @@ def inspect_key_pem_strict(pem_content: str) -> Dict[str, Any]:
     return result
 
 
+def change_private_key_password(pem_content: str, current_password: str, new_password: str) -> Tuple[str, str, str]:
+    """Re-encrypt an authenticated private key without changing its key material."""
+    key_info = inspect_key_pem_strict(pem_content)
+    if key_info["key_type"] != "private":
+        raise InvalidKeyFormatError("An encrypted private key is required.")
+    if not current_password:
+        raise PasswordRequiredError("The current private-key password is required.")
+    validate_private_key_password(new_password)
+    if new_password == current_password:
+        raise WeakPasswordError("The new password must be different from the current password.")
+
+    raw_private_key, kem_alg, key_type = load_key_pem(pem_content, current_password)
+    if raw_private_key is None or kem_alg is None or key_type != "private":
+        raise AuthenticationFailedError("Could not unlock the private key. Check the current password and key file.")
+    try:
+        fingerprint = get_private_key_public_fingerprint(raw_private_key, kem_alg)
+        private_pem = save_key_pem(raw_private_key, kem_alg, "private", new_password)
+        if private_pem is None:
+            raise CryptoCoreError("Could not encrypt the private key with the new password.")
+        return private_pem, kem_alg, fingerprint
+    finally:
+        # Drop this reference promptly; Python does not guarantee memory zeroization.
+        del raw_private_key
+
+
 def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
     if not encrypted_blob:
         raise FileFormatError("Encrypted input is empty.")

@@ -28,6 +28,8 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Public-Key Fingerprints**: Full versioned SHA3-256 identifiers support independent public-key comparison
 - **User-Friendly Interface**: Custom local web UI with progressive technical details and a Python ASGI API
 - **Batch Encryption**: Encrypt up to 25 files for one recipient with sequential processing, per-file results, cancellation, and explicit downloads
+- **Batch Decryption**: Restore up to 25 encrypted files with one private key and password, retaining successful results when another file fails
+- **Private-Key Password Changes**: Download a newly password-protected copy of the same private key without replacing your public key or re-encrypting existing files
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Screenshots
@@ -125,7 +127,9 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
    - **Encrypt**: protect a file for the holder of a recipient public key.
    - **Batch encrypt**: protect multiple files for the same recipient, then download each encrypted result.
    - **Decrypt**: recover a file with the matching encrypted private key and password.
+   - **Batch decrypt**: recover several files with the same private key and download each successful result.
    - **Generate keys**: create a new public key and password-protected private key.
+   - **Change password**: create an updated encrypted copy of an existing private key.
    - **Inspect key**: check supported key metadata without exposing key material.
 
    Each workflow starts with plain-language guidance. Expand **Technical details** only when you need suite, format, or key-policy information.
@@ -209,6 +213,25 @@ Do not treat the browser smoke test as proof that the native cryptographic backe
 5. Choose **Clear batch** when finished. Results live only in the current tab; there is no persistent batch history or server-side recovery.
 
 **Cancel batch** stops scheduling further files and aborts the active browser request. Native work already running may still finish on the server. Completed results remain available for download. If starting a download fails, retry that download without re-encrypting the file. The interface reports when a download starts; the browser determines whether it finishes. Navigation and page-leave warnings help protect results whose downloads have not been started, but browser-controlled warnings cannot guarantee recovery after a crash or forced close.
+
+### Batch Decryption
+
+Choose **Batch decrypt**, select up to 25 encrypted files within the displayed combined-size limit, and supply the encrypted private key and its password. The key's metadata is inspected before starting; its match to each file is verified only during authenticated decryption. Compatible legacy decryption keys remain supported.
+
+Files are processed sequentially. A corrupt file or a file for another recipient shows its own error while successful results remain available. Download each result explicitly, then choose **Clear batch** to release the tab's plaintext references. Downloads can be retried without decrypting again. The password field is cleared when the batch starts; the active operation retains the password until it finishes or cancellation settles. Cancellation stops queued files and aborts the active browser request, but native work already running may still finish.
+
+Decrypted files are sensitive plaintext. The app warns before navigating away while any plaintext result is retained, even if its download has started. Clearing results cannot guarantee memory zeroization or remove copies already downloaded by the browser.
+
+### Change a Private-Key Password
+
+1. Choose **Change password** and upload your encrypted private PEM key.
+2. Enter its current password, then enter and confirm a different new password that meets the displayed policy.
+3. Choose **Change key password** and download the updated encrypted private key. The displayed public-key fingerprint identifies the same key pair; existing ciphertext and the public key remain compatible.
+4. Test the downloaded key with the new password before replacing any original copies. Choose **Clear updated key** to release the result from the tab.
+
+This uses the existing scrypt/AES-GCM private-key format with fresh salt and nonce, and does not require a native post-quantum backend. It creates a separate download and does not overwrite the uploaded file. Copies protected with the old password still work with that password; this operation does not revoke old copies or recover a lost password.
+
+The local API exposes `POST /api/keys/change-password` with multipart fields `private_key`, `current_password`, and `new_password`. Its JSON response contains the updated encrypted `privatePem`, `privateFilename`, `kem`, and authenticated `publicKeyFingerprint`. It follows the existing local API authentication and origin requirements, bounds uploads and password lengths, and admits only one password-change operation at a time. Health advertises support through `supportsKeyPasswordChange`.
 
 ## Automation Usage
 

@@ -700,6 +700,136 @@ class TestPrivateKeyEncryption:
         assert decrypted_key_wrong is None
 
 
+class TestPrivateKeyPasswordChange:
+    current_password = "river metal orbit cactus 47"
+    new_password = "harbor maple cloud copper 93"
+
+    @pytest.mark.parametrize("kem_alg", cfg.ALLOWED_KEY_ALGS)
+    def test_password_change_preserves_key_identity_with_fresh_encryption(self, monkeypatch, kem_alg):
+        raw_private_key = _synthetic_mlkem_private()
+        if core.is_hybrid_key_algorithm(kem_alg):
+            raw_private_key = bytes(range(cfg.X25519_KEY_BYTES)) + raw_private_key
+        original = core.save_key_pem(raw_private_key, kem_alg, "private", self.current_password)
+        assert original is not None
+        monkeypatch.setattr(core, "_require_oqs", lambda: pytest.fail("Password changes must not use liboqs"))
+
+        updated, updated_alg, fingerprint = core.change_private_key_password(
+            original, self.current_password, self.new_password
+        )
+
+        assert updated_alg == kem_alg
+        assert fingerprint == core.get_private_key_public_fingerprint(raw_private_key, kem_alg)
+        assert core.load_key_pem(updated, self.new_password) == (raw_private_key, kem_alg, "private")
+        assert core.load_key_pem(updated, self.current_password) == (None, None, None)
+        assert core.load_key_pem(original, self.current_password) == (raw_private_key, kem_alg, "private")
+        original_envelope = core._parse_key_pem_strict(original).private_envelope
+        updated_envelope = core._parse_key_pem_strict(updated).private_envelope
+        assert original_envelope is not None and updated_envelope is not None
+        assert updated_envelope.salt != original_envelope.salt
+        assert updated_envelope.nonce != original_envelope.nonce
+        assert updated_envelope.format_version == cfg.PEM_PRIVATE_KEY_FORMAT_VERSION
+
+    def test_password_change_accepts_authenticated_v2_without_relabelling_the_key(self, monkeypatch):
+        monkeypatch.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 2)
+        raw_private_key = _synthetic_mlkem_private()
+        original = core.save_key_pem(raw_private_key, "Kyber768", "private", self.current_password)
+        assert original is not None
+        monkeypatch.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 3)
+
+        updated, kem_alg, _fingerprint = core.change_private_key_password(
+            original, self.current_password, self.new_password
+        )
+
+        assert kem_alg == "Kyber768"
+        assert core.load_key_pem(updated, self.new_password) == (raw_private_key, "Kyber768", "private")
+        assert core.inspect_key_pem_strict(updated)["private_key_format_version"] == 3
+
+    @pytest.mark.parametrize("failure", ["wrong_password", "corrupt_metadata"])
+    def test_password_change_requires_authenticated_private_key(self, monkeypatch, failure):
+        original = core.save_key_pem(_synthetic_mlkem_private(), cfg.KEM_ALG, "private", self.current_password)
+        assert original is not None
+        password = self.current_password
+        if failure == "wrong_password":
+            password = "incorrect but strong password 83"
+        else:
+            envelope = core._parse_key_pem_strict(original).private_envelope
+            assert envelope is not None
+            original = original.replace(
+                base64.b64encode(envelope.nonce).decode("ascii"),
+                base64.b64encode(_tamper(envelope.nonce, 0)).decode("ascii"),
+            )
+        monkeypatch.setattr(
+            core, "save_key_pem", lambda *_args, **_kwargs: pytest.fail("Must not rewrap an invalid key")
+        )
+
+        with pytest.raises(core.AuthenticationFailedError):
+            core.change_private_key_password(original, password, self.new_password)
+
+    @pytest.mark.parametrize("new_password", ["short", "river metal orbit cactus 47"])
+    def test_password_change_rejects_weak_or_unchanged_password_before_kdf(self, monkeypatch, new_password):
+        original = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+
+        with pytest.raises(core.WeakPasswordError):
+            core.change_private_key_password(original, self.current_password, new_password)
+
+    @pytest.mark.parametrize("missing", ["current", "new"])
+    def test_password_change_requires_both_passwords(self, monkeypatch, missing):
+        original = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+
+        with pytest.raises(core.PasswordRequiredError):
+            core.change_private_key_password(
+                original,
+                "" if missing == "current" else self.current_password,
+                "" if missing == "new" else self.new_password,
+            )
+
+    @pytest.mark.parametrize("key_type", ["public", "unencrypted_private"])
+    def test_password_change_rejects_keys_without_private_key_encryption(self, monkeypatch, key_type):
+        if key_type == "public":
+            pem = _public_key_pem(_synthetic_mlkem_public())
+            expected_error = core.InvalidKeyFormatError
+        else:
+            pem = "\n".join(
+                [
+                    cfg.PEM_PRIVATE_HEADER,
+                    f"{cfg.PEM_ALGORITHM_HEADER}{cfg.KEM_ALG}",
+                    base64.b64encode(_synthetic_mlkem_private()).decode("ascii"),
+                    cfg.PEM_PRIVATE_FOOTER,
+                ]
+            )
+            expected_error = core.UnencryptedPrivateKeyError
+        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+
+        with pytest.raises(expected_error):
+            core.change_private_key_password(pem, self.current_password, self.new_password)
+
+    @pytest.mark.parametrize("failure", ["malformed", "unsupported_kdf", "oversized"])
+    def test_password_change_rejects_invalid_envelope_before_kdf(self, monkeypatch, failure):
+        pem = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
+        expected_error = core.InvalidKeyFormatError
+        if failure == "malformed":
+            pem = "not a key"
+        elif failure == "unsupported_kdf":
+            pem = pem.replace(f"n={cfg.SCRYPT_N}", "n=1073741824")
+            expected_error = core.UnsupportedKDFError
+        else:
+            pem += " " * cfg.MAX_PEM_BYTES
+        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+
+        with pytest.raises(expected_error):
+            core.change_private_key_password(pem, self.current_password, self.new_password)
+
+    def test_password_change_propagates_rewrap_failure_without_returning_key_data(self, monkeypatch):
+        original = core.save_key_pem(_synthetic_mlkem_private(), cfg.KEM_ALG, "private", self.current_password)
+        assert original is not None
+        monkeypatch.setattr(core, "save_key_pem", lambda *_args, **_kwargs: None)
+
+        with pytest.raises(core.CryptoCoreError, match="Could not encrypt"):
+            core.change_private_key_password(original, self.current_password, self.new_password)
+
+
 class TestPEMKeyFormat:
     """Tests for PEM key format functions."""
 

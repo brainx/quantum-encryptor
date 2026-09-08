@@ -162,6 +162,13 @@ test("sensitive operation signals reach each state-changing fetch", async (t) =>
     calls.push({ url, signal: init.signal });
     if (url === "/api/health") return jsonResponse(healthPayload());
     if (url === "/api/keys/generate") return jsonResponse(generatedKeysPayload());
+    if (url === "/api/keys/change-password") {
+      assert.equal(init.method, "POST");
+      assert.equal(init.body.get("current_password"), "correct horse battery staple");
+      assert.equal(init.body.get("new_password"), "new strong password for key");
+      assert.equal(await init.body.get("private_key").text(), "key");
+      return jsonResponse({ ok: true, privatePem: "UPDATED PEM", privateFilename: "updated.pem", kem: "ML-KEM-768+X25519-v2", publicKeyFingerprint: testPublicKeyFingerprint });
+    }
     if (url === "/api/files/encrypt" || url === "/api/files/decrypt") {
       return new Response(new Blob([url]), {
         status: 200,
@@ -179,13 +186,16 @@ test("sensitive operation signals reach each state-changing fetch", async (t) =>
   await api.generateKeys("correct horse battery staple", controller.signal);
   await api.encryptFile(file, key, "encrypted.pqc", controller.signal);
   await api.decryptFile(file, key, "correct horse battery staple", "plain.txt", controller.signal);
+  const updated = await api.changeKeyPassword(key, "correct horse battery staple", "new strong password for key", controller.signal);
+  assert.equal(updated.publicKeyFingerprint, testPublicKeyFingerprint);
 
   assert.deepEqual(
     calls.filter(({ url }) => url !== "/api/health").map(({ url, signal }) => ({ url, signal })),
     [
       { url: "/api/keys/generate", signal: controller.signal },
       { url: "/api/files/encrypt", signal: controller.signal },
-      { url: "/api/files/decrypt", signal: controller.signal }
+      { url: "/api/files/decrypt", signal: controller.signal },
+      { url: "/api/keys/change-password", signal: controller.signal }
     ]
   );
   assert.equal(calls.filter(({ url }) => url === "/api/health").length, 1);

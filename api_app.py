@@ -10,10 +10,12 @@ import secrets
 import sys
 from http.cookies import SimpleCookie
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -52,6 +54,8 @@ def _allowed_browser_authorities(app_port: int, enable_vite_dev: bool) -> frozen
 APP_ROOT = Path(__file__).resolve().parent
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 SMALL_FORM_MAX_BYTES = 64 * 1024
+PASSWORD_FIELD_MAX_BYTES = 4096
+_password_change_lock = Lock()
 LOCAL_API_PORT = _configured_port(os.environ.get("PORT", "4000"))
 LOCAL_API_HOST_HEADER = f"127.0.0.1:{LOCAL_API_PORT}"
 ALLOWED_BROWSER_AUTHORITIES = _allowed_browser_authorities(
@@ -188,7 +192,7 @@ async def _form(request: Request, max_files: int = 2, max_fields: int = 6):
 def _api_body_limit(path: str) -> int | None:
     if path == "/api/keys/generate":
         return SMALL_FORM_MAX_BYTES
-    if path == "/api/keys/inspect":
+    if path in {"/api/keys/inspect", "/api/keys/change-password"}:
         return cfg.MAX_PEM_BYTES + MULTIPART_OVERHEAD_BYTES
     if path == "/api/files/encrypt":
         return cfg.MAX_FILE_BYTES + cfg.MAX_PEM_BYTES + MULTIPART_OVERHEAD_BYTES
@@ -533,6 +537,7 @@ def _health_payload() -> dict[str, Any]:
     )
 
     return {
+        "supportsKeyPasswordChange": True,
         "backendReady": current_backend_ready,
         "backendMessage": backend_message,
         "capabilities": capabilities,
@@ -628,6 +633,82 @@ async def generate_keys(request: Request) -> JSONResponse:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("generate-keys", exc)
+    finally:
+        await request.close()
+
+
+def _change_private_key_password(pem_content: str, current_password: str, new_password: str) -> tuple[str, str, str]:
+    # The worker owns admission so cancelling its awaiting request cannot release it early.
+    if not _password_change_lock.acquire(blocking=False):
+        raise ApiError(429, "server_busy", "A private-key password change is already running. Try again shortly.")
+    try:
+        return core.change_private_key_password(pem_content, current_password, new_password)
+    finally:
+        _password_change_lock.release()
+
+
+async def change_key_password(request: Request) -> JSONResponse:
+    try:
+        form = await _form(request, max_files=1, max_fields=2)
+        private_key_file = _form_upload(form, "private_key")
+        current_password = _form_text(form, "current_password", required=False)
+        new_password = _form_text(form, "new_password", required=False)
+        if not current_password or not new_password:
+            raise ApiError(400, "password_required", "The current and new private-key passwords are required.")
+        if any(
+            len(password.encode("utf-8")) > PASSWORD_FIELD_MAX_BYTES for password in (current_password, new_password)
+        ):
+            raise ApiError(413, "field_too_large", "Private-key passwords must not exceed 4096 UTF-8 bytes.")
+        original_filename = sanitize_download_filename(private_key_file.filename or "", "private.pem")
+        output_filename = sanitize_download_filename(
+            f"{Path(original_filename).stem or 'private'}_updated.pem", "private_updated.pem"
+        )
+        pem_content = await _read_upload_text(private_key_file, cfg.MAX_PEM_BYTES, "Private key file")
+        private_pem, kem_alg, fingerprint = await run_in_threadpool(
+            _change_private_key_password, pem_content, current_password, new_password
+        )
+        return _success_json(
+            {
+                "privatePem": private_pem,
+                "kem": kem_alg,
+                "publicKeyFingerprint": fingerprint,
+                "privateFilename": output_filename,
+            }
+        )
+    except ApiError as exc:
+        response = _json_error(exc)
+        if exc.code == "server_busy":
+            response.headers["Retry-After"] = "1"
+        return response
+    except (
+        core.InvalidKeyFormatError,
+        core.UnencryptedPrivateKeyError,
+        core.UnsupportedKDFError,
+        core.UnsupportedAlgorithmError,
+    ):
+        return _json_error(
+            ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
+        )
+    except core.PasswordRequiredError:
+        return _json_error(
+            ApiError(400, "password_required", "The current and new private-key passwords are required.")
+        )
+    except core.WeakPasswordError:
+        return _json_error(
+            ApiError(400, "weak_password", "Choose a strong new password that is different from the current password.")
+        )
+    except core.AuthenticationFailedError:
+        return _json_error(
+            ApiError(
+                400, "private_key_failed", "Could not unlock the private key. Check the current password and key file."
+            )
+        )
+    except core.CryptoCoreError:
+        return _json_error(
+            ApiError(500, "password_change_failed", "Could not encrypt the private key with the new password.")
+        )
+    except Exception as exc:
+        return _safe_unexpected("change-key-password", exc)
     finally:
         await request.close()
 
@@ -741,6 +822,7 @@ def create_app() -> ASGIApp:
         Route("/api/health", health, methods=["GET"]),
         Route("/api/keys/inspect", inspect_key, methods=["POST"]),
         Route("/api/keys/generate", generate_keys, methods=["POST"]),
+        Route("/api/keys/change-password", change_key_password, methods=["POST"]),
         Route("/api/files/encrypt", encrypt_file, methods=["POST"]),
         Route("/api/files/decrypt", decrypt_file, methods=["POST"]),
     ]

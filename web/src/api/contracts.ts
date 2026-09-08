@@ -7,6 +7,7 @@ export type Capability = {
 
 export type Health = {
   ok: boolean;
+  supportsKeyPasswordChange?: boolean;
   backendReady: boolean;
   backendMessage: string;
   capabilities: Record<CapabilityName, Capability>;
@@ -62,6 +63,21 @@ export type DownloadResult = {
   blob: Blob;
   filename: string;
 };
+
+export type ChangedPrivateKey = {
+  ok: boolean;
+  privatePem: string;
+  privateFilename: string;
+  kem: string;
+  publicKeyFingerprint: string;
+};
+
+export type ChangeKeyPasswordOperation = (
+  privateKey: File,
+  currentPassword: string,
+  newPassword: string,
+  signal?: AbortSignal
+) => Promise<ChangedPrivateKey>;
 
 export type InspectKeyOperation = (file: File, signal?: AbortSignal) => Promise<KeyInspectResult>;
 export type GenerateKeysOperation = (password: string, signal?: AbortSignal) => Promise<GeneratedKeys>;

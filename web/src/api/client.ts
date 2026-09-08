@@ -1,4 +1,4 @@
-import type { DownloadResult, GeneratedKeys, Health, KeyInspectResult } from "./contracts";
+import type { ChangedPrivateKey, DownloadResult, GeneratedKeys, Health, KeyInspectResult } from "./contracts";
 
 type ApiErrorPayload = {
   ok: false;
@@ -101,6 +101,21 @@ export async function generateKeys(password: string, signal?: AbortSignal): Prom
   const response = await fetchStateChanging("/api/keys/generate", { method: "POST", body: form, signal });
   if (!response.ok) await parseError(response);
   return (await response.json()) as GeneratedKeys;
+}
+
+export async function changeKeyPassword(
+  privateKey: File,
+  currentPassword: string,
+  newPassword: string,
+  signal?: AbortSignal
+): Promise<ChangedPrivateKey> {
+  const form = new FormData();
+  form.append("private_key", privateKey);
+  form.append("current_password", currentPassword);
+  form.append("new_password", newPassword);
+  const response = await fetchStateChanging("/api/keys/change-password", { method: "POST", body: form, signal });
+  if (!response.ok) await parseError(response);
+  return (await response.json()) as ChangedPrivateKey;
 }
 
 export async function encryptFile(

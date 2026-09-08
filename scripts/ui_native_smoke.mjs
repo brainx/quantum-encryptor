@@ -7,6 +7,7 @@ import { chromium } from "playwright";
 
 const baseUrl = process.env.UI_NATIVE_URL ?? "http://127.0.0.1:4000/";
 const password = "correct horse battery staple";
+const updatedPassword = "new correct horse battery staple";
 const inputBytes = Buffer.from("native browser round trip");
 
 function assertReadyHealth(health) {
@@ -27,11 +28,11 @@ async function saveDownload(download, destination) {
 
 async function downloadFromButton(page, name, destination) {
   const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name }).click();
+  await page.getByRole("button", { name, exact: true }).click();
   return saveDownload(await downloadPromise, destination);
 }
 
-async function decryptFromUi(page, encryptedPath, privateKeyPath, decryptedPath) {
+async function decryptFromUi(page, encryptedPath, privateKeyPath, decryptedPath, privateKeyPassword = password) {
   await page.getByRole("button", { name: "Decrypt", exact: true }).click();
   await page.getByRole("heading", { name: "Decrypt a file" }).waitFor();
   await page.getByLabel("Encrypted file").setInputFiles(encryptedPath);
@@ -39,7 +40,7 @@ async function decryptFromUi(page, encryptedPath, privateKeyPath, decryptedPath)
   await page
     .getByText("Supported encrypted private key; match not yet verified", { exact: true })
     .waitFor({ state: "visible" });
-  await page.getByLabel("Private key password", { exact: true }).fill(password);
+  await page.getByLabel("Private key password", { exact: true }).fill(privateKeyPassword);
   const decryptedDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: "Decrypt file" }).click();
   await saveDownload(await decryptedDownload, decryptedPath);
@@ -79,14 +80,73 @@ async function runBatchRoundTrips(page, temporaryDirectory, publicKeyPath, priva
       await downloadFromButton(page, `Download ${input.filename}.pqc`, path.join(temporaryDirectory, `${input.filename}.pqc`));
       assert.equal(downloads.length, index + 1, "Each batch download button must download exactly one result.");
     }
+
+    await page.getByRole("button", { name: "Batch decrypt", exact: true }).click();
+    await page.getByRole("heading", { name: "Decrypt multiple files", exact: true }).waitFor();
+    await page.getByLabel("Files to decrypt", { exact: true }).setInputFiles(
+      inputs.map((input) => path.join(temporaryDirectory, `${input.filename}.pqc`))
+    );
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    await page.getByRole("button", { name: "Decrypt batch", exact: true }).click();
+
+    const decryptedResults = page.getByRole("list", { name: "File decryption results", exact: true });
+    for (const input of inputs) {
+      await decryptedResults.getByRole("button", { name: `Download ${input.filename}`, exact: true })
+        .waitFor({ state: "visible" });
+    }
+    assert.equal(downloads.length, inputs.length, "Batch decryption must wait for explicit per-file downloads.");
+
+    for (const [index, input] of inputs.entries()) {
+      const decryptedPath = path.join(temporaryDirectory, `${input.filename}.decrypted`);
+      await downloadFromButton(page, `Download ${input.filename}`, decryptedPath);
+      assert.equal(downloads.length, inputs.length + index + 1, "Each batch decryption download button must download exactly one result.");
+      assert.deepEqual(await readFile(decryptedPath), input.bytes, `The batch round trip changed ${input.filename}.`);
+    }
+    await page.getByRole("button", { name: "Clear batch", exact: true }).click();
+    assert.equal(await page.getByRole("list", { name: "File decryption results", exact: true }).count(), 0);
+  } finally {
+    page.off("download", recordDownload);
+  }
+}
+
+async function runPasswordChange(page, temporaryDirectory, privateKeyPath, encryptedPath) {
+  const updatedKeyPath = path.join(temporaryDirectory, "updated-private.pem");
+  const decryptedPath = path.join(temporaryDirectory, "updated-key-decrypted.txt");
+  const downloads = [];
+  const recordDownload = (download) => downloads.push(download);
+  page.on("download", recordDownload);
+  try {
+    await page.getByRole("button", { name: "Change password", exact: true }).click();
+    await page.getByRole("heading", { name: "Change private key password", exact: true }).waitFor();
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Current password", { exact: true }).fill(password);
+    await page.getByLabel("New password", { exact: true }).fill(updatedPassword);
+    await page.getByLabel("Confirm new password", { exact: true }).fill(updatedPassword);
+    await page.getByRole("button", { name: "Change key password", exact: true }).click();
+    await page.getByRole("button", { name: "Download updated private key", exact: true }).waitFor({ state: "visible" });
+    assert.equal(downloads.length, 0, "The updated private key must wait for an explicit download.");
+    await downloadFromButton(page, "Download updated private key", updatedKeyPath);
+    assert.equal(downloads.length, 1, "The updated key download button must download exactly one key.");
+    await page.getByRole("button", { name: "Clear updated key", exact: true }).click();
+    assert.equal(await page.getByRole("button", { name: "Download updated private key", exact: true }).count(), 0);
   } finally {
     page.off("download", recordDownload);
   }
 
-  for (const input of inputs) {
-    const decryptedPath = path.join(temporaryDirectory, `${input.filename}.decrypted`);
-    await decryptFromUi(page, path.join(temporaryDirectory, `${input.filename}.pqc`), privateKeyPath, decryptedPath);
-    assert.deepEqual(await readFile(decryptedPath), input.bytes, `The batch round trip changed ${input.filename}.`);
+  await decryptFromUi(page, encryptedPath, updatedKeyPath, decryptedPath, updatedPassword);
+  assert.deepEqual(await readFile(decryptedPath), inputBytes, "The updated private key changed the decrypted bytes.");
+
+  downloads.length = 0;
+  page.on("download", recordDownload);
+  try {
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    await page.getByRole("button", { name: "Decrypt file", exact: true }).click();
+    await page.getByText("The file could not be authenticated. Check the encrypted file, private key, and password.", { exact: true })
+      .waitFor({ state: "visible" });
+    assert.equal(downloads.length, 0, "The original password must not decrypt with the updated private key.");
+  } finally {
+    page.off("download", recordDownload);
   }
 }
 
@@ -144,7 +204,8 @@ async function run() {
     assert.deepEqual(await readFile(decryptedPath), inputBytes, "The native browser round trip returned different bytes.");
 
     await runBatchRoundTrips(page, temporaryDirectory, publicKeyPath, privateKeyPath);
-    console.log("Native browser single-file and batch encryption round trips passed.");
+    await runPasswordChange(page, temporaryDirectory, privateKeyPath, encryptedPath);
+    console.log("Native browser single-file, batch encryption/decryption, and private-key password-change round trips passed.");
   } finally {
     try {
       await browser?.close();
@@ -157,6 +218,6 @@ async function run() {
 try {
   await run();
 } catch {
-  console.error("Native browser encryption round trip failed.");
+  console.error("Native browser encryption, decryption, or key password-change round trip failed.");
   process.exitCode = 1;
 }
