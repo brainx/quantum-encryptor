@@ -16,6 +16,9 @@ This project follows a practical semantic-versioning style.
 
 ### Added
 
+- Batch decryption with a shared private key, independent authentication errors, explicit plaintext downloads, cancellation, and clear-result controls.
+- Private-key password changes that preserve key identity and existing ciphertext compatibility, with authenticated local API access and a retained download of the updated encrypted key.
+- Batch file encryption with a shared verified recipient, a 25-file and aggregate-size limit, sequential requests, per-file downloads and errors, cancellation, and warnings before leaving undownloaded results.
 - ML-KEM-768 + X25519 composite key generation and format-v4 encrypted containers.
 - SHA3-256 hybrid key combiner binding both key shares, X25519 context, suite identifier, and application domain.
 - Polished monochrome local web workflows with progressive technical details,

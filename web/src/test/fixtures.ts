@@ -2,6 +2,9 @@ import type { Health } from "../api/contracts";
 
 export const READY_HEALTH: Health = {
   ok: true,
+  supportsKeyPasswordChange: true,
+  supportsPublicKeyRecovery: true,
+  supportsFileVerification: true,
   backendReady: true,
   backendMessage: "Post-quantum backend ready.",
   capabilities: {

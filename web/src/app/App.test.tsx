@@ -9,7 +9,12 @@ const TEST_PUBLIC_KEY_FINGERPRINT = `QE1-SHA3-256:${"a".repeat(64)}`;
 
 const client = vi.hoisted(() => ({
   fetchHealth: vi.fn(),
-  generateKeys: vi.fn()
+  generateKeys: vi.fn(),
+  inspectKey: vi.fn(),
+  encryptFile: vi.fn(),
+  decryptFile: vi.fn(),
+  changeKeyPassword: vi.fn(),
+  save: vi.fn()
 }));
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -17,9 +22,32 @@ vi.mock("../api/client", async (importOriginal) => {
   return {
     ...actual,
     fetchHealth: client.fetchHealth,
-    generateKeys: client.generateKeys
+    generateKeys: client.generateKeys,
+    inspectKey: client.inspectKey,
+    encryptFile: client.encryptFile,
+    decryptFile: client.decryptFile,
+    changeKeyPassword: client.changeKeyPassword
   };
 });
+
+vi.mock("../lib/download", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../lib/download")>(),
+  downloadBlob: client.save
+}));
+
+async function openBatchResults(user: ReturnType<typeof userEvent.setup>) {
+  await screen.findByRole("heading", { name: "Encrypt a file" });
+  await user.click(screen.getByRole("button", { name: "Batch encrypt" }));
+  await screen.findByRole("heading", { name: "Encrypt multiple files" });
+  await user.upload(screen.getByLabelText("Files to encrypt"), [
+    new File(["alpha"], "alpha.txt"),
+    new File(["beta"], "beta.txt")
+  ]);
+  await user.upload(screen.getByLabelText("Recipient public key"), new File(["public"], "recipient.pem"));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Encrypt batch" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "Encrypt batch" }));
+  await screen.findByRole("button", { name: "Download beta.txt.pqc" });
+}
 
 async function openGeneratedKeys(user: ReturnType<typeof userEvent.setup>) {
   await screen.findByRole("heading", { name: "Encrypt a file" });
@@ -44,9 +72,116 @@ beforeEach(() => {
     privateFilename: "recipient-private.pem",
     publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT
   });
+  client.inspectKey.mockReset();
+  client.inspectKey.mockResolvedValue({
+    ok: true,
+    keyInfo: { kem: READY_HEALTH.kem, key_type: "public", public_key_fingerprint: TEST_PUBLIC_KEY_FINGERPRINT },
+    display: {}
+  });
+  client.encryptFile.mockReset();
+  client.encryptFile.mockImplementation((_file: File, _key: File, filename: string) =>
+    Promise.resolve({ filename, blob: new Blob(["ciphertext"]) })
+  );
+  client.save.mockReset();
+  client.decryptFile.mockReset();
+  client.decryptFile.mockImplementation((_file: File, _key: File, _password: string, filename: string) =>
+    Promise.resolve({ filename, blob: new Blob(["plaintext"]) })
+  );
+  client.changeKeyPassword.mockReset();
+  client.changeKeyPassword.mockResolvedValue({
+    ok: true, privatePem: "ENCRYPTED UPDATED PEM", privateFilename: "updated.pem",
+    kem: READY_HEALTH.kem, publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT
+  });
 });
 
 describe("App", () => {
+  it("opens the file verification and public-key recovery workflows", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Verify file" }));
+    expect(screen.getByRole("heading", { name: "Inspect and verify a file" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Recover public key" }));
+    expect(screen.getByRole("heading", { name: "Recover public key" })).toBeVisible();
+  });
+
+  it("guards retained plaintext even after download until the batch is cleared", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    client.inspectKey.mockResolvedValue({ ok: true, keyInfo: { kem: READY_HEALTH.kem, key_type: "private", private_key_encrypted: true }, display: {} });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Batch decrypt" }));
+    await user.upload(screen.getByLabelText("Files to decrypt"), new File(["ciphertext"], "report.txt.pqc"));
+    await user.upload(screen.getByLabelText("Private key", { exact: true }), new File(["encrypted key"], "private.pem"));
+    await user.type(screen.getByLabelText("Private key password", { exact: true }), "correct horse battery staple");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Decrypt batch" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Decrypt batch" }));
+    await user.click(await screen.findByRole("button", { name: "Download report.txt" }));
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Encrypt" }));
+    expect(confirm).toHaveBeenCalledWith("Decrypted files are still available in this tab. Leave this workflow and clear them?");
+    expect(screen.getByRole("heading", { name: "Decrypt multiple files" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Clear batch" }));
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+  });
+
+  it("guards an updated private key and releases it after confirmed navigation", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    client.inspectKey.mockResolvedValue({ ok: true, keyInfo: { kem: READY_HEALTH.kem, key_type: "private", private_key_encrypted: true }, display: {} });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Change password" }));
+    await user.upload(screen.getByLabelText("Private key", { exact: true }), new File(["encrypted key"], "private.pem"));
+    await user.type(screen.getByLabelText("Current password", { exact: true }), "correct horse battery staple");
+    await user.type(screen.getByLabelText("New password", { exact: true }), "a new strong passphrase for key");
+    await user.type(screen.getByLabelText("Confirm new password", { exact: true }), "a new strong passphrase for key");
+    await user.click(screen.getByRole("button", { name: "Change key password" }));
+    await screen.findByRole("button", { name: "Download updated private key" });
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(confirm).toHaveBeenCalledWith("The updated private key is still available. Leave this workflow and clear it?");
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(await screen.findByRole("heading", { name: "Inspect a key" })).toBeVisible();
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+  });
+
+  it("protects undownloaded batch results when navigating or closing the page", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<App />);
+    await openBatchResults(user);
+
+    const beforeLeave = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(beforeLeave)).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(confirm).toHaveBeenCalledWith("Encrypted files are waiting to be downloaded. Leave this workflow and clear them?");
+    expect(screen.getByRole("heading", { name: "Encrypt multiple files" })).toBeVisible();
+
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(await screen.findByRole("heading", { name: "Inspect a key" })).toBeVisible();
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+  });
+
+  it("allows navigation after every batch download has been started", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm");
+    render(<App />);
+    await openBatchResults(user);
+    await user.click(screen.getByRole("button", { name: "Download alpha.txt.pqc" }));
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Download beta.txt.pqc" }));
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Encrypt" }));
+    expect(await screen.findByRole("heading", { name: "Encrypt a file" })).toBeVisible();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(client.save).toHaveBeenCalledTimes(2);
+    expect(client.encryptFile).toHaveBeenCalledTimes(2);
+  });
+
   it("starts on file encryption and switches to key inspection", async () => {
     const user = userEvent.setup();
 

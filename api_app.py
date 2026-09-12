@@ -10,10 +10,12 @@ import secrets
 import sys
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable, TypeVar
 from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -28,6 +30,7 @@ from ui_helpers import format_key_info_for_display, guess_decrypted_filename
 logger = logging.getLogger(__name__)
 
 Authority = tuple[str, str, int]
+CryptoResult = TypeVar("CryptoResult")
 
 
 def _configured_port(value: str) -> int:
@@ -52,6 +55,8 @@ def _allowed_browser_authorities(app_port: int, enable_vite_dev: bool) -> frozen
 APP_ROOT = Path(__file__).resolve().parent
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 SMALL_FORM_MAX_BYTES = 64 * 1024
+PASSWORD_FIELD_MAX_BYTES = 4096
+_crypto_operation_lock = Lock()
 LOCAL_API_PORT = _configured_port(os.environ.get("PORT", "4000"))
 LOCAL_API_HOST_HEADER = f"127.0.0.1:{LOCAL_API_PORT}"
 ALLOWED_BROWSER_AUTHORITIES = _allowed_browser_authorities(
@@ -188,11 +193,15 @@ async def _form(request: Request, max_files: int = 2, max_fields: int = 6):
 def _api_body_limit(path: str) -> int | None:
     if path == "/api/keys/generate":
         return SMALL_FORM_MAX_BYTES
-    if path == "/api/keys/inspect":
+    if path in {"/api/keys/inspect", "/api/keys/change-password"}:
         return cfg.MAX_PEM_BYTES + MULTIPART_OVERHEAD_BYTES
+    if path == "/api/keys/recover-public":
+        return 2 * cfg.MAX_PEM_BYTES + MULTIPART_OVERHEAD_BYTES
+    if path == "/api/files/inspect":
+        return cfg.MAX_ENCRYPTED_FILE_BYTES + MULTIPART_OVERHEAD_BYTES
     if path == "/api/files/encrypt":
         return cfg.MAX_FILE_BYTES + cfg.MAX_PEM_BYTES + MULTIPART_OVERHEAD_BYTES
-    if path == "/api/files/decrypt":
+    if path in {"/api/files/decrypt", "/api/files/verify"}:
         return cfg.MAX_ENCRYPTED_FILE_BYTES + cfg.MAX_PEM_BYTES + MULTIPART_OVERHEAD_BYTES
     return None
 
@@ -533,6 +542,9 @@ def _health_payload() -> dict[str, Any]:
     )
 
     return {
+        "supportsKeyPasswordChange": True,
+        "supportsPublicKeyRecovery": True,
+        "supportsFileVerification": True,
         "backendReady": current_backend_ready,
         "backendMessage": backend_message,
         "capabilities": capabilities,
@@ -628,6 +640,255 @@ async def generate_keys(request: Request) -> JSONResponse:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
         return _safe_unexpected("generate-keys", exc)
+    finally:
+        await request.close()
+
+
+def _run_crypto_operation(operation: Callable[..., CryptoResult], *args: Any) -> CryptoResult:
+    # The worker owns admission so cancelling its awaiting request cannot release it early.
+    if not _crypto_operation_lock.acquire(blocking=False):
+        raise ApiError(429, "server_busy", "A cryptographic operation is already running. Try again shortly.")
+    try:
+        return operation(*args)
+    finally:
+        _crypto_operation_lock.release()
+
+
+def _rewrap_private_key_pem(pem_content: str, current_password: str, new_password: str) -> tuple[str, str, str]:
+    return _run_crypto_operation(core.rewrap_private_key_pem, pem_content, current_password, new_password)
+
+
+async def change_key_password(request: Request) -> JSONResponse:
+    try:
+        form = await _form(request, max_files=1, max_fields=2)
+        private_key_file = _form_upload(form, "private_key")
+        current_password = _form_text(form, "current_password", required=False)
+        new_password = _form_text(form, "new_password", required=False)
+        if not current_password or not new_password:
+            raise ApiError(400, "password_required", "The current and new private-key passwords are required.")
+        if any(
+            len(password.encode("utf-8")) > PASSWORD_FIELD_MAX_BYTES for password in (current_password, new_password)
+        ):
+            raise ApiError(413, "field_too_large", "Private-key passwords must not exceed 4096 UTF-8 bytes.")
+        original_filename = sanitize_download_filename(private_key_file.filename or "", "private.pem")
+        output_filename = sanitize_download_filename(
+            f"{Path(original_filename).stem or 'private'}_updated.pem", "private_updated.pem"
+        )
+        pem_content = await _read_upload_text(private_key_file, cfg.MAX_PEM_BYTES, "Private key file")
+        private_pem, kem_alg, fingerprint = await run_in_threadpool(
+            _rewrap_private_key_pem, pem_content, current_password, new_password
+        )
+        return _success_json(
+            {
+                "privatePem": private_pem,
+                "kem": kem_alg,
+                "publicKeyFingerprint": fingerprint,
+                "privateFilename": output_filename,
+            }
+        )
+    except ApiError as exc:
+        response = _json_error(exc)
+        if exc.code == "server_busy":
+            response.headers["Retry-After"] = "1"
+        return response
+    except (
+        core.InvalidKeyFormatError,
+        core.UnencryptedPrivateKeyError,
+        core.UnsupportedKDFError,
+        core.UnsupportedAlgorithmError,
+    ):
+        return _json_error(
+            ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
+        )
+    except core.PasswordRequiredError:
+        return _json_error(
+            ApiError(400, "password_required", "The current and new private-key passwords are required.")
+        )
+    except core.WeakPasswordError:
+        return _json_error(
+            ApiError(400, "weak_password", "Choose a strong new password that is different from the current password.")
+        )
+    except core.AuthenticationFailedError:
+        return _json_error(
+            ApiError(
+                400, "private_key_failed", "Could not unlock the private key. Check the current password and key file."
+            )
+        )
+    except core.CryptoCoreError:
+        return _json_error(
+            ApiError(500, "password_change_failed", "Could not encrypt the private key with the new password.")
+        )
+    except Exception as exc:
+        return _safe_unexpected("change-key-password", exc)
+    finally:
+        await request.close()
+
+
+def _workflow_password(form: Any) -> str:
+    password = _form_text(form, "password", required=False)
+    if not password:
+        raise ApiError(400, "password_required", "The private-key password is required.")
+    if len(password.encode("utf-8")) > PASSWORD_FIELD_MAX_BYTES:
+        raise ApiError(413, "field_too_large", "Private-key passwords must not exceed 4096 UTF-8 bytes.")
+    return password
+
+
+def _crypto_workflow_error(operation: str, exc: Exception) -> JSONResponse:
+    if isinstance(exc, ApiError):
+        response = _json_error(exc)
+        if exc.code == "server_busy":
+            response.headers["Retry-After"] = "1"
+        return response
+    if isinstance(
+        exc,
+        (
+            core.InvalidKeyFormatError,
+            core.UnencryptedPrivateKeyError,
+            core.UnsupportedKDFError,
+            core.UnsupportedAlgorithmError,
+        ),
+    ):
+        return _json_error(
+            ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
+        )
+    if isinstance(exc, core.AuthenticationFailedError):
+        return _json_error(
+            ApiError(400, "private_key_failed", "Could not unlock the private key. Check the password and key file.")
+        )
+    if isinstance(exc, core.PasswordRequiredError):
+        return _json_error(ApiError(400, "password_required", "The private-key password is required."))
+    if isinstance(exc, core.CryptoDependencyError):
+        return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
+    return _safe_unexpected(operation, exc)
+
+
+def _recover_public_key(pem_content: str, password: str, supplied_public_pem: str | None) -> dict[str, Any]:
+    supplied_fingerprint = None
+    if supplied_public_pem is not None:
+        public_bytes, public_alg, key_type = core.load_key_pem(supplied_public_pem)
+        if public_bytes is None or public_alg is None or key_type != "public":
+            raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
+        supplied_fingerprint = core.get_public_key_fingerprint(public_bytes, public_alg)
+    public_pem, kem_alg, fingerprint = core.recover_public_key_pem(pem_content, password)
+    return {
+        "publicPem": public_pem,
+        "kem": kem_alg,
+        "publicKeyFingerprint": fingerprint,
+        "matchesSuppliedPublicKey": (
+            secrets.compare_digest(fingerprint, supplied_fingerprint) if supplied_fingerprint is not None else None
+        ),
+    }
+
+
+async def recover_public_key(request: Request) -> JSONResponse:
+    try:
+        form = await _form(request, max_files=2, max_fields=1)
+        private_key_file = _form_upload(form, "private_key")
+        password = _workflow_password(form)
+        original_filename = sanitize_download_filename(private_key_file.filename or "", "private.pem")
+        public_filename = sanitize_download_filename(
+            f"{Path(original_filename).stem or 'private'}_public.pem", "recovered_public.pem"
+        )
+        private_pem = await _read_upload_text(private_key_file, cfg.MAX_PEM_BYTES, "Private key file")
+        supplied_public_pem = None
+        if "public_key" in form:
+            supplied_public_pem = await _read_upload_text(
+                _form_upload(form, "public_key"), cfg.MAX_PEM_BYTES, "Public key file"
+            )
+        result = await run_in_threadpool(
+            _run_crypto_operation, _recover_public_key, private_pem, password, supplied_public_pem
+        )
+        return _success_json({**result, "publicFilename": public_filename})
+    except Exception as exc:
+        return _crypto_workflow_error("recover-public-key", exc)
+    finally:
+        await request.close()
+
+
+def _inspect_encrypted_file(encrypted_blob: bytes) -> core.EncryptedFileMetadata:
+    try:
+        return core.inspect_encrypted_file_strict(encrypted_blob)
+    except core.SizeLimitError as exc:
+        raise ApiError(413, "file_too_large", "Encrypted file exceeds the supported size.") from exc
+    except (core.FileFormatError, core.UnsupportedAlgorithmError) as exc:
+        raise ApiError(400, "invalid_encrypted_file", "Upload a supported encrypted PQC file.") from exc
+
+
+async def inspect_file(request: Request) -> JSONResponse:
+    try:
+        form = await _form(request, max_files=1, max_fields=0)
+        encrypted_blob = await _read_upload_bytes(
+            _form_upload(form, "file"), cfg.MAX_ENCRYPTED_FILE_BYTES, "Encrypted file"
+        )
+        metadata = await run_in_threadpool(_run_crypto_operation, _inspect_encrypted_file, encrypted_blob)
+        return _success_json(
+            {
+                "authenticated": False,
+                "metadata": {
+                    "formatVersion": metadata.version,
+                    "kem": metadata.kem_alg,
+                    "headerBytes": metadata.header_bytes,
+                    "kemCiphertextBytes": metadata.kem_ciphertext_bytes,
+                    "x25519CiphertextBytes": metadata.x25519_ciphertext_bytes,
+                    "encryptedPayloadBytes": metadata.encrypted_payload_bytes,
+                    "totalBytes": metadata.total_bytes,
+                },
+            }
+        )
+    except Exception as exc:
+        return _crypto_workflow_error("inspect-file", exc)
+    finally:
+        await request.close()
+
+
+def _verify_encrypted_file(encrypted_blob: bytes, private_pem: str, password: str) -> dict[str, Any]:
+    metadata = _inspect_encrypted_file(encrypted_blob)
+    key_info = core.inspect_key_pem_strict(private_pem)
+    if key_info.get("key_type") != "private":
+        raise core.InvalidKeyFormatError("An encrypted private key is required.")
+    private_key, kem_alg, key_type = core.load_key_pem(private_pem, password)
+    if private_key is None or kem_alg is None or key_type != "private":
+        raise core.AuthenticationFailedError("Could not unlock the private key.")
+    try:
+        if kem_alg != metadata.kem_alg:
+            raise ApiError(
+                400, "verification_failed", "Verification failed. Check the private key and encrypted file integrity."
+            )
+        core.resolve_decryption_kem_algorithms(kem_alg)
+        plaintext, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
+        if plaintext is None:
+            raise ApiError(
+                400, "verification_failed", "Verification failed. Check the private key and encrypted file integrity."
+            )
+        try:
+            return {
+                "verified": True,
+                "kem": detected_alg or kem_alg,
+                "formatVersion": metadata.version,
+                "bytesVerified": len(plaintext),
+                "publicKeyFingerprint": core.get_private_key_public_fingerprint(private_key, kem_alg),
+            }
+        finally:
+            # Verification authenticates in memory; no plaintext enters the HTTP response.
+            del plaintext
+    finally:
+        del private_key
+
+
+async def verify_file(request: Request) -> JSONResponse:
+    try:
+        form = await _form(request, max_files=2, max_fields=1)
+        encrypted_upload = _form_upload(form, "file")
+        private_upload = _form_upload(form, "private_key")
+        password = _workflow_password(form)
+        encrypted_blob = await _read_upload_bytes(encrypted_upload, cfg.MAX_ENCRYPTED_FILE_BYTES, "Encrypted file")
+        private_pem = await _read_upload_text(private_upload, cfg.MAX_PEM_BYTES, "Private key file")
+        result = await run_in_threadpool(
+            _run_crypto_operation, _verify_encrypted_file, encrypted_blob, private_pem, password
+        )
+        return _success_json(result)
+    except Exception as exc:
+        return _crypto_workflow_error("verify-file", exc)
     finally:
         await request.close()
 
@@ -741,6 +1002,10 @@ def create_app() -> ASGIApp:
         Route("/api/health", health, methods=["GET"]),
         Route("/api/keys/inspect", inspect_key, methods=["POST"]),
         Route("/api/keys/generate", generate_keys, methods=["POST"]),
+        Route("/api/keys/change-password", change_key_password, methods=["POST"]),
+        Route("/api/keys/recover-public", recover_public_key, methods=["POST"]),
+        Route("/api/files/inspect", inspect_file, methods=["POST"]),
+        Route("/api/files/verify", verify_file, methods=["POST"]),
         Route("/api/files/encrypt", encrypt_file, methods=["POST"]),
         Route("/api/files/decrypt", decrypt_file, methods=["POST"]),
     ]

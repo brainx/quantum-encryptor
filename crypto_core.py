@@ -319,8 +319,8 @@ def get_public_key_fingerprint(key_bytes: bytes, kem_alg: str) -> str:
     return f"QE1-SHA3-256:{hashlib.sha3_256(fingerprint_input).hexdigest()}"
 
 
-def get_private_key_public_fingerprint(private_key_bytes: bytes, kem_alg: str) -> str:
-    """Fingerprint the public key derived from authenticated private-key bytes."""
+def get_public_key_from_private(private_key_bytes: bytes, kem_alg: str) -> bytes:
+    """Recover canonical public bytes from validated private-key material."""
     _validate_key_material(private_key_bytes, kem_alg, "private")
     mlkem_private_key = _mlkem_key_component(private_key_bytes, kem_alg)
     public_start = cfg.MLKEM768_PKE_PRIVATE_KEY_BYTES
@@ -333,7 +333,13 @@ def get_private_key_public_fingerprint(private_key_bytes: bytes, kem_alg: str) -
             serialization.PublicFormat.Raw,
         )
         public_key = x25519_public_key + public_key
-    return get_public_key_fingerprint(public_key, kem_alg)
+    _validate_key_material(public_key, kem_alg, "public")
+    return public_key
+
+
+def get_private_key_public_fingerprint(private_key_bytes: bytes, kem_alg: str) -> str:
+    """Fingerprint the public key derived from authenticated private-key bytes."""
+    return get_public_key_fingerprint(get_public_key_from_private(private_key_bytes, kem_alg), kem_alg)
 
 
 def resolve_kem_algorithm(kem_alg: Optional[str] = None) -> str:
@@ -1068,6 +1074,52 @@ def inspect_key_pem_strict(pem_content: str) -> Dict[str, Any]:
         result["private_key_format_version"] = parsed.private_envelope.format_version
     result["private_key_kdf"] = parsed.private_envelope.kdf_name
     return result
+
+
+def recover_public_key_pem(pem_content: str, password: str) -> Tuple[str, str, str]:
+    """Recover a public PEM only after authenticating its encrypted private PEM."""
+    key_info = inspect_key_pem_strict(pem_content)
+    if key_info["key_type"] != "private":
+        raise InvalidKeyFormatError("An encrypted private key is required.")
+    if not password:
+        raise PasswordRequiredError("The private-key password is required.")
+    raw_private_key, kem_alg, key_type = load_key_pem(pem_content, password)
+    if raw_private_key is None or kem_alg is None or key_type != "private":
+        raise AuthenticationFailedError("Could not unlock the private key. Check the password and key file.")
+    try:
+        public_key = get_public_key_from_private(raw_private_key, kem_alg)
+        fingerprint = get_public_key_fingerprint(public_key, kem_alg)
+        public_pem = save_key_pem(public_key, kem_alg, "public")
+        if public_pem is None:
+            raise CryptoCoreError("Could not format the recovered public key.")
+        return public_pem, kem_alg, fingerprint
+    finally:
+        del raw_private_key
+
+
+def rewrap_private_key_pem(pem_content: str, current_password: str, new_password: str) -> Tuple[str, str, str]:
+    """Re-encrypt an authenticated private key without changing its key material."""
+    key_info = inspect_key_pem_strict(pem_content)
+    if key_info["key_type"] != "private":
+        raise InvalidKeyFormatError("An encrypted private key is required.")
+    if not current_password:
+        raise PasswordRequiredError("The current private-key password is required.")
+    validate_private_key_password(new_password)
+    if new_password == current_password:
+        raise WeakPasswordError("The new password must be different from the current password.")
+
+    raw_private_key, kem_alg, key_type = load_key_pem(pem_content, current_password)
+    if raw_private_key is None or kem_alg is None or key_type != "private":
+        raise AuthenticationFailedError("Could not unlock the private key. Check the current password and key file.")
+    try:
+        fingerprint = get_private_key_public_fingerprint(raw_private_key, kem_alg)
+        private_pem = save_key_pem(raw_private_key, kem_alg, "private", new_password)
+        if private_pem is None:
+            raise CryptoCoreError("Could not encrypt the private key with the new password.")
+        return private_pem, kem_alg, fingerprint
+    finally:
+        # Drop this reference promptly; Python does not guarantee memory zeroization.
+        del raw_private_key
 
 
 def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:

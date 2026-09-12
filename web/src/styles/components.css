@@ -584,7 +584,7 @@ button:disabled {
 
   .app-mobile-navigation {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     border-bottom: 1px solid var(--color-border);
     background: var(--color-rail);
   }
@@ -606,4 +606,48 @@ button:disabled {
     color: var(--color-text);
     box-shadow: inset 0 -2px 0 var(--color-text);
   }
+}
+
+.batch-encryption-form,
+.verify-file-form,
+.change-key-password-form,
+.batch-results {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.batch-results > h2,
+.batch-results > p {
+  margin: 0;
+}
+
+.batch-file-list {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.batch-file-list > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  background: var(--color-surface);
+}
+
+.batch-file-name {
+  display: grid;
+  flex: 1 1 12rem;
+  min-width: 0;
+  gap: var(--space-1);
+  overflow-wrap: anywhere;
+}
+
+.batch-file-name small {
+  color: var(--color-text-muted);
 }
