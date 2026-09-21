@@ -16,6 +16,7 @@ This project follows a practical semantic-versioning style.
 
 ### Added
 
+- Bounded-memory CLI encryption, decryption, inspection, and verification up to 1 GiB, with two-pass authenticated decryption, atomic output publication, and a configurable lower size limit.
 - Batch decryption with a shared private key, independent authentication errors, explicit plaintext downloads, cancellation, and clear-result controls.
 - Private-key password changes that preserve key identity and existing ciphertext compatibility, with authenticated local API access and a retained download of the updated encrypted key.
 - Batch file encryption with a shared verified recipient, a 25-file and aggregate-size limit, sequential requests, per-file downloads and errors, cancellation, and warnings before leaving undownloaded results.

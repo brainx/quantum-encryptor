@@ -10,10 +10,11 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, NoReturn, Optional, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, NoReturn, Optional, Sequence, TypeVar
 
 from crypto_config import cfg
 import crypto_core as core
+import crypto_stream as streaming
 
 EXIT_SUCCESS = 0
 EXIT_UNEXPECTED = 1
@@ -24,6 +25,14 @@ EXIT_PATH_VIOLATION = 5
 
 # Environment variable name, not a password value.
 DEFAULT_PASSWORD_ENV = "PQC_PRIVATE_KEY_PASSWORD"  # nosec B105
+StreamResult = TypeVar("StreamResult")
+_STREAM_ERRORS = (
+    core.CryptoCoreError,
+    core.FileFormatError,
+    core.SizeLimitError,
+    core.InvalidKeyFormatError,
+    core.UnsupportedAlgorithmError,
+)
 
 
 @dataclass
@@ -267,6 +276,63 @@ def _atomic_write_file(
         ) from exc
 
 
+def _atomic_write_stream(
+    path: Path,
+    write: Callable[[BinaryIO], StreamResult],
+    overwrite: bool,
+    private_file: bool,
+    operation: str,
+    directory_fd: Optional[int] = None,
+) -> StreamResult:
+    """Keep incomplete output private and publish only after the writer succeeds."""
+    mode = _target_file_mode(path, private_file, directory_fd)
+    tmp_name: Optional[str] = None
+    fd: Optional[int] = None
+    try:
+        fd, tmp_name = _create_temporary_output(path, directory_fd)
+        with os.fdopen(fd, "wb", buffering=0) as sink:
+            fd = None
+            result = write(sink)
+            sink.flush()
+            if os.name != "nt":
+                os.fchmod(sink.fileno(), mode)
+            os.fsync(sink.fileno())
+        if os.name == "nt":
+            os.chmod(tmp_name, mode)
+        target = path.name if directory_fd is not None else path
+        if overwrite:
+            os.replace(tmp_name, target, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        else:
+            try:
+                # Link the finished inode without replacing a file created during encryption.
+                os.link(tmp_name, target, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            except FileExistsError as exc:
+                raise AgentCommandError(
+                    "output_exists",
+                    "Output file already exists. Pass --overwrite to replace it.",
+                    EXIT_INVALID_INPUT,
+                    operation,
+                ) from exc
+        try:
+            _fsync_parent_dir(path, directory_fd)
+        except OSError as exc:
+            # Publication is the commit boundary; do not undo a visible, complete output.
+            raise AgentCommandError(
+                "output_durability_failed",
+                "Output was published but directory durability could not be confirmed. "
+                "Verify the output before retrying.",
+                EXIT_UNEXPECTED,
+                operation,
+            ) from exc
+        return result
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_name is not None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_name, dir_fd=directory_fd)
+
+
 def _open_workspace_directory(path: Path, workspace: Path) -> int:
     """Anchor POSIX file operations to a directory without following replacement symlinks."""
     relative_path = path.relative_to(workspace)
@@ -298,6 +364,29 @@ def _open_workspace_input(path: Path, workspace: Path) -> int:
         )
     finally:
         os.close(directory_fd)
+
+
+@contextlib.contextmanager
+def _open_workspace_stream(path_text: str, workspace: Path, max_bytes: int) -> Iterator[tuple[Path, BinaryIO]]:
+    path = _resolve_input_path(path_text, workspace)
+    fd: Optional[int] = None
+    try:
+        fd = _open_workspace_input(path, workspace)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise AgentCommandError("invalid_path", "Input path must be a file.", EXIT_INVALID_INPUT)
+        if file_stat.st_size > max_bytes:
+            raise AgentCommandError(
+                "file_too_large", "Input file exceeds the configured size limit.", EXIT_INVALID_INPUT
+            )
+        with os.fdopen(fd, "rb") as source:
+            fd = None
+            yield path, source
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not read input path.", EXIT_INVALID_INPUT) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _read_resolved_workspace_file_limited(
@@ -395,6 +484,28 @@ def _write_workspace_text(
     return _write_workspace_file(path_text, workspace, data.encode("ascii"), overwrite, operation, private_file)
 
 
+def _write_workspace_stream(
+    path_text: str,
+    workspace: Path,
+    write: Callable[[BinaryIO], StreamResult],
+    overwrite: bool,
+    operation: str,
+    private_file: bool = False,
+) -> tuple[Path, StreamResult]:
+    path = _resolve_output_path(path_text, workspace, overwrite)
+    directory_fd: Optional[int] = None
+    try:
+        if os.name != "nt":
+            directory_fd = _open_workspace_directory(path.parent, workspace)
+        result = _atomic_write_stream(path, write, overwrite, private_file, operation, directory_fd)
+        return path, result
+    except OSError as exc:
+        raise AgentCommandError("write_failed", "Could not write output file.", EXIT_INVALID_INPUT, operation) from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def _password_from_env(env_name: str, operation: str, required: bool) -> Optional[str]:
     password = os.environ.get(env_name)
     if password:
@@ -418,6 +529,15 @@ def _password_from_env(env_name: str, operation: str, required: bool) -> Optiona
 
 
 def _agent_error_from_core(operation: str, exc: Exception) -> AgentCommandError:
+    if isinstance(exc, streaming.OperationCancelled):
+        return AgentCommandError("cancelled", "Operation cancelled.", EXIT_CRYPTO_FAILURE, operation)
+    if isinstance(exc, core.AuthenticationFailedError):
+        return AgentCommandError(
+            "verification_failed" if operation == "verify-file" else "decryption_failed",
+            "Authentication failed. Check private key, password, and ciphertext integrity.",
+            EXIT_CRYPTO_FAILURE,
+            operation,
+        )
     if isinstance(exc, core.PasswordRequiredError):
         return AgentCommandError(
             "password_required", "Private-key password is required.", EXIT_CRYPTO_FAILURE, operation
@@ -496,6 +616,8 @@ def handle_health(_args: argparse.Namespace, workspace: Path) -> int:
             kem=cfg.HYBRID_KEM_ALG,
             kem_component=kem_component,
             workspace=workspace.name,
+            max_stream_file_bytes=cfg.MAX_STREAM_FILE_BYTES,
+            stream_chunk_bytes=cfg.STREAM_CHUNK_BYTES,
         )
     except AgentCommandError as exc:
         if exc.error_code == "backend_unavailable":
@@ -510,6 +632,8 @@ def handle_health(_args: argparse.Namespace, workspace: Path) -> int:
                     "backend_error_code": exc.error_code,
                     "message": exc.message,
                     "workspace": workspace.name,
+                    "max_stream_file_bytes": cfg.MAX_STREAM_FILE_BYTES,
+                    "stream_chunk_bytes": cfg.STREAM_CHUNK_BYTES,
                 }
             )
             return EXIT_SUCCESS
@@ -594,51 +718,60 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
 
 def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     operation = "encrypt"
-    input_path, input_data = _read_workspace_file_limited(args.input, workspace, cfg.MAX_FILE_BYTES)
-    public_key_path, public_key_pem = _read_workspace_text(args.public_key, workspace)
-    output_path = _resolve_output_path(args.output, workspace, args.overwrite)
+    with _open_workspace_stream(args.input, workspace, args.max_file_bytes) as (input_path, source):
+        public_key_path, public_key_pem = _read_workspace_text(args.public_key, workspace)
+        _resolve_output_path(args.output, workspace, args.overwrite)
+        public_key, kem_alg, key_type = core.load_key_pem(public_key_pem)
+        if not public_key or not kem_alg or key_type != "public":
+            raise AgentCommandError(
+                "invalid_key", "Public key file is invalid or has the wrong key type.", EXIT_INVALID_INPUT, operation
+            )
+        if kem_alg != cfg.HYBRID_KEM_ALG:
+            raise AgentCommandError(
+                "legacy_public_key",
+                "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
+                EXIT_INVALID_INPUT,
+                operation,
+            )
+        _resolve_backend(operation)
 
-    public_key, kem_alg, key_type = core.load_key_pem(public_key_pem)
-    if not public_key or not kem_alg or key_type != "public":
-        raise AgentCommandError(
-            "invalid_key", "Public key file is invalid or has the wrong key type.", EXIT_INVALID_INPUT, operation
-        )
-    if kem_alg != cfg.HYBRID_KEM_ALG:
-        raise AgentCommandError(
-            "legacy_public_key",
-            "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
-            EXIT_INVALID_INPUT,
-            operation,
-        )
+        def write_encrypted(sink: BinaryIO, key: bytes = public_key) -> core.EncryptedFileMetadata:
+            return streaming.encrypt_stream(source, sink, key, cfg.HYBRID_KEM_ALG, max_file_bytes=args.max_file_bytes)
 
-    _resolve_backend(operation)
-    with _suppress_library_output():
-        encrypted_blob = core.encrypt_file_pro(input_data, public_key, cfg.HYBRID_KEM_ALG)
-    del input_data
-    del public_key
-
-    if encrypted_blob is None:
-        raise AgentCommandError("encryption_failed", "Encryption failed.", EXIT_CRYPTO_FAILURE, operation)
-
-    _write_workspace_file(args.output, workspace, encrypted_blob, args.overwrite, operation)
+        try:
+            with _suppress_library_output():
+                output_path, metadata = _write_workspace_stream(
+                    args.output,
+                    workspace,
+                    write_encrypted,
+                    args.overwrite,
+                    operation,
+                )
+        except _STREAM_ERRORS as exc:
+            raise _agent_error_from_core(operation, exc) from exc
+        finally:
+            del write_encrypted
+            del public_key
     return _success(
         operation,
-        kem=cfg.HYBRID_KEM_ALG,
+        kem=metadata.kem_alg,
         input=_relative_to_workspace(input_path, workspace),
         public_key=_relative_to_workspace(public_key_path, workspace),
         output=_relative_to_workspace(output_path, workspace),
-        bytes_written=len(encrypted_blob),
+        bytes_written=metadata.total_bytes,
     )
 
 
 def handle_inspect_file(args: argparse.Namespace, workspace: Path) -> int:
     operation = "inspect-file"
-    input_path, encrypted_blob = _read_workspace_file_limited(args.input, workspace, cfg.MAX_ENCRYPTED_FILE_BYTES)
-    try:
-        metadata = core.inspect_encrypted_file_strict(encrypted_blob)
-    except Exception as exc:
-        raise _agent_error_from_core(operation, exc) from exc
-
+    with _open_workspace_stream(args.input, workspace, streaming.encrypted_size_limit(args.max_file_bytes)) as (
+        input_path,
+        source,
+    ):
+        try:
+            metadata = streaming.inspect_stream(source, max_file_bytes=args.max_file_bytes)
+        except _STREAM_ERRORS as exc:
+            raise _agent_error_from_core(operation, exc) from exc
     return _success(
         operation,
         input=_relative_to_workspace(input_path, workspace),
@@ -678,82 +811,103 @@ def _load_required_private_key(
 
 def handle_decrypt(args: argparse.Namespace, workspace: Path) -> int:
     operation = "decrypt"
-    encrypted_path, encrypted_blob = _read_workspace_file_limited(args.input, workspace, cfg.MAX_ENCRYPTED_FILE_BYTES)
-    if not encrypted_blob:
-        raise AgentCommandError("invalid_input", "Encrypted input file is empty.", EXIT_INVALID_INPUT, operation)
-
-    output_path = _resolve_output_path(args.output, workspace, args.overwrite)
-    private_key_path, private_key, kem_alg = _load_required_private_key(
-        args.private_key,
-        args.password_env,
-        workspace,
-        operation,
-    )
-
-    _resolve_decryption_backends(operation, kem_alg)
-    with _suppress_library_output():
-        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
-    del encrypted_blob
-    del private_key
-
-    if decrypted_data is None:
-        raise AgentCommandError(
-            "decryption_failed",
-            "Decryption failed. Check private key, password, and ciphertext integrity.",
-            EXIT_CRYPTO_FAILURE,
+    with _open_workspace_stream(args.input, workspace, streaming.encrypted_size_limit(args.max_file_bytes)) as (
+        encrypted_path,
+        source,
+    ):
+        if os.fstat(source.fileno()).st_size == 0:
+            raise AgentCommandError("invalid_input", "Encrypted input file is empty.", EXIT_INVALID_INPUT, operation)
+        _resolve_output_path(args.output, workspace, args.overwrite)
+        private_key_path, private_key, kem_alg = _load_required_private_key(
+            args.private_key,
+            args.password_env,
+            workspace,
             operation,
         )
 
-    _write_workspace_file(args.output, workspace, decrypted_data, args.overwrite, operation, private_file=True)
-    bytes_written = len(decrypted_data)
-    del decrypted_data
+        def write_decrypted(sink: BinaryIO, key: bytes = private_key) -> core.EncryptedFileMetadata:
+            return streaming.decrypt_stream(
+                source, sink, key, expected_kem_alg=kem_alg, max_file_bytes=args.max_file_bytes
+            )
+
+        try:
+            _resolve_decryption_backends(operation, kem_alg)
+            with _suppress_library_output():
+                output_path, metadata = _write_workspace_stream(
+                    args.output,
+                    workspace,
+                    write_decrypted,
+                    args.overwrite,
+                    operation,
+                    private_file=True,
+                )
+        except _STREAM_ERRORS as exc:
+            raise _agent_error_from_core(operation, exc) from exc
+        finally:
+            del write_decrypted
+            del private_key
     return _success(
         operation,
-        kem=detected_alg or kem_alg,
+        kem=metadata.kem_alg,
         input=_relative_to_workspace(encrypted_path, workspace),
         private_key=_relative_to_workspace(private_key_path, workspace),
         output=_relative_to_workspace(output_path, workspace),
-        bytes_written=bytes_written,
+        bytes_written=metadata.encrypted_payload_bytes - cfg.AES_TAG_BYTES,
     )
 
 
 def handle_verify_file(args: argparse.Namespace, workspace: Path) -> int:
     operation = "verify-file"
-    encrypted_path, encrypted_blob = _read_workspace_file_limited(args.input, workspace, cfg.MAX_ENCRYPTED_FILE_BYTES)
-    try:
-        metadata = core.inspect_encrypted_file_strict(encrypted_blob)
-    except Exception as exc:
-        raise _agent_error_from_core(operation, exc) from exc
-
-    private_key_path, private_key, kem_alg = _load_required_private_key(
-        args.private_key,
-        args.password_env,
-        workspace,
-        operation,
-    )
-
-    _resolve_decryption_backends(operation, kem_alg)
-    with _suppress_library_output():
-        decrypted_data, detected_alg = core.decrypt_file_pro(encrypted_blob, private_key, expected_kem_alg=kem_alg)
-    del encrypted_blob
-    del private_key
-
-    if decrypted_data is None:
-        raise AgentCommandError(
-            "verification_failed",
-            "Verification failed. Check private key, password, and ciphertext integrity.",
-            EXIT_CRYPTO_FAILURE,
+    with _open_workspace_stream(args.input, workspace, streaming.encrypted_size_limit(args.max_file_bytes)) as (
+        encrypted_path,
+        source,
+    ):
+        try:
+            streaming.inspect_stream(source, max_file_bytes=args.max_file_bytes)
+            source.seek(0)
+        except _STREAM_ERRORS as exc:
+            raise _agent_error_from_core(operation, exc) from exc
+        private_key_path, private_key, kem_alg = _load_required_private_key(
+            args.private_key,
+            args.password_env,
+            workspace,
             operation,
         )
-
-    bytes_verified = len(decrypted_data)
-    del decrypted_data
+        try:
+            _resolve_decryption_backends(operation, kem_alg)
+            with _suppress_library_output():
+                metadata = streaming.verify_stream(
+                    source, private_key, expected_kem_alg=kem_alg, max_file_bytes=args.max_file_bytes
+                )
+        except _STREAM_ERRORS as exc:
+            raise _agent_error_from_core(operation, exc) from exc
+        finally:
+            del private_key
     return _success(
         operation,
-        kem=detected_alg or metadata.kem_alg,
+        kem=metadata.kem_alg,
         input=_relative_to_workspace(encrypted_path, workspace),
         private_key=_relative_to_workspace(private_key_path, workspace),
-        bytes_verified=bytes_verified,
+        bytes_verified=metadata.encrypted_payload_bytes - cfg.AES_TAG_BYTES,
+    )
+
+
+def _stream_size_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer number of bytes") from exc
+    if not 1 <= limit <= cfg.MAX_STREAM_FILE_BYTES:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {cfg.MAX_STREAM_FILE_BYTES} bytes")
+    return limit
+
+
+def _add_stream_limit_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-file-bytes",
+        type=_stream_size_limit,
+        default=cfg.MAX_STREAM_FILE_BYTES,
+        help="Maximum plaintext size in bytes (may lower the streaming limit).",
     )
 
 
@@ -788,10 +942,12 @@ def build_parser() -> argparse.ArgumentParser:
     encrypt.add_argument("--public-key", required=True)
     encrypt.add_argument("--output", required=True)
     encrypt.add_argument("--overwrite", action="store_true")
+    _add_stream_limit_argument(encrypt)
     encrypt.set_defaults(handler=handle_encrypt)
 
     inspect_file = subparsers.add_parser("inspect-file", help="Inspect an encrypted workspace file.")
     inspect_file.add_argument("--input", required=True)
+    _add_stream_limit_argument(inspect_file)
     inspect_file.set_defaults(handler=handle_inspect_file)
 
     decrypt = subparsers.add_parser("decrypt", help="Decrypt a workspace file.")
@@ -800,12 +956,14 @@ def build_parser() -> argparse.ArgumentParser:
     decrypt.add_argument("--output", required=True)
     _add_password_env_argument(decrypt)
     decrypt.add_argument("--overwrite", action="store_true")
+    _add_stream_limit_argument(decrypt)
     decrypt.set_defaults(handler=handle_decrypt)
 
     verify_file = subparsers.add_parser("verify-file", help="Authenticate an encrypted workspace file without output.")
     verify_file.add_argument("--input", required=True)
     verify_file.add_argument("--private-key", required=True)
     _add_password_env_argument(verify_file)
+    _add_stream_limit_argument(verify_file)
     verify_file.set_defaults(handler=handle_verify_file)
 
     inspect_key = subparsers.add_parser("inspect-key", help="Inspect a PQC PEM key.")
@@ -833,6 +991,10 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             operation = args.command
         _failure(operation, exc.error_code, exc.message)
         return exc.exit_code
+    except KeyboardInterrupt:
+        operation = args.command if args is not None else "parse"
+        _failure(operation, "cancelled", "Operation cancelled.")
+        return EXIT_CRYPTO_FAILURE
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else EXIT_UNEXPECTED
     except Exception:

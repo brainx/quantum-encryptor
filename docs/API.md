@@ -33,6 +33,10 @@ quantum-encryptor-agent health --json
 
 Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and existing output files are rejected unless the command includes `--overwrite`. Private-key and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
 
+File commands use the `crypto_stream` module with 1 MiB payload blocks and a default 1 GiB plaintext limit. `--max-file-bytes BYTES` can lower that limit on `encrypt`, `decrypt`, `inspect-file`, and `verify-file`. The bytes-based `crypto_core` functions and existing web routes keep their 100 MiB limit. Streaming operations preserve the v4 container format and authenticated legacy decryption; existing small-file containers remain compatible.
+
+`crypto_stream.encrypt_stream`, `decrypt_stream`, `inspect_stream`, and `verify_stream` operate on binary file objects and return `EncryptedFileMetadata`. `max_file_bytes` bounds plaintext plus separately bounded container overhead. Progress reports identify the phase and byte counts; an optional cancellation callback is checked between chunks. Callers must keep encryption and decryption sinks private and publish them only after successful return. Decryption owns a private ciphertext snapshot, authenticates it in a discard pass, and then decrypts the same snapshot into the caller's staged sink before final authentication. Verification never writes plaintext to an output sink. Temporary storage and Python-managed memory do not provide secure-erasure guarantees.
+
 Private-key generation, decryption, and verification read passwords from an environment variable. The default variable is `PQC_PRIVATE_KEY_PASSWORD`; override it with `--password-env NAME`. `inspect-key` does not unlock an encrypted private key by default. Supplying `--password-env NAME` explicitly requests an authenticated unlock and adds the corresponding `public_key_fingerprint` only when the password and private-key structure validate.
 
 ## Local Web API

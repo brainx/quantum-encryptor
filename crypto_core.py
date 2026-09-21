@@ -11,7 +11,7 @@ import ctypes.util
 import importlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Protocol
 
 # Configuration
 from crypto_config import cfg
@@ -92,6 +92,29 @@ class EncryptedFileMetadata:
     x25519_ciphertext_bytes: int
     encrypted_payload_bytes: int
     total_bytes: int
+
+
+@dataclass(frozen=True)
+class EncryptedFileHeader:
+    """Bounded, unauthenticated container header shared by bytes and stream readers."""
+
+    version: int
+    kem_alg: str
+    header_aad: bytes
+    ciphertext_kem: bytes
+    x25519_ephemeral_public: bytes
+    nonce: bytes
+
+    def metadata(self, payload_bytes: int) -> EncryptedFileMetadata:
+        return EncryptedFileMetadata(
+            version=self.version,
+            kem_alg=self.kem_alg,
+            header_bytes=len(self.header_aad),
+            kem_ciphertext_bytes=len(self.ciphertext_kem),
+            x25519_ciphertext_bytes=len(self.x25519_ephemeral_public),
+            encrypted_payload_bytes=payload_bytes,
+            total_bytes=len(self.header_aad) + payload_bytes,
+        )
 
 
 @dataclass(frozen=True)
@@ -1122,92 +1145,74 @@ def rewrap_private_key_pem(pem_content: str, current_password: str, new_password
         del raw_private_key
 
 
+class _BinaryReader(Protocol):
+    def read(self, size: int = -1) -> bytes: ...
+
+
+def _read_encrypted_file_header(source: _BinaryReader) -> EncryptedFileHeader:
+    header = bytearray()
+
+    def read_exact(size: int, label: str) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            part = source.read(size - len(data))
+            if not isinstance(part, bytes) or len(part) > size - len(data):
+                raise OSError("Binary source returned invalid data.")
+            if not part:
+                raise FileFormatError(f"Truncated header ({label}).")
+            data.extend(part)
+        header.extend(data)
+        return bytes(data)
+
+    fixed = read_exact(struct.calcsize(cfg.HEADER_BASE_FORMAT), "fixed header")
+    magic, version = struct.unpack(cfg.HEADER_BASE_FORMAT, fixed)
+    if magic != cfg.MAGIC_BYTES:
+        raise FileFormatError("Invalid magic bytes.")
+    if version not in cfg.SUPPORTED_FORMAT_VERSIONS:
+        raise FileFormatError("Unsupported encrypted-file format version.")
+    alg_len = struct.unpack(">H", read_exact(2, "KEM algo len"))[0]
+    if alg_len == 0 or alg_len > cfg.MAX_KEM_ALG_NAME_BYTES:
+        raise FileFormatError("Implausible KEM algorithm length in header.")
+    try:
+        kem_alg = read_exact(alg_len, "KEM algo name").decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FileFormatError("KEM algorithm name is not valid UTF-8.") from exc
+    if version == cfg.FORMAT_VERSION:
+        if not is_hybrid_key_algorithm(kem_alg):
+            raise UnsupportedAlgorithmError("Version 4 requires a supported hybrid suite.")
+    elif not is_allowed_kem_algorithm(kem_alg):
+        raise UnsupportedAlgorithmError("Unsupported legacy KEM algorithm in encrypted file.")
+    kem_ct_len = struct.unpack(">I", read_exact(4, "KEM CT len"))[0]
+    if kem_ct_len == 0 or kem_ct_len > cfg.MAX_KEM_CIPHERTEXT_BYTES:
+        raise FileFormatError("Implausible KEM ciphertext length.")
+    ciphertext_kem = read_exact(kem_ct_len, "KEM CT")
+    x25519_public = (
+        read_exact(cfg.X25519_KEY_BYTES, "X25519 ephemeral public key") if version == cfg.FORMAT_VERSION else b""
+    )
+    nonce = read_exact(cfg.AES_NONCE_BYTES, "Nonce")
+    return EncryptedFileHeader(version, kem_alg, bytes(header), ciphertext_kem, x25519_public, nonce)
+
+
 def _parse_encrypted_file_parts(encrypted_blob: bytes) -> EncryptedFileParts:
     if not encrypted_blob:
         raise FileFormatError("Encrypted input is empty.")
     if len(encrypted_blob) > cfg.MAX_ENCRYPTED_FILE_BYTES:
         raise SizeLimitError("Encrypted input exceeds maximum supported size.")
-
-    input_buffer = io.BytesIO(encrypted_blob)
-    try:
-        header_fixed_size = struct.calcsize(cfg.HEADER_BASE_FORMAT)
-        header_fixed_part = input_buffer.read(header_fixed_size)
-        if len(header_fixed_part) < header_fixed_size:
-            raise FileFormatError("File too short - truncated fixed header.")
-
-        magic, version = struct.unpack(cfg.HEADER_BASE_FORMAT, header_fixed_part)
-        if magic != cfg.MAGIC_BYTES:
-            raise FileFormatError("Invalid magic bytes.")
-        if version not in cfg.SUPPORTED_FORMAT_VERSIONS:
-            raise FileFormatError("Unsupported encrypted-file format version.")
-
-        kem_alg_len_bytes = input_buffer.read(struct.calcsize(">H"))
-        if len(kem_alg_len_bytes) < struct.calcsize(">H"):
-            raise FileFormatError("Truncated header (KEM algo len).")
-        kem_alg_len = struct.unpack(">H", kem_alg_len_bytes)[0]
-        if kem_alg_len == 0 or kem_alg_len > cfg.MAX_KEM_ALG_NAME_BYTES:
-            raise FileFormatError("Implausible KEM algorithm length in header.")
-
-        kem_alg_bytes = input_buffer.read(kem_alg_len)
-        if len(kem_alg_bytes) < kem_alg_len:
-            raise FileFormatError("Truncated header (KEM algo name).")
-        try:
-            kem_alg_from_file = kem_alg_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise FileFormatError("KEM algorithm name is not valid UTF-8.") from exc
-        if version == cfg.FORMAT_VERSION:
-            if not is_hybrid_key_algorithm(kem_alg_from_file):
-                raise UnsupportedAlgorithmError("Version 4 requires a supported hybrid suite.")
-        elif not is_allowed_kem_algorithm(kem_alg_from_file):
-            raise UnsupportedAlgorithmError("Unsupported legacy KEM algorithm in encrypted file.")
-
-        kem_ct_len_bytes = input_buffer.read(struct.calcsize(">I"))
-        if len(kem_ct_len_bytes) < struct.calcsize(">I"):
-            raise FileFormatError("Truncated header (KEM CT len).")
-        kem_ct_len = struct.unpack(">I", kem_ct_len_bytes)[0]
-        if kem_ct_len == 0 or kem_ct_len > cfg.MAX_KEM_CIPHERTEXT_BYTES:
-            raise FileFormatError("Implausible KEM ciphertext length.")
-
-        ciphertext_kem = input_buffer.read(kem_ct_len)
-        if len(ciphertext_kem) < kem_ct_len:
-            raise FileFormatError("Truncated header (KEM CT).")
-
-        x25519_ephemeral_public = b""
-        if version == cfg.FORMAT_VERSION:
-            x25519_ephemeral_public = input_buffer.read(cfg.X25519_KEY_BYTES)
-            if len(x25519_ephemeral_public) < cfg.X25519_KEY_BYTES:
-                raise FileFormatError("Truncated header (X25519 ephemeral public key).")
-
-        nonce = input_buffer.read(cfg.AES_NONCE_BYTES)
-        if len(nonce) < cfg.AES_NONCE_BYTES:
-            raise FileFormatError("Truncated header (Nonce).")
-
-        header_aad = encrypted_blob[: input_buffer.tell()]
+    with io.BytesIO(encrypted_blob) as input_buffer:
+        header = _read_encrypted_file_header(input_buffer)
         encrypted_data_aes = input_buffer.read()
-        if len(encrypted_data_aes) < cfg.AES_TAG_BYTES:
-            raise FileFormatError("AES-GCM payload is shorter than the authentication tag.")
-        if len(encrypted_data_aes) > cfg.MAX_FILE_BYTES + cfg.AES_TAG_BYTES:
-            raise SizeLimitError("AES-GCM payload exceeds maximum supported size.")
-
-        metadata = EncryptedFileMetadata(
-            version=version,
-            kem_alg=kem_alg_from_file,
-            header_bytes=len(header_aad),
-            kem_ciphertext_bytes=len(ciphertext_kem),
-            x25519_ciphertext_bytes=len(x25519_ephemeral_public),
-            encrypted_payload_bytes=len(encrypted_data_aes),
-            total_bytes=len(encrypted_blob),
-        )
-        return EncryptedFileParts(
-            metadata=metadata,
-            header_aad=header_aad,
-            ciphertext_kem=ciphertext_kem,
-            x25519_ephemeral_public=x25519_ephemeral_public,
-            nonce=nonce,
-            encrypted_data_aes=encrypted_data_aes,
-        )
-    finally:
-        input_buffer.close()
+    if len(encrypted_data_aes) < cfg.AES_TAG_BYTES:
+        raise FileFormatError("AES-GCM payload is shorter than the authentication tag.")
+    if len(encrypted_data_aes) > cfg.MAX_FILE_BYTES + cfg.AES_TAG_BYTES:
+        raise SizeLimitError("AES-GCM payload exceeds maximum supported size.")
+    return EncryptedFileParts(
+        metadata=header.metadata(len(encrypted_data_aes)),
+        header_aad=header.header_aad,
+        ciphertext_kem=header.ciphertext_kem,
+        x25519_ephemeral_public=header.x25519_ephemeral_public,
+        nonce=header.nonce,
+        encrypted_data_aes=encrypted_data_aes,
+    )
 
 
 def inspect_encrypted_file_strict(encrypted_blob: bytes) -> EncryptedFileMetadata:

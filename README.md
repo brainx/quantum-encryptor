@@ -32,6 +32,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Private-Key Password Changes**: Download a newly password-protected copy of the same private key without replacing your public key or re-encrypting existing files
 - **Public-Key Recovery**: Recover the public PEM from an unlocked private key and check whether a supplied public key matches
 - **File Verification**: Inspect encrypted-file metadata and authenticate an entire file without downloading its plaintext
+- **Large-file CLI**: Encrypt, decrypt, inspect, and verify files up to 1 GiB using bounded buffers and authenticated, atomic output
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Screenshots
@@ -254,6 +255,10 @@ Verification requires the native backend and decrypts the bounded file in local 
 These endpoints follow the existing local API authentication, exact-origin, no-store, and upload-cleanup rules. Password changes, public-key recovery, file inspection, and file verification share one worker admission slot, retained until the operation finishes even if its HTTP request is cancelled. Busy requests receive `429` with `Retry-After: 1`; passwords are bounded to 4096 UTF-8 bytes and PEM files to the advertised limit.
 
 ## Automation Usage
+
+The CLI file commands process payloads in 1 MiB blocks with a 1 GiB plaintext limit. Use `--max-file-bytes BYTES` on `encrypt`, `decrypt`, `inspect-file`, or `verify-file` to enforce a smaller limit. The existing web workflows and bytes-based Python APIs retain their 100 MiB limit. Encrypted-container limits additionally allow bounded header and authentication overhead; older clients still reject files above their own size limit even though the file format is unchanged.
+
+Streaming decryption first snapshots ciphertext into private temporary storage and authenticates the complete snapshot while discarding plaintext. Only then does it decrypt the same snapshot into a private staged output. The requested destination is published atomically after finalization; failures before publication leave any existing destination unchanged. A directory-sync failure after publication returns `output_durability_failed`: the output exists, but its crash durability could not be confirmed, so verify it before retrying. Decrypted output uses POSIX mode `0600`. Ciphertext snapshots and staged plaintext consume temporary disk space; cleanup releases files but cannot guarantee secure erasure, and a forced termination can leave a staged output file. Allow free disk space for the snapshot and output in addition to the source file.
 
 Automation tools can use the deterministic JSON CLI instead of driving the browser interface. Run commands from the repository workspace and pass only workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and accidental output overwrites are rejected.
 
