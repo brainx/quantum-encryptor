@@ -10,6 +10,7 @@ import { InspectKeyWorkflow } from "../features/inspect/InspectKeyWorkflow";
 import { ChangeKeyPasswordWorkflow } from "../features/keys/ChangeKeyPasswordWorkflow";
 import { RecoverPublicKeyWorkflow } from "../features/keys/RecoverPublicKeyWorkflow";
 import { VerifyFileWorkflow } from "../features/inspect/VerifyFileWorkflow";
+import { LargeFilesWorkflow } from "../features/large-files/LargeFilesWorkflow";
 import { AppShell } from "./AppShell";
 import type { View } from "./navigation";
 
@@ -17,6 +18,7 @@ const SENSITIVE_RESULT_CONFIRMATION = "Generated keys are still available. Leave
 const BATCH_RESULT_CONFIRMATION = "Encrypted files are waiting to be downloaded. Leave this workflow and clear them?";
 const PLAINTEXT_RESULT_CONFIRMATION = "Decrypted files are still available in this tab. Leave this workflow and clear them?";
 const UPDATED_KEY_CONFIRMATION = "The updated private key is still available. Leave this workflow and clear it?";
+const LARGE_FILE_CONFIRMATION = "A large-file operation or temporary result is still available. Leave and request cleanup? Interrupted cleanup will finish when the job expires.";
 
 export default function App() {
   const [activeView, setActiveView] = useState<View>("encrypt");
@@ -26,6 +28,7 @@ export default function App() {
   const [hasBatchResults, setHasBatchResults] = useState(false);
   const [hasPlaintextResults, setHasPlaintextResults] = useState(false);
   const [hasUpdatedKey, setHasUpdatedKey] = useState(false);
+  const [hasLargeFileWork, setHasLargeFileWork] = useState(false);
   const healthRequestId = useRef(0);
   const initialHealthRequest = useRef<Promise<Health> | null>(null);
 
@@ -56,7 +59,7 @@ export default function App() {
   }, [loadHealth]);
 
   useLayoutEffect(() => {
-    if (!hasGeneratedKeys && !hasBatchResults && !hasPlaintextResults && !hasUpdatedKey) return;
+    if (!hasGeneratedKeys && !hasBatchResults && !hasPlaintextResults && !hasUpdatedKey && !hasLargeFileWork) return;
 
     function warnBeforeUnload(event: BeforeUnloadEvent) {
       event.preventDefault();
@@ -65,7 +68,7 @@ export default function App() {
 
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
-  }, [hasGeneratedKeys, hasBatchResults, hasPlaintextResults, hasUpdatedKey]);
+  }, [hasGeneratedKeys, hasBatchResults, hasPlaintextResults, hasUpdatedKey, hasLargeFileWork]);
 
   function navigate(nextView: View) {
     if (nextView === activeView) return;
@@ -84,6 +87,10 @@ export default function App() {
     if (activeView === "change-password" && hasUpdatedKey) {
       if (!window.confirm(UPDATED_KEY_CONFIRMATION)) return;
       setHasUpdatedKey(false);
+    }
+    if (activeView === "large-files" && hasLargeFileWork) {
+      if (!window.confirm(LARGE_FILE_CONFIRMATION)) return;
+      setHasLargeFileWork(false);
     }
     setActiveView(nextView);
   }
@@ -122,6 +129,9 @@ export default function App() {
       {activeView === "inspect" && <InspectKeyWorkflow health={health} />}
       {activeView === "verify-file" && <VerifyFileWorkflow health={health} />}
       {activeView === "recover-public" && <RecoverPublicKeyWorkflow health={health} />}
+      {activeView === "large-files" && (
+        <LargeFilesWorkflow health={health} onSensitiveResultChange={setHasLargeFileWork} />
+      )}
       {activeView === "change-password" && (
         <ChangeKeyPasswordWorkflow health={health} onSensitiveResultChange={setHasUpdatedKey} />
       )}

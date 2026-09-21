@@ -43,7 +43,7 @@ Private-key generation, decryption, and verification read passwords from an envi
 
 The custom web UI is served by `api_app.py` at exactly `http://127.0.0.1:<PORT>` (`http://127.0.0.1:4000` by default). `PORT` determines the sole trusted UI/API authority: `localhost`, IPv6 and other loopback addresses, and sibling ports are not aliases. Setting `QUANTUM_ENCRYPTOR_ENABLE_VITE_DEV=1` on both the API and Vite processes adds only `http://127.0.0.1:4001` for Vite development and its `/api` proxy; every other value leaves that exception disabled.
 
-`GET /api/health` sets the per-process local API token as an `HttpOnly`, `SameSite=Strict` cookie only when the direct `Host` is an allowed authority and, if an `Origin` header is present, it exactly matches that Host. The token is never disclosed in API response bodies, and forwarding headers are not trusted. For a state-changing `/api/*` request, cookie authentication requires an allowed, exactly parsed `Origin` equal to the direct allowed `Host`. Clients without an `Origin` header must present the token in `X-Quantum-Encryptor-Token` (for programmatic clients configured with `QUANTUM_ENCRYPTOR_API_TOKEN`); if that header is present but invalid, the request is rejected rather than falling back to the cookie. Requests without a valid token are rejected before route handlers parse uploaded files or form data. All responses include a restrictive `Content-Security-Policy` (including `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`.
+`GET /api/health` sets the per-process local API token as an `HttpOnly`, `SameSite=Strict` cookie only when the direct `Host` is an allowed authority and, if an `Origin` header is present, it exactly matches that Host. The token is never disclosed in API response bodies, and forwarding headers are not trusted. For a state-changing `/api/*` request, cookie authentication requires an allowed, exactly parsed `Origin` equal to the direct allowed `Host`. Clients without an `Origin` header must present the token in `X-Quantum-Encryptor-Token` (for programmatic clients configured with `QUANTUM_ENCRYPTOR_API_TOKEN`); if that header is present but invalid, the request is rejected rather than falling back to the cookie. Requests without a valid token are rejected before route handlers parse uploaded files or form data. All responses include a restrictive `Content-Security-Policy` (including `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. The app HTML document uses `Referrer-Policy: same-origin` so browser form downloads carry the exact Origin required for authorization; cross-origin referrers remain suppressed.
 
 ### Health capability contract
 
@@ -67,6 +67,28 @@ The custom web UI is served by `api_app.py` at exactly `http://127.0.0.1:<PORT>`
 Every HTTP response under `/api/*` carries `Cache-Control: no-store` and `Pragma: no-cache`, including JSON successes and errors, authorization or body-limit middleware rejections, unmatched API routes, framework-generated 500 responses, and file downloads. The policy is applied centrally so new API handlers inherit it; static UI responses outside `/api/*` keep their own cache behavior. These directives reduce retention by conforming HTTP caches but do not securely erase browser or process memory.
 
 Key generation returns the public and encrypted private PEM directly in one response. The server does not retain a temporary downloadable key pair or provide a recovery endpoint; save both values immediately because explicit clearing removes the app's references and browser lifecycle transitions may lose the tab state. Browser history may also preserve and later restore a suspended document's state.
+
+### Large-file jobs
+
+Health additionally advertises `largeFiles: {available, maxPlaintextBytes, maxEncryptedBytes, resultTtlSeconds}`. Operation-specific crypto capabilities still apply. Plaintext is capped at 1 GiB, container overhead is separately bounded, and the job deadline is 900 seconds from reservation.
+
+All job routes require the existing local authentication and origin checks. IDs are resource identifiers, not bearer credentials. Every route below uses `POST`, except raw upload, which uses `PUT`.
+
+| Route | Request | Response |
+| --- | --- | --- |
+| `/api/jobs` | Multipart `mode` (`encrypt`, `decrypt`, `verify`), `filename`, decimal `size` | `{ok: true, job}` reservation |
+| `/api/jobs/{id}/upload` | Raw `application/octet-stream`, exactly the reserved size | `{ok: true, job}` |
+| `/api/jobs/{id}/start` | Multipart PEM file `key`, plus `password` for private-key operations | `{ok: true, job}` |
+| `/api/jobs/{id}/status` | Empty body | `{ok: true, job}` |
+| `/api/jobs/{id}/cancel` | Empty body | `{ok: true, job}`; active work may remain `cancelling` |
+| `/api/jobs/{id}/clear` | Empty body | `{ok: true}` after cleanup; `409` while work/download owns files |
+| `/api/jobs/{id}/download` | Browser form POST with matching allowed Origin and HttpOnly session cookie | Streaming attachment; header-token-only clients are rejected |
+
+Snapshots contain `id`, `mode`, `state`, `phase`, `processedBytes`, `totalBytes`, and ISO `expiresAt`. States are `awaiting_upload`, `uploading`, `ready`, `running`, `cancelling`, `complete`, `failed`, and `cancelled`. Only complete jobs expose `result: {filename, bytes}` or the existing verification report under `verification`; failures expose a safe `error: {code, message}`. Phase counters can reset between authentication and decryption passes. No password, key, payload, or temporary path appears in status.
+
+The service reserves one worker slot and checks temporary disk capacity before receiving file bytes. A completed job releases the worker but retains its result until clear/expiry. A second reservation returns `429 server_busy` with `Retry-After: 1`. Unknown, expired, or cleared IDs return `410 job_expired`; clearing an unknown ID is idempotent. Do not automatically replay reservation, upload, or start after an uncertain response. Retain a known ID and poll status; abandoned jobs expire automatically.
+
+Cancellation is cooperative. File handles and worker admission remain owned until actual I/O/native work finishes. Downloads retain ownership through the final response send, so cancellation/expiry closes their files only after readers stop. Shutdown cancels work, waits for ownership to settle, and closes private temporary files. Storage is process-local and not restart-resumable; deletion and reference clearing do not guarantee secure erasure.
 
 ### Public-key fingerprint contract
 

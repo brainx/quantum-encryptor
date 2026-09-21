@@ -237,6 +237,86 @@ async function runFileVerification(page, temporaryDirectory, privateKeyPath, enc
   }
 }
 
+async function downloadLargeResult(page, destination) {
+  const context = page.context();
+  const watchedPages = new Set();
+  let acceptDownload;
+  let rejectDownload;
+  const received = new Promise((resolve, reject) => { acceptDownload = resolve; rejectDownload = reject; });
+  const timer = setTimeout(() => rejectDownload(new Error("The large-file attachment did not download.")), 30000);
+  const onDownload = (download) => acceptDownload(download);
+  const watch = (candidate) => { watchedPages.add(candidate); candidate.on("download", onDownload); };
+  context.pages().forEach(watch);
+  context.on("page", watch);
+  try {
+    await page.getByRole("button", { name: "Download result", exact: true }).click();
+    await saveDownload(await received, destination);
+  } finally {
+    clearTimeout(timer);
+    context.off("page", watch);
+    for (const candidate of watchedPages) candidate.off("download", onDownload);
+  }
+}
+
+async function runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, privateKeyPath) {
+  const plaintext = Buffer.alloc(2 * 1024 * 1024 + 17);
+  for (let index = 0; index < plaintext.length; index += 1) plaintext[index] = index % 251;
+  const inputPath = path.join(temporaryDirectory, "large-input.bin");
+  const encryptedPath = path.join(temporaryDirectory, "large-input.bin.pqc");
+  const decryptedPath = path.join(temporaryDirectory, "large-output.bin");
+  await writeFile(inputPath, plaintext);
+  const responses = [];
+  const onResponse = (response) => {
+    if (/\/api\/jobs\/[^/]+\/download$/.test(new URL(response.url()).pathname)) responses.push(response);
+  };
+  page.context().on("response", onResponse);
+  try {
+    await page.getByRole("navigation", { name: "Workflows", exact: true }).getByRole("button", { name: "Large files", exact: true }).click();
+    await page.getByRole("heading", { name: "Large files", exact: true }).waitFor();
+    await page.getByLabel("File to encrypt", { exact: true }).setInputFiles(inputPath);
+    await page.getByLabel("Recipient public key", { exact: true }).setInputFiles(publicKeyPath);
+    await page.getByRole("button", { name: "Encrypt large file", exact: true }).click();
+    await page.getByRole("button", { name: "Download result", exact: true }).waitFor();
+    assert.equal(responses.length, 0, "Large-file encryption must wait for an explicit download.");
+    await downloadLargeResult(page, encryptedPath);
+    await page.getByText("Download requested. The browser controls whether it finishes.", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
+    await page.getByRole("button", { name: "Encrypt large file", exact: true }).waitFor();
+
+    await page.getByLabel("Operation", { exact: true }).selectOption("decrypt");
+    await page.getByLabel("Encrypted file", { exact: true }).setInputFiles(encryptedPath);
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    await page.getByRole("button", { name: "Decrypt large file", exact: true }).click();
+    assert.equal(await page.getByLabel("Private key password", { exact: true }).inputValue(), "");
+    await page.getByRole("button", { name: "Download result", exact: true }).waitFor();
+    assert.equal(responses.length, 1, "Large-file decryption must wait for an explicit download.");
+    await downloadLargeResult(page, decryptedPath);
+    assert.deepEqual(await readFile(decryptedPath), plaintext, "The large-file browser round trip changed the plaintext.");
+    await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
+    await page.getByRole("button", { name: "Decrypt large file", exact: true }).waitFor();
+
+    await page.getByLabel("Operation", { exact: true }).selectOption("verify");
+    await page.getByLabel("Encrypted file", { exact: true }).setInputFiles(encryptedPath);
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    await page.getByRole("button", { name: "Verify large file", exact: true }).click();
+    await page.getByText("File authenticated", { exact: true }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Download result", exact: true }).count(), 0);
+    assert.equal(responses.length, 2, "Large-file verification must not download plaintext.");
+    for (const response of responses) {
+      assert.equal(response.status(), 200, "The authenticated large-file download must succeed.");
+      assert.equal(response.request().method(), "POST");
+      const headers = await response.request().allHeaders();
+      assert.equal(headers.origin, new URL(baseUrl).origin, "Attachment navigation must preserve the trusted Origin.");
+    }
+    await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
+    await page.getByRole("button", { name: "Verify large file", exact: true }).waitFor();
+  } finally {
+    page.context().off("response", onResponse);
+  }
+}
+
 async function run() {
   let temporaryDirectory;
   let browser;
@@ -294,7 +374,9 @@ async function run() {
     await runPasswordChange(page, temporaryDirectory, privateKeyPath, encryptedPath);
     await runPublicKeyRecovery(page, temporaryDirectory, publicKeyPath, privateKeyPath);
     await runFileVerification(page, temporaryDirectory, privateKeyPath, encryptedPath);
-    console.log("Native browser encryption/decryption, key password change, public-key recovery, and file verification checks passed.");
+    assert.equal(health.largeFiles?.available, true, "Large-file jobs must be available for the native browser checks.");
+    await runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, privateKeyPath);
+    console.log("Native browser encryption/decryption, key password change, public-key recovery, verification, and large-file checks passed.");
   } finally {
     try {
       await browser?.close();

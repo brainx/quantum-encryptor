@@ -10,6 +10,12 @@ export type Health = {
   supportsKeyPasswordChange?: boolean;
   supportsPublicKeyRecovery?: boolean;
   supportsFileVerification?: boolean;
+  largeFiles?: {
+    available: boolean;
+    maxPlaintextBytes: number;
+    maxEncryptedBytes: number;
+    resultTtlSeconds: number;
+  };
   backendReady: boolean;
   backendMessage: string;
   capabilities: Record<CapabilityName, Capability>;

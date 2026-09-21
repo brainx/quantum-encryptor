@@ -609,11 +609,43 @@ button:disabled {
 }
 
 .batch-encryption-form,
+.large-file-form,
+.large-file-status,
 .verify-file-form,
 .change-key-password-form,
 .batch-results {
   display: grid;
   gap: var(--space-3);
+}
+
+.large-file-form > label {
+  font-weight: 700;
+}
+
+.large-file-form > select {
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.large-file-form .fingerprint,
+.large-file-status p {
+  overflow-wrap: anywhere;
+}
+
+.large-file-status progress {
+  width: 100%;
+  height: var(--space-3);
+  accent-color: var(--color-text);
+}
+
+.large-file-status > p {
+  margin: 0;
 }
 
 .batch-results > h2,

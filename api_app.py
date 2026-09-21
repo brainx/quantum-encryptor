@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import logging
 import mimetypes
 import os
@@ -11,18 +13,20 @@ import sys
 from http.cookies import SimpleCookie
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, TypeVar
+from typing import Any, AsyncIterator, Callable, TypeVar
 from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import BaseRoute, Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from api_jobs import FileJob, JobError, JobStore, RESULT_TTL_SECONDS, encrypted_limit
+from api_worker import CryptoWorker
 from crypto_config import cfg
 import crypto_core as core
 from ui_helpers import format_key_info_for_display, guess_decrypted_filename
@@ -191,6 +195,12 @@ async def _form(request: Request, max_files: int = 2, max_fields: int = 6):
 
 
 def _api_body_limit(path: str) -> int | None:
+    if path.startswith("/api/jobs/") and path.endswith("/upload"):
+        return encrypted_limit()
+    if path.startswith("/api/jobs/") and path.endswith("/start"):
+        return cfg.MAX_PEM_BYTES + SMALL_FORM_MAX_BYTES
+    if path == "/api/jobs" or path.startswith("/api/jobs/"):
+        return SMALL_FORM_MAX_BYTES
     if path == "/api/keys/generate":
         return SMALL_FORM_MAX_BYTES
     if path in {"/api/keys/inspect", "/api/keys/change-password"}:
@@ -384,8 +394,16 @@ class SecurityHeadersMiddleware:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 existing = {name.lower() for name, _value in headers}
+                is_app_document = scope.get("path") in {"/", "/index.html"} and any(
+                    name.lower() == b"content-type" and value.lower().startswith(b"text/html")
+                    for name, value in headers
+                )
                 for name, value in SECURITY_HEADERS:
                     if name not in existing:
+                        # Browser form POSTs need an actual Origin for exact-origin
+                        # authorization. This still suppresses cross-origin referrers.
+                        if name == b"referrer-policy" and is_app_document:
+                            value = b"same-origin"
                         headers.append((name, value))
                 if is_api_path:
                     for name, value in API_NO_STORE_HEADERS:
@@ -418,13 +436,18 @@ class ApiBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        content_length = _header_value(scope, b"content-length")
+        try:
+            content_length = _single_header_value(scope, b"content-length")
+        except _DuplicateHeaderError:
+            content_length = "invalid"
         if content_length is None:
             await _json_error(ApiError(411, "length_required", "API requests must include a Content-Length header."))(
                 scope, receive, send
             )
             return
         try:
+            if not content_length.isascii() or not content_length.isdecimal():
+                raise ValueError
             parsed_length = int(content_length)
         except ValueError:
             await _json_error(ApiError(400, "invalid_content_length", "Invalid Content-Length header."))(
@@ -454,6 +477,49 @@ class ApiBodyLimitMiddleware:
             await _json_error(ApiError(413, "request_too_large", "Request body exceeds the configured size limit."))(
                 scope, receive, send
             )
+
+
+class CryptoAdmissionMiddleware:
+    """Bound uploaded data and expensive work before reading an admitted request."""
+
+    paths = frozenset(
+        {
+            "/api/keys/generate",
+            "/api/keys/change-password",
+            "/api/keys/recover-public",
+            "/api/files/encrypt",
+            "/api/files/decrypt",
+            "/api/files/verify",
+            "/api/files/inspect",
+        }
+    )
+
+    def __init__(self, app: ASGIApp, worker: CryptoWorker) -> None:
+        self.app = app
+        self.worker = worker
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "POST" or scope.get("path") not in self.paths:
+            await self.app(scope, receive, send)
+            return
+        lease = self.worker.acquire()
+        if lease is None:
+            response = _json_error(
+                ApiError(
+                    429,
+                    "server_busy",
+                    "The local service is processing another operation. Wait for it to finish, then try again.",
+                )
+            )
+            response.headers["Retry-After"] = "1"
+            await response(scope, receive, send)
+            return
+        scope.setdefault("state", {})["crypto_lease"] = lease
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            # The lease also waits for any worker left running after cancellation.
+            lease.close()
 
 
 def _form_text(form: Any, name: str, required: bool = True) -> str:
@@ -542,6 +608,12 @@ def _health_payload() -> dict[str, Any]:
     )
 
     return {
+        "largeFiles": {
+            "available": current_backend_ready or decrypt_ready,
+            "maxPlaintextBytes": cfg.MAX_STREAM_FILE_BYTES,
+            "maxEncryptedBytes": encrypted_limit(),
+            "resultTtlSeconds": RESULT_TTL_SECONDS,
+        },
         "supportsKeyPasswordChange": True,
         "supportsPublicKeyRecovery": True,
         "supportsFileVerification": True,
@@ -567,7 +639,7 @@ async def health(request: Request) -> JSONResponse:
     _has_valid_origin, authority_error = _validate_request_authorities(request.scope)
     if authority_error is not None:
         return _json_error(authority_error)
-    response = _success_json(_health_payload())
+    response = _success_json(await run_in_threadpool(_health_payload))
     # Deliver the per-process API token only as an HttpOnly, SameSite=Strict cookie so it
     # is never exposed in response bodies or to JavaScript, and is not sent cross-site.
     response.set_cookie(
@@ -602,38 +674,41 @@ async def inspect_key(request: Request) -> JSONResponse:
         await request.close()
 
 
+def _generate_key_pair(password: str) -> dict[str, Any]:
+    try:
+        core.validate_private_key_password(password)
+    except (core.PasswordRequiredError, core.WeakPasswordError) as exc:
+        raise ApiError(400, "weak_password", str(exc)) from exc
+
+    active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
+    raw_public_key, raw_private_key = core.generate_hybrid_keys(active_kem_alg)
+    if not raw_public_key or not raw_private_key:
+        raise ApiError(503, "backend_unavailable", "Could not generate a hybrid key pair.")
+
+    public_key_fingerprint = core.get_public_key_fingerprint(raw_public_key, cfg.HYBRID_KEM_ALG)
+    public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
+    private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
+    del raw_public_key
+    del raw_private_key
+    if not public_pem or not private_pem:
+        raise ApiError(500, "pem_format_failed", "Could not format generated keys.")
+
+    return {
+        "kem": cfg.HYBRID_KEM_ALG,
+        "publicPem": public_pem,
+        "privatePem": private_pem,
+        "publicKeyFingerprint": public_key_fingerprint,
+        "publicFilename": "ml-kem-768_x25519_public.pem",
+        "privateFilename": "ml-kem-768_x25519_private.pem",
+    }
+
+
 async def generate_keys(request: Request) -> JSONResponse:
     try:
         form = await _form(request, max_files=0)
         password = _form_text(form, "password")
-        try:
-            core.validate_private_key_password(password)
-        except (core.PasswordRequiredError, core.WeakPasswordError) as exc:
-            raise ApiError(400, "weak_password", str(exc)) from exc
-
-        active_kem_alg = core.resolve_kem_algorithm(cfg.KEM_ALG)
-        raw_public_key, raw_private_key = core.generate_hybrid_keys(active_kem_alg)
-        if not raw_public_key or not raw_private_key:
-            raise ApiError(503, "backend_unavailable", "Could not generate a hybrid key pair.")
-
-        public_key_fingerprint = core.get_public_key_fingerprint(raw_public_key, cfg.HYBRID_KEM_ALG)
-        public_pem = core.save_key_pem(raw_public_key, cfg.HYBRID_KEM_ALG, "public")
-        private_pem = core.save_key_pem(raw_private_key, cfg.HYBRID_KEM_ALG, "private", password=password)
-        del raw_public_key
-        del raw_private_key
-        if not public_pem or not private_pem:
-            raise ApiError(500, "pem_format_failed", "Could not format generated keys.")
-
-        return _success_json(
-            {
-                "kem": cfg.HYBRID_KEM_ALG,
-                "publicPem": public_pem,
-                "privatePem": private_pem,
-                "publicKeyFingerprint": public_key_fingerprint,
-                "publicFilename": "ml-kem-768_x25519_public.pem",
-                "privateFilename": "ml-kem-768_x25519_private.pem",
-            }
-        )
+        payload = await request.state.crypto_lease.run(_generate_key_pair, password)
+        return _success_json(payload)
     except ApiError as exc:
         return _json_error(exc)
     except core.CryptoDependencyError:
@@ -675,7 +750,7 @@ async def change_key_password(request: Request) -> JSONResponse:
             f"{Path(original_filename).stem or 'private'}_updated.pem", "private_updated.pem"
         )
         pem_content = await _read_upload_text(private_key_file, cfg.MAX_PEM_BYTES, "Private key file")
-        private_pem, kem_alg, fingerprint = await run_in_threadpool(
+        private_pem, kem_alg, fingerprint = await request.state.crypto_lease.run(
             _rewrap_private_key_pem, pem_content, current_password, new_password
         )
         return _success_json(
@@ -795,7 +870,7 @@ async def recover_public_key(request: Request) -> JSONResponse:
             supplied_public_pem = await _read_upload_text(
                 _form_upload(form, "public_key"), cfg.MAX_PEM_BYTES, "Public key file"
             )
-        result = await run_in_threadpool(
+        result = await request.state.crypto_lease.run(
             _run_crypto_operation, _recover_public_key, private_pem, password, supplied_public_pem
         )
         return _success_json({**result, "publicFilename": public_filename})
@@ -820,7 +895,7 @@ async def inspect_file(request: Request) -> JSONResponse:
         encrypted_blob = await _read_upload_bytes(
             _form_upload(form, "file"), cfg.MAX_ENCRYPTED_FILE_BYTES, "Encrypted file"
         )
-        metadata = await run_in_threadpool(_run_crypto_operation, _inspect_encrypted_file, encrypted_blob)
+        metadata = await request.state.crypto_lease.run(_run_crypto_operation, _inspect_encrypted_file, encrypted_blob)
         return _success_json(
             {
                 "authenticated": False,
@@ -883,7 +958,7 @@ async def verify_file(request: Request) -> JSONResponse:
         password = _workflow_password(form)
         encrypted_blob = await _read_upload_bytes(encrypted_upload, cfg.MAX_ENCRYPTED_FILE_BYTES, "Encrypted file")
         private_pem = await _read_upload_text(private_upload, cfg.MAX_PEM_BYTES, "Private key file")
-        result = await run_in_threadpool(
+        result = await request.state.crypto_lease.run(
             _run_crypto_operation, _verify_encrypted_file, encrypted_blob, private_pem, password
         )
         return _success_json(result)
@@ -891,6 +966,26 @@ async def verify_file(request: Request) -> JSONResponse:
         return _crypto_workflow_error("verify-file", exc)
     finally:
         await request.close()
+
+
+def _encrypt_bytes(input_data: bytes, public_pem: str) -> bytes:
+    public_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(public_pem)
+    if not public_key_bytes or not kem_alg_from_key or key_type != "public":
+        raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
+    if kem_alg_from_key != cfg.HYBRID_KEM_ALG:
+        raise ApiError(
+            400,
+            "legacy_public_key",
+            "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
+        )
+
+    encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
+    del input_data
+    del public_key_bytes
+    if encrypted_blob is None:
+        raise ApiError(503, "encryption_failed", "Encryption failed. Check backend readiness and key compatibility.")
+
+    return encrypted_blob
 
 
 async def encrypt_file(request: Request) -> Response:
@@ -906,23 +1001,8 @@ async def encrypt_file(request: Request) -> Response:
 
         input_data = await _read_upload_bytes(uploaded_file, cfg.MAX_FILE_BYTES, "Input file")
         public_pem = await _read_upload_text(public_key_file, cfg.MAX_PEM_BYTES, "Public key file")
-        public_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(public_pem)
-        if not public_key_bytes or not kem_alg_from_key or key_type != "public":
-            raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
-        if kem_alg_from_key != cfg.HYBRID_KEM_ALG:
-            raise ApiError(
-                400,
-                "legacy_public_key",
-                "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
-            )
-
-        encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
+        encrypted_blob = await request.state.crypto_lease.run(_encrypt_bytes, input_data, public_pem)
         del input_data
-        del public_key_bytes
-        if encrypted_blob is None:
-            raise ApiError(
-                503, "encryption_failed", "Encryption failed. Check backend readiness and key compatibility."
-            )
 
         return _download_response(encrypted_blob, output_filename)
     except ApiError as exc:
@@ -933,6 +1013,33 @@ async def encrypt_file(request: Request) -> Response:
         return _safe_unexpected("encrypt-file", exc)
     finally:
         await request.close()
+
+
+def _decrypt_bytes(encrypted_blob: bytes, private_pem: str, password: str) -> bytes:
+    key_info = core.inspect_key_pem_strict(private_pem)
+    if key_info.get("key_type") != "private":
+        raise ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
+
+    private_key_bytes, kem_alg_key, key_type = core.load_key_pem(private_pem, password=password)
+    if not private_key_bytes or not kem_alg_key or key_type != "private":
+        raise ApiError(400, "private_key_failed", "Could not unlock the private key. Check the password and key file.")
+
+    core.resolve_decryption_kem_algorithms(kem_alg_key)
+    decrypted_data, _detected_alg = core.decrypt_file_pro(
+        encrypted_blob,
+        private_key_bytes,
+        expected_kem_alg=kem_alg_key,
+    )
+    del encrypted_blob
+    del private_key_bytes
+    if decrypted_data is None:
+        raise ApiError(
+            400,
+            "decryption_failed",
+            "Decryption failed. Check the private key, password, and encrypted file integrity.",
+        )
+
+    return decrypted_data
 
 
 async def decrypt_file(request: Request) -> Response:
@@ -949,30 +1056,8 @@ async def decrypt_file(request: Request) -> Response:
 
         encrypted_blob = await _read_upload_bytes(encrypted_upload, cfg.MAX_ENCRYPTED_FILE_BYTES, "Encrypted file")
         private_pem = await _read_upload_text(private_key_file, cfg.MAX_PEM_BYTES, "Private key file")
-        key_info = core.inspect_key_pem_strict(private_pem)
-        if key_info.get("key_type") != "private":
-            raise ApiError(400, "invalid_private_key", "Upload a supported encrypted PQC private key PEM file.")
-
-        private_key_bytes, kem_alg_key, key_type = core.load_key_pem(private_pem, password=password)
-        if not private_key_bytes or not kem_alg_key or key_type != "private":
-            raise ApiError(
-                400, "private_key_failed", "Could not unlock the private key. Check the password and key file."
-            )
-
-        core.resolve_decryption_kem_algorithms(kem_alg_key)
-        decrypted_data, _detected_alg = core.decrypt_file_pro(
-            encrypted_blob,
-            private_key_bytes,
-            expected_kem_alg=kem_alg_key,
-        )
+        decrypted_data = await request.state.crypto_lease.run(_decrypt_bytes, encrypted_blob, private_pem, password)
         del encrypted_blob
-        del private_key_bytes
-        if decrypted_data is None:
-            raise ApiError(
-                400,
-                "decryption_failed",
-                "Decryption failed. Check the private key, password, and encrypted file integrity.",
-            )
 
         media_type, _ = mimetypes.guess_type(output_filename)
         return _download_response(decrypted_data, output_filename, media_type or "application/octet-stream")
@@ -990,6 +1075,171 @@ async def decrypt_file(request: Request) -> Response:
         await request.close()
 
 
+def _job_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, JobError):
+        error = ApiError(exc.status, exc.code, exc.message)
+    elif isinstance(exc, ApiError):
+        error = exc
+    elif isinstance(exc, RequestBodyTooLarge):
+        error = ApiError(413, "request_too_large", "Request body exceeds the configured size limit.")
+    elif isinstance(exc, OSError):
+        error = ApiError(507, "storage_failed", "Temporary storage failed. Check free disk space and try again.")
+    else:
+        return _safe_unexpected("large-file-job", exc)
+    response = _json_error(error)
+    if error.code == "server_busy":
+        response.headers["Retry-After"] = "1"
+    return response
+
+
+def _request_job(request: Request) -> tuple[JobStore, FileJob]:
+    jobs: JobStore = request.app.state.jobs
+    identifier = request.path_params["identifier"]
+    if not identifier.isascii():
+        raise JobError(410, "job_expired", "The temporary job has expired or was cleared. Run the operation again.")
+    return jobs, jobs.get(identifier)
+
+
+async def reserve_job(request: Request) -> JSONResponse:
+    try:
+        form = await _form(request, max_files=0, max_fields=3)
+        mode = _form_text(form, "mode")
+        filename = _form_text(form, "filename")
+        size_text = _form_text(form, "size")
+        if not size_text.isascii() or not size_text.isdecimal() or len(size_text) > 20:
+            raise ApiError(400, "invalid_job", "Choose a supported operation and file size.")
+        if len(filename.encode("utf-8")) > 1024:
+            raise ApiError(400, "invalid_job", "The selected file name is too long.")
+        filename = sanitize_download_filename(filename, "file")
+        jobs: JobStore = request.app.state.jobs
+        job = jobs.reserve(mode, filename, int(size_text))
+        return _success_json({"job": job.snapshot()})
+    except Exception as exc:
+        return _job_error(exc)
+    finally:
+        await request.close()
+
+
+async def upload_job(request: Request) -> JSONResponse:
+    try:
+        jobs, job = _request_job(request)
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/octet-stream":
+            raise ApiError(415, "invalid_content_type", "Upload the file as application/octet-stream.")
+        await jobs.upload(job, request.stream())
+        return _success_json({"job": job.snapshot()})
+    except Exception as exc:
+        return _job_error(exc)
+    finally:
+        await request.close()
+
+
+async def start_job(request: Request) -> JSONResponse:
+    try:
+        jobs, job = _request_job(request)
+        form = await _form(request, max_files=1, max_fields=1)
+        pem = await _read_upload_text(_form_upload(form, "key"), cfg.MAX_PEM_BYTES, "Key file")
+        password = "" if job.mode == "encrypt" else _workflow_password(form)
+        filename = f"{job.filename}.pqc" if job.mode == "encrypt" else guess_decrypted_filename(Path(job.filename))
+        jobs.start(job, pem, password, sanitize_download_filename(filename, "download.bin"))
+        return _success_json({"job": job.snapshot()})
+    except Exception as exc:
+        return _job_error(exc)
+    finally:
+        await request.close()
+
+
+async def status_job(request: Request) -> JSONResponse:
+    try:
+        _jobs, job = _request_job(request)
+        return _success_json({"job": job.snapshot()})
+    except Exception as exc:
+        return _job_error(exc)
+
+
+async def cancel_job(request: Request) -> JSONResponse:
+    try:
+        jobs, job = _request_job(request)
+        jobs.cancel(job)
+        return _success_json({"job": job.snapshot()})
+    except Exception as exc:
+        return _job_error(exc)
+
+
+async def clear_job(request: Request) -> JSONResponse:
+    try:
+        jobs: JobStore = request.app.state.jobs
+        job = jobs.job
+        identifier = request.path_params["identifier"]
+        # Expiry may already have hidden a cancelling job from get(). Clearing must
+        # still wait for that job's native work and file ownership to finish.
+        if job is None or not identifier.isascii() or not secrets.compare_digest(job.id, identifier):
+            return _success_json({})
+        if job.downloading:
+            raise JobError(409, "download_busy", "Wait for the active download to finish before clearing this job.")
+        if job.state in {"running", "cancelling", "uploading"}:
+            raise JobError(409, "job_active", "Cancel the operation and wait for it to stop before clearing this job.")
+        jobs.cancel(job, discard=True)
+        return _success_json({})
+    except Exception as exc:
+        return _job_error(exc)
+
+
+class JobDownloadResponse(StreamingResponse):
+    """Release download ownership even if sending headers never enters the iterator."""
+
+    def __init__(self, jobs: JobStore, job: FileJob) -> None:
+        if job.result is None:
+            raise RuntimeError("The job has no downloadable result.")
+        self.jobs = jobs
+        self.job = job
+        self.chunks = jobs.download(job)
+        super().__init__(
+            self.chunks,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": _content_disposition(job.result["filename"]),
+                "Content-Length": str(job.result["bytes"]),
+            },
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.job.download_task = asyncio.current_task()
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self.chunks.aclose()
+            finally:
+                self.job.download_task = None
+                self.jobs.finish_download(self.job)
+
+
+async def download_job(request: Request) -> Response:
+    try:
+        # Direct form downloads require the same local Origin and HttpOnly session.
+        # Neither job IDs nor URL parameters act as bearer credentials.
+        has_origin, authority_error = _validate_request_authorities(request.scope)
+        if authority_error is not None:
+            raise authority_error
+        if not has_origin:
+            raise ApiError(403, "invalid_origin", "A trusted browser Origin is required for downloads.")
+        try:
+            cookie = _cookie_value(request.scope, LOCAL_API_TOKEN_COOKIE)
+        except _DuplicateHeaderError:
+            cookie = None
+        if not _has_valid_local_api_token(cookie):
+            raise ApiError(403, "missing_api_token", "Missing or invalid local API token.")
+        jobs, job = _request_job(request)
+        jobs.begin_download(job)
+        try:
+            return JobDownloadResponse(jobs, job)
+        except BaseException:
+            jobs.finish_download(job)
+            raise
+    except Exception as exc:
+        return _job_error(exc)
+
+
 async def frontend_missing(_request: Request) -> PlainTextResponse:
     return PlainTextResponse(
         "Quantum Encryptor web UI has not been built. Run `npm install` and `npm run build`, then start the server.",
@@ -998,6 +1248,20 @@ async def frontend_missing(_request: Request) -> PlainTextResponse:
 
 
 def create_app() -> ASGIApp:
+    worker = CryptoWorker()
+    jobs = JobStore(worker)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        reaper = asyncio.create_task(jobs.reap())
+        try:
+            yield
+        finally:
+            reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await reaper
+            await jobs.close()
+
     routes: list[BaseRoute] = [
         Route("/api/health", health, methods=["GET"]),
         Route("/api/keys/inspect", inspect_key, methods=["POST"]),
@@ -1008,12 +1272,22 @@ def create_app() -> ASGIApp:
         Route("/api/files/verify", verify_file, methods=["POST"]),
         Route("/api/files/encrypt", encrypt_file, methods=["POST"]),
         Route("/api/files/decrypt", decrypt_file, methods=["POST"]),
+        Route("/api/jobs", reserve_job, methods=["POST"]),
+        Route("/api/jobs/{identifier}/upload", upload_job, methods=["PUT"]),
+        Route("/api/jobs/{identifier}/start", start_job, methods=["POST"]),
+        Route("/api/jobs/{identifier}/status", status_job, methods=["POST"]),
+        Route("/api/jobs/{identifier}/cancel", cancel_job, methods=["POST"]),
+        Route("/api/jobs/{identifier}/clear", clear_job, methods=["POST"]),
+        Route("/api/jobs/{identifier}/download", download_job, methods=["POST"]),
     ]
     if STATIC_APP_DIR.exists():
         routes.append(Mount("/", StaticFiles(directory=STATIC_APP_DIR, html=True), name="web"))
     else:
         routes.append(Route("/{path:path}", frontend_missing, methods=["GET"]))
-    inner_app = Starlette(debug=False, routes=routes)
+    inner_app = Starlette(debug=False, routes=routes, lifespan=lifespan)
+    inner_app.state.jobs = jobs
+    inner_app.state.crypto_worker = worker
+    inner_app.add_middleware(CryptoAdmissionMiddleware, worker=worker)
     inner_app.add_middleware(ApiBodyLimitMiddleware)
     inner_app.add_middleware(LocalApiGuardMiddleware)
     return SecurityHeadersMiddleware(inner_app)
