@@ -9,7 +9,7 @@ pip-audit>=2.8.0
 # Require the patched installer and a compatible lock compiler.
 pip>=26.2.1
 pip-tools>=7.6.1
-build>=1.5.0
+build>=1.6.1
 twine>=5.0.0
 # Keep the hashed dev lock portable when generated outside Linux.
 SecretStorage>=3.2; sys_platform == "linux"
