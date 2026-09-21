@@ -18,8 +18,8 @@ SUPPORTED_TOOLCHAIN = {
     "build": "1.5.0",
     "click": "8.4.2",
     "pyproject-hooks": "1.2.0",
-    "setuptools": "83.0.0",
-    "wheel": "0.47.0",
+    "setuptools": "84.0.0",
+    "wheel": "0.48.0",
     "node": "22.23.1",
     "npm": "10.9.8",
 }
