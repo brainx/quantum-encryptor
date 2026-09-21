@@ -1185,6 +1185,24 @@ def test_security_headers_cover_middleware_rejections():
     _assert_api_no_store(response_headers)
 
 
+@pytest.mark.parametrize("path", ["/", "/index.html"])
+def test_app_document_preserves_origin_for_authenticated_download_forms(monkeypatch, tmp_path, path):
+    (tmp_path / "index.html").write_text("<!doctype html><title>Test app</title>", encoding="utf-8")
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+    status, headers, _body = asyncio.run(_call_app_raw(path, method="GET"))
+    assert status == 200
+    assert _header(headers, b"referrer-policy") == "same-origin"
+    assert _header(headers, b"x-frame-options") == "DENY"
+
+
+def test_non_document_static_response_keeps_no_referrer(monkeypatch, tmp_path):
+    (tmp_path / "test.css").write_text("body {}", encoding="utf-8")
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+    status, headers, _body = asyncio.run(_call_app_raw("/test.css", method="GET"))
+    assert status == 200
+    assert _header(headers, b"referrer-policy") == "no-referrer"
+
+
 def test_api_cache_policy_replaces_weaker_handler_headers(monkeypatch):
     async def cacheable_health(_request):
         return api_app.Response(

@@ -3,6 +3,8 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { READY_HEALTH } from "../test/fixtures";
+import { ApiError } from "../api/client";
+import type { LargeFileJob, LargeFileMode } from "../api/largeFiles";
 import App from "./App";
 
 const TEST_PUBLIC_KEY_FINGERPRINT = `QE1-SHA3-256:${"a".repeat(64)}`;
@@ -16,6 +18,41 @@ const client = vi.hoisted(() => ({
   changeKeyPassword: vi.fn(),
   save: vi.fn()
 }));
+
+const largeJobs = vi.hoisted(() => ({
+  create: vi.fn(), upload: vi.fn(), start: vi.fn(), status: vi.fn(), cancel: vi.fn(), clear: vi.fn(), download: vi.fn()
+}));
+
+vi.mock("../api/largeFiles", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../api/largeFiles")>(), largeFileOperations: largeJobs
+}));
+
+function largeSnapshot(mode: LargeFileMode, state: LargeFileJob["state"]): LargeFileJob {
+  return { id: "large-job", mode, state, phase: "processing", processedBytes: 3, totalBytes: 3,
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), ...(state === "complete" ? { result: { filename: "result.bin", bytes: 3 } } : {}) };
+}
+
+async function openLargeFile(user: ReturnType<typeof userEvent.setup>, mode: "encrypt" | "decrypt") {
+  client.fetchHealth.mockResolvedValue({ ...READY_HEALTH, largeFiles: {
+    available: true, maxPlaintextBytes: 1024, maxEncryptedBytes: 2048, resultTtlSeconds: 60
+  } });
+  if (mode === "decrypt") client.inspectKey.mockResolvedValue({ ok: true,
+    keyInfo: { kem: READY_HEALTH.kem, key_type: "private", private_key_encrypted: true }, display: {} });
+  largeJobs.create.mockResolvedValue(largeSnapshot(mode, "awaiting_upload"));
+  largeJobs.upload.mockResolvedValue(largeSnapshot(mode, "ready"));
+  largeJobs.start.mockResolvedValue(largeSnapshot(mode, "complete"));
+  largeJobs.status.mockResolvedValue(largeSnapshot(mode, "running"));
+  largeJobs.cancel.mockResolvedValue(largeSnapshot(mode, "cancelled"));
+  largeJobs.clear.mockResolvedValue({ ok: true });
+  render(<App />);
+  await screen.findByRole("heading", { name: "Encrypt a file" });
+  await user.click(screen.getByRole("button", { name: "Large files" }));
+  if (mode === "decrypt") await user.selectOptions(screen.getByLabelText("Operation"), "decrypt");
+  await user.upload(screen.getByLabelText(mode === "encrypt" ? "File to encrypt" : "Encrypted file"), new File(["abc"], "file.bin"));
+  await user.upload(screen.getByLabelText(mode === "encrypt" ? "Recipient public key" : "Private key", { exact: true }), new File(["PEM"], "key.pem"));
+  if (mode === "decrypt") await user.type(screen.getByLabelText("Private key password", { exact: true }), "test private password");
+  await waitFor(() => expect(screen.getByRole("button", { name: mode === "encrypt" ? "Encrypt large file" : "Decrypt large file" })).toBeEnabled());
+}
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -60,6 +97,7 @@ async function openGeneratedKeys(user: ReturnType<typeof userEvent.setup>) {
 }
 
 beforeEach(() => {
+  Object.values(largeJobs).forEach((operation) => operation.mockReset());
   client.fetchHealth.mockReset();
   client.fetchHealth.mockResolvedValue(READY_HEALTH);
   client.generateKeys.mockReset();
@@ -95,6 +133,47 @@ beforeEach(() => {
 });
 
 describe("App", () => {
+  it("guards an active large-file upload and requests cancellation only after confirmed navigation", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await openLargeFile(user, "encrypt");
+    let resolveUpload!: (value: LargeFileJob) => void;
+    largeJobs.upload.mockReturnValue(new Promise<LargeFileJob>((resolve) => { resolveUpload = resolve; }));
+    await user.click(screen.getByRole("button", { name: "Encrypt large file" }));
+    await waitFor(() => expect(largeJobs.upload).toHaveBeenCalledTimes(1));
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(confirm).toHaveBeenCalledWith("A large-file operation or temporary result is still available. Leave and request cleanup? Interrupted cleanup will finish when the job expires.");
+    expect(screen.getByRole("heading", { name: "Large files" })).toBeVisible();
+    expect(largeJobs.cancel).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(screen.getByRole("heading", { name: "Inspect a key" })).toBeVisible();
+    expect(largeJobs.cancel).toHaveBeenCalledWith("large-job");
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+    await act(async () => resolveUpload(largeSnapshot("encrypt", "ready")));
+    expect(largeJobs.start).not.toHaveBeenCalled();
+  });
+
+  it("guards large decrypted output after download and failed cleanup until removal is confirmed", async () => {
+    const user = userEvent.setup();
+    await openLargeFile(user, "decrypt");
+    await user.click(screen.getByRole("button", { name: "Decrypt large file" }));
+    const download = await screen.findByRole("button", { name: "Download result" });
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(download);
+    expect(largeJobs.download).toHaveBeenCalledWith("large-job");
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    largeJobs.clear.mockRejectedValueOnce(new ApiError(409, "download_busy", "Wait for the download to finish, then clear the temporary files."));
+    await user.click(screen.getByRole("button", { name: "Clear temporary files" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Wait for the download to finish");
+    expect(screen.getByRole("button", { name: "Download result" })).toBeVisible();
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Clear temporary files" }));
+    expect(screen.queryByRole("button", { name: "Download result" })).not.toBeInTheDocument();
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+  });
+
   it("opens the file verification and public-key recovery workflows", async () => {
     const user = userEvent.setup();
     render(<App />);

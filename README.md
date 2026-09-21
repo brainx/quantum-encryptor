@@ -33,6 +33,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Public-Key Recovery**: Recover the public PEM from an unlocked private key and check whether a supplied public key matches
 - **File Verification**: Inspect encrypted-file metadata and authenticate an entire file without downloading its plaintext
 - **Large-file CLI**: Encrypt, decrypt, inspect, and verify files up to 1 GiB using bounded buffers and authenticated, atomic output
+- **Large-file Web Jobs**: Encrypt, decrypt, and verify up to 1 GiB with upload progress, cancellation, expiring temporary results, and explicit downloads
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
 
 ## Screenshots
@@ -253,6 +254,14 @@ Verification requires the native backend and decrypts the bounded file in local 
 `POST /api/files/inspect` accepts multipart `file` and returns `authenticated: false` with a `metadata` object. `POST /api/files/verify` accepts `file`, `private_key`, and `password`; a successful report contains `verified: true`, `kem`, `formatVersion`, `bytesVerified`, and `publicKeyFingerprint`. Health advertises `supportsFileVerification`. Both use the existing encrypted-file size limit.
 
 These endpoints follow the existing local API authentication, exact-origin, no-store, and upload-cleanup rules. Password changes, public-key recovery, file inspection, and file verification share one worker admission slot, retained until the operation finishes even if its HTTP request is cancelled. Busy requests receive `429` with `Retry-After: 1`; passwords are bounded to 4096 UTF-8 bytes and PEM files to the advertised limit.
+
+## Large files
+
+Choose **Large files** in the web app to encrypt, decrypt, or verify one file up to 1 GiB. Select the operation, file, and appropriate PEM key. The app shows upload and processing progress, clears the password field when you start, and waits for an explicit **Download result** action. Downloads stream directly from the local service; the browser app does not retain a full result blob. Verification returns an authentication report without a plaintext download.
+
+One large-file job can be retained at a time. **Cancel operation** requests cancellation; wait for cleanup to finish before choosing **Clear temporary files**. Completed results remain downloadable until cleared or until the 15-minute deadline measured from reservation. Expiry also cancels unfinished jobs. Closing or losing the tab may leave a job until automatic expiry. Temporary files use private, automatically removed storage; decrypted results occupy disk until cleared or expired, including after a download. Allow roughly three times the selected file size plus a small reserve in the system temporary directory. Deleting files is not secure erasure.
+
+Cryptographic work runs on a single background worker. Other expensive operations return a retryable busy response while a job is reserved or running; health and key inspection remain available. A completed retained result releases the cryptographic worker, although it must be cleared before reserving another large-file job. Jobs are local, process-owned, and are not resumable across service restarts.
 
 ## Automation Usage
 

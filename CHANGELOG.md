@@ -16,6 +16,7 @@ This project follows a practical semantic-versioning style.
 
 ### Added
 
+- Large-file web jobs with upload and processing progress, cancellation, expiring private temporary results, direct streaming downloads, and shared background-worker admission for cryptographic operations.
 - Bounded-memory CLI encryption, decryption, inspection, and verification up to 1 GiB, with two-pass authenticated decryption, atomic output publication, and a configurable lower size limit.
 - Batch decryption with a shared private key, independent authentication errors, explicit plaintext downloads, cancellation, and clear-result controls.
 - Private-key password changes that preserve key identity and existing ciphertext compatibility, with authenticated local API access and a retained download of the updated encrypted key.

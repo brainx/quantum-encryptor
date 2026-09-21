@@ -82,13 +82,13 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Check formatting
-        run: python -m black --check api_app.py crypto_config.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py scripts/check_dependency_locks.py scripts/check_release_preflight.py setup.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_crypto_stream.py tests/test_dependency_locks.py tests/test_release_preflight.py tests/test_ui_helpers.py
+        run: python -m black --check api_app.py api_jobs.py api_worker.py crypto_config.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py scripts/check_dependency_locks.py scripts/check_release_preflight.py scripts/streaming_native_smoke.py scripts/large_file_api_smoke.py setup.py tests/test_agent_tools.py tests/test_api_app.py tests/test_api_jobs.py tests/test_api_jobs_api.py tests/test_api_jobs_crypto.py tests/test_api_worker.py tests/test_crypto_core.py tests/test_crypto_stream.py tests/test_dependency_locks.py tests/test_release_preflight.py tests/test_ui_helpers.py
 
       - name: Lint
-        run: python -m flake8 api_app.py crypto_config.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py scripts/check_dependency_locks.py scripts/check_release_preflight.py setup.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_crypto_stream.py tests/test_dependency_locks.py tests/test_release_preflight.py tests/test_ui_helpers.py
+        run: python -m flake8 api_app.py api_jobs.py api_worker.py crypto_config.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py scripts/check_dependency_locks.py scripts/check_release_preflight.py scripts/streaming_native_smoke.py scripts/large_file_api_smoke.py setup.py tests/test_agent_tools.py tests/test_api_app.py tests/test_api_jobs.py tests/test_api_jobs_api.py tests/test_api_jobs_crypto.py tests/test_api_worker.py tests/test_crypto_core.py tests/test_crypto_stream.py tests/test_dependency_locks.py tests/test_release_preflight.py tests/test_ui_helpers.py
 
       - name: Type check
-        run: python -m mypy --explicit-package-bases api_app.py crypto_config.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py scripts/check_dependency_locks.py scripts/check_release_preflight.py tests/test_agent_tools.py tests/test_api_app.py tests/test_crypto_core.py tests/test_crypto_stream.py tests/test_dependency_locks.py tests/test_release_preflight.py tests/test_ui_helpers.py
+        run: python -m mypy --explicit-package-bases api_app.py api_jobs.py api_worker.py crypto_config.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py scripts/check_dependency_locks.py scripts/check_release_preflight.py scripts/streaming_native_smoke.py scripts/large_file_api_smoke.py tests/test_agent_tools.py tests/test_api_app.py tests/test_api_jobs.py tests/test_api_jobs_api.py tests/test_api_jobs_crypto.py tests/test_api_worker.py tests/test_crypto_core.py tests/test_crypto_stream.py tests/test_dependency_locks.py tests/test_release_preflight.py tests/test_ui_helpers.py
 
       - name: Unit tests without native liboqs
         run: >
@@ -98,6 +98,8 @@ jobs:
           --cov=pqc_agent_tools
           --cov=ui_helpers
           --cov=api_app
+          --cov=api_jobs
+          --cov=api_worker
           --cov-report=term-missing
           --cov-fail-under=80
 
@@ -150,12 +152,14 @@ jobs:
           import sys
 
           import api_app
+          import api_jobs
+          import api_worker
           import crypto_stream
           import pqc_agent_tools
           import ui_helpers
 
           prefix = Path(sys.prefix).resolve()
-          for module in (api_app, crypto_stream, pqc_agent_tools, ui_helpers):
+          for module in (api_app, api_jobs, api_worker, crypto_stream, pqc_agent_tools, ui_helpers):
               module_path = Path(module.__file__).resolve()
               assert module_path.is_relative_to(prefix), (module.__name__, module_path, prefix)
           assert find_spec("pqc_app") is None
@@ -215,7 +219,7 @@ jobs:
         run: npm audit --package-lock-only --audit-level=high
 
       - name: Run Python security lint
-        run: python -m bandit -q -r api_app.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py
+        run: python -m bandit -q -r api_app.py api_jobs.py api_worker.py crypto_core.py crypto_stream.py pqc_agent_tools.py ui_helpers.py
 
   web:
     name: Custom web UI
@@ -293,6 +297,8 @@ jobs:
           import crypto_core
           import crypto_stream
           import api_app
+          import api_jobs
+          import api_worker
           import pqc_agent_tools
           import ui_helpers
 
@@ -387,6 +393,10 @@ jobs:
       - name: Large-file streaming and memory acceptance
         timeout-minutes: 5
         run: python scripts/streaming_native_smoke.py
+
+      - name: Large-file HTTP jobs and memory acceptance
+        timeout-minutes: 5
+        run: python scripts/large_file_api_smoke.py
 
       - name: Agent CLI native round trip
         run: |
