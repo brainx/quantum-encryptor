@@ -47,8 +47,8 @@ jobs:
           python -m pip install --no-deps \
             "pip-tools==7.6.1" \
             "packaging==26.2" \
-            "build==1.5.0" \
-            "click==8.4.2" \
+            "build==1.6.1" \
+            "click==8.5.0" \
             "pyproject-hooks==1.2.0" \
             "setuptools==84.0.0" \
             "wheel==0.48.0"

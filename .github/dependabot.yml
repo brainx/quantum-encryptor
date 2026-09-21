@@ -13,6 +13,24 @@ updates:
       - dependency-name: "docutils"
         versions: ["0.23.*"]
     groups:
+      python-runtime:
+        patterns:
+          - "liboqs-python"
+          - "cryptography"
+          - "cffi"
+          - "pycparser"
+          - "starlette"
+          - "anyio"
+          - "idna"
+          - "typing-extensions"
+          - "uvicorn"
+          - "click"
+          - "h11"
+          - "httptools"
+          - "python-multipart"
+        update-types:
+          - "minor"
+          - "patch"
       python-tests:
         patterns:
           - "pytest"
@@ -56,6 +74,12 @@ updates:
           - "cyclonedx-python-lib"
           - "filelock"
           - "charset-normalizer"
+        update-types:
+          - "minor"
+          - "patch"
+      python-other:
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"
