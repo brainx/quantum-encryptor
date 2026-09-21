@@ -65,7 +65,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 - Open Quantum Safe native `liboqs` shared library
 - Open Quantum Safe `liboqs-python` wrapper, which imports as `oqs`
 - Python dependencies listed in `requirements.txt`
-- Node.js 20.19+ or 22.12+ and npm for building the custom web UI
+- Node.js 22.22.2+, 24.15.0+, or 26+ and npm for building and testing the custom web UI
 - Optional hash-locked installs from `requirements-lock.txt` or `requirements-dev-lock.txt`
 
 ## Installation
