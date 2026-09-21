@@ -144,7 +144,8 @@ The application has the following security limitations:
    - Hardware-level attacks (cache timing, power analysis) are not mitigated
 
 4. **In-Memory Processing**
-   - Files are processed in memory, so very large-file streaming is not supported
+   - Existing web and bytes-based APIs process files in memory with a 100 MiB limit; CLI file commands use bounded buffers up to 1 GiB
+   - CLI streaming decryption authenticates a private ciphertext snapshot before writing a staged plaintext result, and publishes only after final authentication. Temporary snapshots and staged outputs require disk capacity; abrupt termination can leave a staged output, and deleting it does not guarantee secure erasure
    - Sensitive data may remain in Python-managed memory until garbage collection
    - Local reference deletion in the implementation must not be treated as secure memory zeroization
    - Explicitly clearing generated keys drops React's application references but does not guarantee JavaScript or Python memory zeroization; garbage collection and process-memory reuse are outside application control

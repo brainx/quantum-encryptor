@@ -41,6 +41,7 @@ The tests are organized by module and functionality:
   - Private key encryption/decryption
   - PEM format handling
   - File encryption/decryption
+- `test_crypto_stream.py` - Streaming format compatibility, bounded reads/writes, authentication failures, chunk boundaries, and cancellation
 - `test_agent_tools.py` - Tests for the local JSON CLI safety boundary
   - Workspace-relative path validation
   - Input size checks before file parsing
@@ -73,6 +74,8 @@ pip install -r requirements-dev.txt
 ```
 
 Native `liboqs` is required for the key generation and end-to-end file encryption tests. When native `liboqs` is unavailable, those tests skip and the non-backend validation still runs.
+
+`python scripts/streaming_native_smoke.py` exercises a real 1 GiB CLI round trip and verification, checks exact restored content and POSIX output permissions, and enforces peak child-process RSS below 256 MiB on Linux/macOS. It requires the native backend and about 4 GiB of free disk space; its temporary data is removed afterward. Use `--size-mib 16` for a smaller development check. CI runs the full acceptance check in the native integration job.
 
 Security-critical tests cover exact ML-KEM/Kyber identity handling, authenticated legacy-hybrid migration, legacy public-key rejection, composite ML-KEM/X25519 key generation, hybrid combiner binding, encrypted private-key PEM v3 metadata authentication, authenticated-v2 migration, version-downgrade and component-substitution rejection, malformed AES-GCM payload bounds, race-resistant bounded workspace reads, oversized input rejection, and no-overwrite output safety.
 

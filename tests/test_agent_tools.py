@@ -103,6 +103,27 @@ def _syntactic_encrypted_blob() -> bytes:
     )
 
 
+def _stream_metadata(plaintext_bytes: int, kem: str = cfg.HYBRID_KEM_ALG, total_bytes: int | None = None):
+    return core.EncryptedFileMetadata(
+        version=cfg.FORMAT_VERSION,
+        kem_alg=kem,
+        header_bytes=0,
+        kem_ciphertext_bytes=0,
+        x25519_ciphertext_bytes=0,
+        encrypted_payload_bytes=plaintext_bytes + cfg.AES_TAG_BYTES,
+        total_bytes=total_bytes if total_bytes is not None else plaintext_bytes + cfg.AES_TAG_BYTES,
+    )
+
+
+def _mock_stream_encryption(monkeypatch, transform):
+    def encrypt(source, sink, _public_key, _kem, **_kwargs):
+        data = transform(source.read())
+        sink.write(data)
+        return _stream_metadata(0, total_bytes=len(data))
+
+    monkeypatch.setattr(tools.streaming, "encrypt_stream", encrypt)
+
+
 def test_health_reports_backend_unavailable_without_crashing(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
 
@@ -379,7 +400,7 @@ def test_encrypt_rejects_existing_output_without_overwrite(monkeypatch, tmp_path
 
     monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
-    monkeypatch.setattr(core, "encrypt_file_pro", lambda _data, _public_key, _kem: b"encrypted")
+    _mock_stream_encryption(monkeypatch, lambda _data: b"encrypted")
 
     code, payload = _run_agent(
         ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "message.pqc"],
@@ -457,7 +478,7 @@ def test_encrypt_rejects_oversized_public_key_before_parse(monkeypatch, tmp_path
 
 def test_encrypt_rejects_oversized_input_before_key_parse(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cfg, "MAX_FILE_BYTES", 4)
+    monkeypatch.setattr(cfg, "MAX_STREAM_FILE_BYTES", 4)
     (tmp_path / "message.txt").write_bytes(b"12345")
     (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
     monkeypatch.setattr(core, "load_key_pem", lambda _pem: pytest.fail("PEM parser should not run"))
@@ -544,11 +565,12 @@ def test_decrypt_uses_password_env_and_writes_plaintext_file(monkeypatch, tmp_pa
 
     monkeypatch.setattr(core, "load_key_pem", load_private_key)
 
-    def decrypt_file(_blob, _private_key, expected_kem_alg=None):
+    def decrypt_file(_source, sink, _private_key, expected_kem_alg=None, **_kwargs):
         assert expected_kem_alg == cfg.KEM_ALG
-        return b"plaintext", cfg.KEM_ALG
+        sink.write(b"plaintext")
+        return _stream_metadata(len(b"plaintext"), cfg.KEM_ALG)
 
-    monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
+    monkeypatch.setattr(tools.streaming, "decrypt_stream", decrypt_file)
 
     code, payload = _run_agent(
         [
@@ -589,8 +611,8 @@ def test_decrypt_reports_suite_aware_backend_unavailable(monkeypatch, tmp_path, 
 
     monkeypatch.setattr(core, "resolve_decryption_kem_algorithms", missing_backend, raising=False)
     monkeypatch.setattr(
-        core,
-        "decrypt_file_pro",
+        tools.streaming,
+        "decrypt_stream",
         lambda *_args, **_kwargs: pytest.fail("decryption must not run without a compatible backend"),
     )
 
@@ -606,19 +628,20 @@ def test_decrypt_reports_suite_aware_backend_unavailable(monkeypatch, tmp_path, 
 
 def test_decrypt_allows_ciphertext_overhead_above_plaintext_limit(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cfg, "MAX_FILE_BYTES", 3)
-    monkeypatch.setattr(cfg, "MAX_ENCRYPTED_FILE_BYTES", 64)
+    monkeypatch.setattr(cfg, "MAX_STREAM_FILE_BYTES", 3)
+    monkeypatch.setattr(tools.streaming, "encrypted_size_limit", lambda _limit: 64)
     (tmp_path / "message.pqc").write_bytes(b"encrypted-container")
     (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
     monkeypatch.setattr(tools, "_resolve_decryption_backends", lambda _operation, suite: (suite,))
     monkeypatch.setattr(core, "load_key_pem", lambda _pem, password=None: (b"private", cfg.KEM_ALG, "private"))
 
-    def decrypt_file(_blob, _private_key, expected_kem_alg=None):
+    def decrypt_file(_source, sink, _private_key, expected_kem_alg=None, **_kwargs):
         assert expected_kem_alg == cfg.KEM_ALG
-        return b"abc", cfg.KEM_ALG
+        sink.write(b"abc")
+        return _stream_metadata(3, cfg.KEM_ALG)
 
-    monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
+    monkeypatch.setattr(tools.streaming, "decrypt_stream", decrypt_file)
 
     code, payload = _run_agent(
         ["decrypt", "--input", "message.pqc", "--private-key", "private.pem", "--output", "message.txt"],
@@ -632,8 +655,8 @@ def test_decrypt_allows_ciphertext_overhead_above_plaintext_limit(monkeypatch, t
 
 def test_decrypt_rejects_encrypted_input_above_encrypted_limit(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cfg, "MAX_FILE_BYTES", 3)
-    monkeypatch.setattr(cfg, "MAX_ENCRYPTED_FILE_BYTES", 4)
+    monkeypatch.setattr(cfg, "MAX_STREAM_FILE_BYTES", 3)
+    monkeypatch.setattr(tools.streaming, "encrypted_size_limit", lambda _limit: 4)
     (tmp_path / "message.pqc").write_bytes(b"12345")
     (tmp_path / "private.pem").write_text("private key placeholder", encoding="utf-8")
     monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: pytest.fail("PEM parser should not run"))
@@ -650,7 +673,7 @@ def test_decrypt_rejects_encrypted_input_above_encrypted_limit(monkeypatch, tmp_
 
 def test_verify_file_rejects_encrypted_input_above_limit_before_private_key_parse(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cfg, "MAX_ENCRYPTED_FILE_BYTES", 4)
+    monkeypatch.setattr(tools.streaming, "encrypted_size_limit", lambda _limit: 4)
     (tmp_path / "message.pqc").write_bytes(b"12345")
     (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
     monkeypatch.setattr(core, "inspect_key_pem_strict", lambda _pem: pytest.fail("PEM parser should not run"))
@@ -741,7 +764,7 @@ def test_encrypt_mocked_flow_writes_encrypted_file(monkeypatch, tmp_path, capsys
     (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
     monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
-    monkeypatch.setattr(core, "encrypt_file_pro", lambda data, _public_key, _kem: b"encrypted:" + data)
+    _mock_stream_encryption(monkeypatch, lambda data: b"encrypted:" + data)
 
     code, payload = _run_agent(
         ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "message.pqc"],
@@ -790,6 +813,63 @@ def test_inspect_file_returns_encrypted_container_metadata(monkeypatch, tmp_path
     assert payload["x25519_ciphertext_bytes"] == cfg.X25519_KEY_BYTES
 
 
+@pytest.mark.parametrize("command", ["inspect-file", "verify-file"])
+@pytest.mark.parametrize("failure", ["format", "size"])
+def test_stream_preflight_failures_preserve_json_error_contract(monkeypatch, tmp_path, capsys, command, failure):
+    monkeypatch.chdir(tmp_path)
+    blob = b"not an encrypted file" if failure == "format" else _syntactic_encrypted_blob() + b"extra"
+    (tmp_path / "input.pqc").write_bytes(blob)
+    argv = [command, "--input", "input.pqc", "--max-file-bytes", "1"]
+    if command == "verify-file":
+        argv += ["--private-key", "unused.pem"]
+
+    code, payload = _run_agent(argv, capsys)
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["operation"] == command
+    assert payload["error_code"] == ("invalid_file_format" if failure == "format" else "file_too_large")
+
+
+@pytest.mark.parametrize("command", ["encrypt", "decrypt", "verify-file"])
+@pytest.mark.parametrize(
+    "exception,error_code",
+    [
+        (core.SizeLimitError, "file_too_large"),
+        (core.InvalidKeyFormatError, "invalid_key"),
+        (core.UnsupportedAlgorithmError, "unsupported_algorithm"),
+    ],
+)
+def test_stream_execution_failures_preserve_json_error_contract(
+    monkeypatch, tmp_path, capsys, command, exception, error_code
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.pqc").write_bytes(_syntactic_encrypted_blob())
+    public = command == "encrypt"
+    (tmp_path / "key.pem").write_text(_valid_public_pem() if public else _valid_private_pem(), encoding="utf-8")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
+    monkeypatch.setattr(
+        core, "load_key_pem", lambda *_args, **_kwargs: (b"key", cfg.HYBRID_KEM_ALG, "public" if public else "private")
+    )
+    monkeypatch.setattr(tools, "_resolve_backend", lambda *_args: cfg.KEM_ALG)
+    monkeypatch.setattr(tools, "_resolve_decryption_backends", lambda *_args: (cfg.KEM_ALG,))
+
+    def fail(*_args, **_kwargs):
+        raise exception("Operation input is invalid.")
+
+    method = "verify_stream" if command == "verify-file" else f"{command}_stream"
+    monkeypatch.setattr(tools.streaming, method, fail)
+    argv = [command, "--input", "input.pqc", "--public-key" if public else "--private-key", "key.pem"]
+    if command != "verify-file":
+        argv += ["--output", "output.bin"]
+    code, payload = _run_agent(argv, capsys)
+
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["operation"] == command
+    assert payload["error_code"] == error_code
+    assert not (tmp_path / "output.bin").exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
 def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.pqc").write_bytes(_syntactic_encrypted_blob())
@@ -811,11 +891,11 @@ def test_verify_file_authenticates_without_writing_plaintext(monkeypatch, tmp_pa
         lambda _pem, password=None: (b"private", cfg.HYBRID_KEM_ALG, "private"),
     )
 
-    def decrypt_file(_blob, _private_key, expected_kem_alg=None):
+    def verify_file(_source, _private_key, expected_kem_alg=None, **_kwargs):
         assert expected_kem_alg == cfg.HYBRID_KEM_ALG
-        return b"plaintext", cfg.HYBRID_KEM_ALG
+        return _stream_metadata(len(b"plaintext"))
 
-    monkeypatch.setattr(core, "decrypt_file_pro", decrypt_file)
+    monkeypatch.setattr(tools.streaming, "verify_stream", verify_file)
 
     code, payload = _run_agent(
         [
@@ -1061,3 +1141,195 @@ def test_generate_keys_rejects_same_output_path(monkeypatch, tmp_path, capsys):
 
     assert code == tools.EXIT_INVALID_INPUT
     assert payload["error_code"] == "invalid_path"
+
+
+@pytest.mark.parametrize("command", ["encrypt", "decrypt", "inspect-file", "verify-file"])
+@pytest.mark.parametrize("limit", ["0", "-1", "invalid", str(1024 * 1024 * 1024 + 1)])
+def test_stream_commands_reject_invalid_plaintext_limits(command, limit, capsys):
+    argv = [command, "--input", "input.bin", "--max-file-bytes", limit]
+    if command in {"encrypt", "decrypt"}:
+        argv += ["--output", "output.bin"]
+    if command == "encrypt":
+        argv += ["--public-key", "public.pem"]
+    if command in {"decrypt", "verify-file"}:
+        argv += ["--private-key", "private.pem"]
+    code, payload = _run_agent(argv, capsys)
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "invalid_args"
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("failure", ["write", "fsync", "publish", "cancel", "interrupt"])
+def test_stream_output_failure_discards_stage_and_preserves_destination(monkeypatch, tmp_path, overwrite, failure):
+    output = tmp_path / "output.bin"
+    if overwrite:
+        output.write_bytes(b"original")
+        output.chmod(0o640)
+
+    def write(sink):
+        if os.name != "nt":
+            assert stat.S_IMODE(os.fstat(sink.fileno()).st_mode) == 0o600
+        sink.write(b"partial private data")
+        if overwrite:
+            assert output.read_bytes() == b"original"
+        else:
+            assert not output.exists()
+        if failure == "write":
+            raise OSError("disk full")
+        if failure == "cancel":
+            raise tools.streaming.OperationCancelled("cancelled")
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        return None
+
+    def fail(*_args, **_kwargs):
+        raise OSError("injected failure")
+
+    if failure == "fsync":
+        monkeypatch.setattr(tools.os, "fsync", fail)
+    if failure == "publish":
+        monkeypatch.setattr(tools.os, "replace" if overwrite else "link", fail)
+    expected = (
+        KeyboardInterrupt
+        if failure == "interrupt"
+        else (tools.streaming.OperationCancelled if failure == "cancel" else tools.AgentCommandError)
+    )
+    with pytest.raises(expected):
+        tools._write_workspace_stream("output.bin", tmp_path, write, overwrite, "decrypt", private_file=True)
+    if overwrite:
+        assert output.read_bytes() == b"original"
+        if os.name != "nt":
+            assert stat.S_IMODE(output.stat().st_mode) == 0o640
+    else:
+        assert not output.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_stream_non_overwrite_rejects_destination_created_during_operation(tmp_path):
+    output = tmp_path / "output.bin"
+
+    def write(sink):
+        sink.write(b"stream output")
+        output.write_bytes(b"concurrent writer")
+
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._write_workspace_stream("output.bin", tmp_path, write, False, "encrypt")
+    assert exc.value.error_code == "output_exists"
+    assert output.read_bytes() == b"concurrent writer"
+    assert list(tmp_path.iterdir()) == [output]
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "O_NOFOLLOW"), reason="POSIX descriptors required")
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_stream_output_stays_anchored_during_parent_replacement(tmp_path, overwrite):
+    workspace = tmp_path / "workspace"
+    parent = workspace / "output"
+    parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    moved = workspace / "original-output"
+    if overwrite:
+        (parent / "message.bin").write_bytes(b"original")
+    (outside / "message.bin").write_bytes(b"outside")
+
+    def write(sink):
+        parent.rename(moved)
+        parent.symlink_to(outside, target_is_directory=True)
+        sink.write(b"private plaintext")
+        return "written"
+
+    _, result = tools._write_workspace_stream(
+        "output/message.bin", workspace, write, overwrite, "decrypt", private_file=True
+    )
+    assert result == "written"
+    assert (moved / "message.bin").read_bytes() == b"private plaintext"
+    assert stat.S_IMODE((moved / "message.bin").stat().st_mode) == 0o600
+    assert (outside / "message.bin").read_bytes() == b"outside"
+    assert not list(moved.glob(".*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt" or not hasattr(os, "O_NOFOLLOW"), reason="POSIX descriptors required")
+def test_stream_input_rejects_symlink_swap_before_open(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "input.bin"
+    source.write_bytes(b"inside")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside secret")
+    resolve = tools._resolve_input_path
+
+    def swap_after_resolution(*args):
+        result = resolve(*args)
+        source.unlink()
+        source.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(tools, "_resolve_input_path", swap_after_resolution)
+    with pytest.raises(tools.AgentCommandError) as exc:
+        with tools._open_workspace_stream("input.bin", workspace, 64):
+            pytest.fail("replacement symlink must not open")
+    assert exc.value.error_code == "invalid_path"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits renaming an open input file")
+def test_stream_input_keeps_original_descriptor_after_path_replacement(tmp_path):
+    source_path = tmp_path / "input.bin"
+    source_path.write_bytes(b"original contents")
+    with tools._open_workspace_stream("input.bin", tmp_path, 64) as (_path, source):
+        source_path.rename(tmp_path / "original.bin")
+        source_path.write_bytes(b"replacement contents")
+        assert source.read() == b"original contents"
+
+
+@pytest.mark.parametrize("failure", ["cancel", "interrupt", "authentication"])
+def test_decrypt_stream_failure_returns_json_without_publishing(monkeypatch, tmp_path, capsys, failure):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.pqc").write_bytes(b"ciphertext")
+    (tmp_path / "private.pem").write_text(_valid_private_pem(), encoding="utf-8")
+    output = tmp_path / "output.bin"
+    output.write_bytes(b"original")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
+    monkeypatch.setattr(core, "load_key_pem", lambda *_args, **_kwargs: (b"private", cfg.HYBRID_KEM_ALG, "private"))
+    monkeypatch.setattr(tools, "_resolve_decryption_backends", lambda *_args: (cfg.KEM_ALG,))
+
+    def decrypt(_source, sink, _key, **_kwargs):
+        sink.write(b"unpublished data")
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        if failure == "cancel":
+            raise tools.streaming.OperationCancelled("private cancellation detail")
+        raise core.AuthenticationFailedError("private crypto detail")
+
+    monkeypatch.setattr(tools.streaming, "decrypt_stream", decrypt)
+    code, payload = _run_agent(
+        ["decrypt", "--input", "input.pqc", "--private-key", "private.pem", "--output", "output.bin", "--overwrite"],
+        capsys,
+    )
+    assert code == tools.EXIT_CRYPTO_FAILURE
+    assert payload["operation"] == "decrypt"
+    assert payload["error_code"] == ("decryption_failed" if failure == "authentication" else "cancelled")
+    assert "private cancellation detail" not in payload["message"]
+    assert "private crypto detail" not in payload["message"]
+    assert output.read_bytes() == b"original"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_stream_reports_directory_sync_failure_after_publication(monkeypatch, tmp_path, overwrite):
+    output = tmp_path / "output.bin"
+    if overwrite:
+        output.write_bytes(b"old")
+
+    def directory_sync_failed(*_args):
+        raise OSError("injected directory sync failure")
+
+    monkeypatch.setattr(tools, "_fsync_parent_dir", directory_sync_failed)
+    with pytest.raises(tools.AgentCommandError) as exc:
+        tools._write_workspace_stream(
+            "output.bin", tmp_path, lambda sink: sink.write(b"complete output"), overwrite, "decrypt", private_file=True
+        )
+    assert exc.value.error_code == "output_durability_failed"
+    assert exc.value.exit_code == tools.EXIT_UNEXPECTED
+    assert "published" in exc.value.message
+    assert output.read_bytes() == b"complete output"
+    assert not list(tmp_path.glob(".*.tmp"))

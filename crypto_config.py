@@ -75,6 +75,8 @@ class CryptoConfig:
 
     # --- General ---
     MAX_FILE_BYTES = 100 * 1024 * 1024
+    STREAM_CHUNK_BYTES = 1024 * 1024
+    MAX_STREAM_FILE_BYTES = 1024 * 1024 * 1024
     MAX_PEM_BYTES = 128 * 1024
     MAX_RAW_KEY_BYTES = 64 * 1024
     MAX_KEM_ALG_NAME_BYTES = 64

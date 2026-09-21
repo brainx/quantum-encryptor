@@ -36,6 +36,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Supplying weak, missing, or reused private-key passwords.
 - Tampering with encrypted-file headers, KEM ciphertext, nonce, AES ciphertext, or authentication tag.
 - Feeding oversized PEM, plaintext, or encrypted-container inputs to exhaust process memory.
+- Exhausting temporary disk space or interrupting a streaming operation before output publication.
 - Using absolute paths, parent traversal, or symlinks to make the agent CLI read or write outside the workspace.
 - Triggering native backend failures during import, key generation, encryption, or decryption.
 - Leaking plaintext, private keys, passwords, raw bytes, or absolute local paths through JSON output or logs.
@@ -57,6 +58,8 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Version 4 AES keys must bind both key shares, both X25519 public values, the suite identifier, and the application domain separator.
 - PEM, plaintext, and encrypted-container inputs must be bounded before expensive parsing or cryptographic work.
 - Decryption failures do not produce plaintext output files.
+- Streaming decryption authenticates an owned ciphertext snapshot before writing any plaintext to a private staging file, and authenticates again before publishing the requested destination. It never authenticates one pathname and then reopens a potentially replaced source for output.
+- Streaming CLI outputs are staged in the validated destination directory and published atomically, preserving existing destinations on pre-publication errors and exclusive non-overwrite behavior. A directory-sync failure after publication reports `output_durability_failed` without rolling back the published output.
 - Agent CLI paths stay workspace-relative and cannot escape through symlinks.
 - Agent CLI JSON output never includes secret material or absolute local paths.
 - Private-key files and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
@@ -89,7 +92,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 
 ## Limitations
 
-- The app processes files in memory and is not suitable for very large streaming workflows.
+- Existing web and bytes-based APIs retain a 100 MiB in-memory limit. CLI file commands use bounded buffers up to 1 GiB, with temporary disk space for ciphertext snapshots and staged output. Abrupt termination can leave staged output; deletion is not secure erasure.
 - Python cannot guarantee secure zeroization of immutable secret byte strings.
 - The loopback API trusts the local machine: malicious local software can use the allowed authority to obtain and send the auth cookie, so this protection does not defend against a malicious local process. Keep the server bound to `127.0.0.1`; never expose it on a network interface.
 - The local web API does not rate-limit private-key password attempts. Each attempt costs a full scrypt derivation, and an attacker holding the encrypted PEM would brute force offline instead, so online throttling adds little.
