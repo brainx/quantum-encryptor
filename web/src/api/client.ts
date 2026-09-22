@@ -20,6 +20,13 @@ export class ApiError extends Error {
   }
 }
 
+export function assertRecipientFingerprintSupport(health: Health): void {
+  if (health?.supportsRecipientFingerprint !== true) {
+    throw new ApiError(409, "recipient_fingerprint_unsupported",
+      "Restart an updated local service to enforce the expected recipient fingerprint.");
+  }
+}
+
 async function rejectedApiToken(response: Response): Promise<boolean> {
   if (response.status !== 403) return false;
   try {
@@ -39,12 +46,23 @@ async function ensureHealth(): Promise<void> {
   }
 }
 
-async function fetchStateChanging(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
-  await ensureHealth();
+async function fetchStateChanging(input: RequestInfo | URL, init: RequestInit, requireRecipientFingerprint = false): Promise<Response> {
+  if (requireRecipientFingerprint) {
+    init.signal?.throwIfAborted();
+    const health = await fetchHealth();
+    init.signal?.throwIfAborted();
+    assertRecipientFingerprintSupport(health);
+    healthLoaded = true;
+  } else await ensureHealth();
   let response = await fetch(input, init);
   if (await rejectedApiToken(response)) {
     // The per-process token rotates on server restart; renew the auth cookie and retry once.
-    await fetchHealth();
+    if (requireRecipientFingerprint) init.signal?.throwIfAborted();
+    const health = await fetchHealth();
+    if (requireRecipientFingerprint) {
+      init.signal?.throwIfAborted();
+      assertRecipientFingerprintSupport(health);
+    }
     response = await fetch(input, init);
   }
   return response;
@@ -160,13 +178,15 @@ export async function encryptFile(
   file: File,
   publicKey: File,
   outputFilename: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expectedRecipientFingerprint?: string
 ): Promise<DownloadResult> {
   const form = new FormData();
   form.append("file", file);
   form.append("public_key", publicKey);
   form.append("output_filename", outputFilename);
-  const response = await fetchStateChanging("/api/files/encrypt", { method: "POST", body: form, signal });
+  if (expectedRecipientFingerprint !== undefined) form.append("expected_recipient_fingerprint", expectedRecipientFingerprint);
+  const response = await fetchStateChanging("/api/files/encrypt", { method: "POST", body: form, signal }, expectedRecipientFingerprint !== undefined);
   if (!response.ok) await parseError(response);
   return {
     blob: await response.blob(),

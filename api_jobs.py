@@ -236,15 +236,35 @@ class JobStore:
         finally:
             job.upload_task = None
 
-    def start(self, job: FileJob, pem: str, password: str, output_filename: str) -> None:
+    def start(
+        self,
+        job: FileJob,
+        pem: str,
+        password: str,
+        output_filename: str,
+        expected_recipient_fingerprint: str | None = None,
+    ) -> None:
         if job.state != "ready":
             raise JobError(409, "invalid_job_state", "Upload a complete file before starting this job.")
+        if expected_recipient_fingerprint is not None:
+            core.validate_recipient_fingerprint(expected_recipient_fingerprint)
+            if job.mode != "encrypt":
+                raise core.InvalidRecipientFingerprintError("Recipient verification applies only to encryption.")
         job.state = "running"
         job.phase = "preparing"
         job.processed = 0
-        job.task = asyncio.create_task(self._execute(job, pem, password, output_filename))
+        job.task = asyncio.create_task(
+            self._execute(job, pem, password, output_filename, expected_recipient_fingerprint)
+        )
 
-    def _process(self, job: FileJob, pem: str, password: str, output_filename: str) -> None:
+    def _process(
+        self,
+        job: FileJob,
+        pem: str,
+        password: str,
+        output_filename: str,
+        expected_recipient_fingerprint: str | None = None,
+    ) -> None:
         if job.cancel.is_set():
             raise stream.OperationCancelled()
         info = core.inspect_key_pem_strict(pem)
@@ -255,6 +275,8 @@ class JobStore:
         if raw is None or algorithm is None or key_type != expected_type:
             raise JobError(400, "private_key_failed", "Could not unlock the private key. Check its password and file.")
         try:
+            if expected_recipient_fingerprint is not None:
+                core.verify_recipient_fingerprint(raw, algorithm, expected_recipient_fingerprint)
             if job.input is None:
                 raise RuntimeError("Input storage is unavailable.")
             if job.mode == "verify":
@@ -289,9 +311,24 @@ class JobStore:
         finally:
             del raw
 
-    async def _execute(self, job: FileJob, pem: str, password: str, output_filename: str) -> None:
+    async def _execute(
+        self,
+        job: FileJob,
+        pem: str,
+        password: str,
+        output_filename: str,
+        expected_recipient_fingerprint: str | None = None,
+    ) -> None:
         try:
-            await job.lease.run_owned(self._process, job, pem, password, output_filename, on_cancel=job.cancel.set)
+            await job.lease.run_owned(
+                self._process,
+                job,
+                pem,
+                password,
+                output_filename,
+                expected_recipient_fingerprint,
+                on_cancel=job.cancel.set,
+            )
             job.state = "cancelled" if job.cancel.is_set() else "complete"
         except (stream.OperationCancelled, asyncio.CancelledError):
             job.state = "cancelled"
@@ -299,6 +336,13 @@ class JobStore:
             job.state = "failed"
             if isinstance(exc, JobError):
                 code, message = exc.code, exc.message
+            elif isinstance(exc, core.InvalidRecipientFingerprintError):
+                code, message = "invalid_recipient_fingerprint", "Provide the complete canonical recipient fingerprint."
+            elif isinstance(exc, core.RecipientFingerprintMismatchError):
+                code, message = (
+                    "recipient_fingerprint_mismatch",
+                    "The public key does not match the expected recipient fingerprint.",
+                )
             elif isinstance(exc, core.CryptoDependencyError):
                 code, message = "backend_unavailable", "The post-quantum backend is unavailable."
             elif isinstance(exc, OSError):

@@ -14,14 +14,18 @@ def _form(fields):
     return urlencode(fields).encode(), [(b"content-type", b"application/x-www-form-urlencoded")]
 
 
-def _key_form(password=""):
+def _key_form(password="", fingerprints=(), fingerprint_file=False):
     body = (
         b'--job-boundary\r\nContent-Disposition: form-data; name="key"; filename="key.pem"\r\n'
         b"Content-Type: application/octet-stream\r\n\r\nsynthetic key\r\n"
-        b'--job-boundary\r\nContent-Disposition: form-data; name="password"\r\n\r\n'
-        + password.encode()
-        + b"\r\n--job-boundary--\r\n"
+        b'--job-boundary\r\nContent-Disposition: form-data; name="password"\r\n\r\n' + password.encode() + b"\r\n"
     )
+    for fingerprint in fingerprints:
+        disposition = 'Content-Disposition: form-data; name="expected_recipient_fingerprint"'
+        if fingerprint_file:
+            disposition += '; filename="fingerprint.txt"'
+        body += b"--job-boundary\r\n" + disposition.encode() + b"\r\n\r\n" + fingerprint.encode() + b"\r\n"
+    body += b"--job-boundary--\r\n"
     return body, [(b"content-type", b"multipart/form-data; boundary=job-boundary")]
 
 
@@ -100,11 +104,98 @@ async def _reserve(app, mode="encrypt", size=7, filename="payload.bin"):
     return json.loads(data)["job"]
 
 
+@pytest.mark.parametrize("failure", ["blank", "malformed", "duplicate", "file", "decrypt", "verify"])
+def test_job_start_rejects_invalid_recipient_fingerprint_fields_without_worker(monkeypatch, failure):
+    fingerprint = "QE1-SHA3-256:" + "a" * 64
+    values = [fingerprint]
+    if failure == "blank":
+        values = [""]
+    elif failure == "malformed":
+        values = [fingerprint + "\n"]
+    elif failure == "duplicate":
+        values *= 2
+    monkeypatch.setattr(JobStore, "start", lambda *_args: pytest.fail("Invalid fingerprint must not start a job"))
+    closed_uploads = []
+    original_close = api_app.UploadFile.close
+
+    async def close(upload):
+        await original_close(upload)
+        closed_uploads.append(upload.file.closed)
+
+    monkeypatch.setattr(api_app.UploadFile, "close", close)
+
+    async def scenario():
+        app = api_app.create_app()
+        store = app.app.state.jobs
+        try:
+            mode = failure if failure in {"decrypt", "verify"} else "encrypt"
+            reserved = await _reserve(app, mode=mode)
+            path = f'/api/jobs/{reserved["id"]}'
+            status, _, _, _ = await _request(
+                app,
+                path + "/upload",
+                method="PUT",
+                body=b"payload",
+                headers=[(b"content-type", b"application/octet-stream")],
+            )
+            assert status == 200
+            body, headers = _key_form(fingerprints=values, fingerprint_file=failure == "file")
+            status, response_headers, data, _ = await _request(app, path + "/start", body=body, headers=headers)
+            assert status == 400 and json.loads(data)["error_code"] == "invalid_recipient_fingerprint"
+            assert response_headers[b"cache-control"] == b"no-store"
+            assert fingerprint.encode() not in data
+            assert store.job.state == "ready" and store.job.task is None and store.job.output is None
+            assert closed_uploads and all(closed_uploads)
+            status, _, _, _ = await _request(app, path + "/clear")
+            assert status == 200 and store.job is None
+            lease = store.worker.acquire()
+            assert lease is not None
+            lease.close()
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_job_start_passes_supplied_recipient_fingerprint_to_worker(monkeypatch):
+    fingerprint = "QE1-SHA3-256:" + "a" * 64
+    received = []
+
+    def process(self, job, pem, password, filename, expected_recipient_fingerprint):
+        received.append(expected_recipient_fingerprint)
+
+    monkeypatch.setattr(JobStore, "_process", process)
+
+    async def scenario():
+        app = api_app.create_app()
+        store = app.app.state.jobs
+        try:
+            reserved = await _reserve(app)
+            path = f'/api/jobs/{reserved["id"]}'
+            await _request(
+                app,
+                path + "/upload",
+                method="PUT",
+                body=b"payload",
+                headers=[(b"content-type", b"application/octet-stream")],
+            )
+            body, headers = _key_form(fingerprints=[fingerprint])
+            status, _, _, _ = await _request(app, path + "/start", body=body, headers=headers)
+            assert status == 200
+            await store.job.task
+            assert received == [fingerprint]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("mode", ["encrypt", "decrypt", "verify"])
 def test_jobs_upload_start_status_download_and_clear(monkeypatch, mode):
     event_loop_thread = threading.get_ident()
 
-    def process(self, job, pem, password, output_filename):
+    def process(self, job, pem, password, output_filename, expected_recipient_fingerprint=None):
+        assert expected_recipient_fingerprint is None
         assert threading.get_ident() != event_loop_thread
         assert pem == "synthetic key"
         assert password == ("" if mode == "encrypt" else "synthetic password")

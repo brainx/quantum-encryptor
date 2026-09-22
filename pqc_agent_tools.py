@@ -531,6 +531,20 @@ def _password_from_env(env_name: str, operation: str, required: bool) -> Optiona
 def _agent_error_from_core(operation: str, exc: Exception) -> AgentCommandError:
     if isinstance(exc, streaming.OperationCancelled):
         return AgentCommandError("cancelled", "Operation cancelled.", EXIT_CRYPTO_FAILURE, operation)
+    if isinstance(exc, core.InvalidRecipientFingerprintError):
+        return AgentCommandError(
+            "invalid_recipient_fingerprint",
+            "Expected recipient fingerprint must be a complete QE1-SHA3-256 fingerprint.",
+            EXIT_INVALID_INPUT,
+            operation,
+        )
+    if isinstance(exc, core.RecipientFingerprintMismatchError):
+        return AgentCommandError(
+            "recipient_fingerprint_mismatch",
+            "The public key does not match the expected recipient fingerprint. Encryption was not started.",
+            EXIT_INVALID_INPUT,
+            operation,
+        )
     if isinstance(exc, core.AuthenticationFailedError):
         return AgentCommandError(
             "verification_failed" if operation == "verify-file" else "decryption_failed",
@@ -733,6 +747,17 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
                 EXIT_INVALID_INPUT,
                 operation,
             )
+        try:
+            public_key_fingerprint = core.verify_recipient_fingerprint(
+                public_key, kem_alg, args.expected_recipient_fingerprint
+            )
+        except (
+            core.InvalidRecipientFingerprintError,
+            core.RecipientFingerprintMismatchError,
+            core.InvalidKeyFormatError,
+            core.UnsupportedAlgorithmError,
+        ) as exc:
+            raise _agent_error_from_core(operation, exc) from exc
         _resolve_backend(operation)
 
         def write_encrypted(sink: BinaryIO, key: bytes = public_key) -> core.EncryptedFileMetadata:
@@ -757,6 +782,7 @@ def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
         kem=metadata.kem_alg,
         input=_relative_to_workspace(input_path, workspace),
         public_key=_relative_to_workspace(public_key_path, workspace),
+        public_key_fingerprint=public_key_fingerprint,
         output=_relative_to_workspace(output_path, workspace),
         bytes_written=metadata.total_bytes,
     )
@@ -940,6 +966,11 @@ def build_parser() -> argparse.ArgumentParser:
     encrypt = subparsers.add_parser("encrypt", help="Encrypt a workspace file.")
     encrypt.add_argument("--input", required=True)
     encrypt.add_argument("--public-key", required=True)
+    encrypt.add_argument(
+        "--expected-recipient-fingerprint",
+        default=None,
+        help="Require the public key to match this complete fingerprint from a separately trusted source.",
+    )
     encrypt.add_argument("--output", required=True)
     encrypt.add_argument("--overwrite", action="store_true")
     _add_stream_limit_argument(encrypt)

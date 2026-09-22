@@ -97,11 +97,12 @@ def test_download_filename_suggestion_uses_existing_ui_helper():
 
 
 def _multipart_form(
-    files: list[tuple[str, str, bytes]], fields: dict[str, str] | None = None
+    files: list[tuple[str, str, bytes]], fields: dict[str, str] | list[tuple[str, str]] | None = None
 ) -> tuple[bytes, list[tuple[bytes, bytes]]]:
     boundary = "test-boundary"
     body = b""
-    for name, value in (fields or {}).items():
+    field_items = fields.items() if isinstance(fields, dict) else fields or []
+    for name, value in field_items:
         body += (f"--{boundary}\r\n" f'Content-Disposition: form-data; name="{name}"\r\n' "\r\n" f"{value}\r\n").encode(
             "utf-8"
         )
@@ -1612,6 +1613,70 @@ def test_encrypt_file_rejects_invalid_public_key(monkeypatch):
 
     assert status == 400
     assert payload["error_code"] == "invalid_public_key"
+
+
+@pytest.mark.parametrize("failure", ["blank", "malformed", "duplicate", "file"])
+def test_encrypt_rejects_invalid_recipient_fingerprint_before_key_load(monkeypatch, tracked_uploads, failure):
+    fingerprint = "QE1-SHA3-256:" + "a" * 64
+    files = [("file", "file.bin", b"plaintext"), ("public_key", "public.pem", b"key")]
+    fields = [("expected_recipient_fingerprint", "" if failure == "blank" else fingerprint)]
+    if failure == "malformed":
+        fields = [("expected_recipient_fingerprint", fingerprint + "\n")]
+    elif failure == "duplicate":
+        fields.append(("expected_recipient_fingerprint", fingerprint))
+    elif failure == "file":
+        fields = []
+        files.append(("expected_recipient_fingerprint", "fingerprint.txt", fingerprint.encode()))
+    body, headers = _multipart_form(files, fields)
+    monkeypatch.setattr(
+        core, "load_key_pem", lambda *_args: pytest.fail("Invalid fingerprint must fail before key load")
+    )
+
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/files/encrypt", body=body, headers=_with_api_token(headers))
+    )
+
+    assert status == 400
+    assert json.loads(response_body)["error_code"] == "invalid_recipient_fingerprint"
+    assert fingerprint.encode() not in response_body
+    assert tracked_uploads and all(upload.closed for upload in tracked_uploads)
+    _assert_api_no_store(response_headers)
+
+
+@pytest.mark.parametrize("matched", [False, True])
+def test_encrypt_checks_fingerprint_of_loaded_key_before_encryption(monkeypatch, tracked_uploads, matched):
+    public = bytes(range(cfg.X25519_KEY_BYTES)) + bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES)
+    expected = core.get_public_key_fingerprint(public, cfg.HYBRID_KEM_ALG)
+    if not matched:
+        expected = "QE1-SHA3-256:" + "0" * 64
+    body, headers = _multipart_form(
+        [("file", "plain.bin", b"plaintext"), ("public_key", "public.pem", b"key")],
+        {"expected_recipient_fingerprint": expected},
+    )
+    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (public, cfg.HYBRID_KEM_ALG, "public"))
+    calls = []
+
+    def encrypt(data, key, algorithm):
+        calls.append((data, key, algorithm))
+        return b"ciphertext"
+
+    monkeypatch.setattr(core, "encrypt_file_pro", encrypt)
+    status, response_headers, response_body = asyncio.run(
+        _call_app_raw("/api/files/encrypt", body=body, headers=_with_api_token(headers))
+    )
+
+    if matched:
+        assert status == 200 and response_body == b"ciphertext"
+        assert calls == [(b"plaintext", public, cfg.HYBRID_KEM_ALG)]
+    else:
+        assert status == 400 and json.loads(response_body)["error_code"] == "recipient_fingerprint_mismatch"
+        assert not calls
+    assert tracked_uploads and all(upload.closed for upload in tracked_uploads)
+    _assert_api_no_store(response_headers)
+
+
+def test_recipient_fingerprint_capability_is_explicit():
+    assert api_app._health_payload()["supportsRecipientFingerprint"] is True
 
 
 @pytest.mark.parametrize("legacy_kem", [cfg.KEM_ALG, cfg.LEGACY_HYBRID_KEM_ALG])

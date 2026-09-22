@@ -15,12 +15,14 @@ function encryptionError(error: unknown): string {
 
 export function useBatchEncryption(encrypt: EncryptFileOperation) {
   const { items, busy, start: startFiles, cancel, clear } = useBatchFiles(encryptionError);
-  const start = useCallback((files: readonly File[], publicKey: File) => {
+  const start = useCallback((files: readonly File[], publicKey: File, expectedRecipientFingerprint?: string) => {
     if (files.length === 0 || files.length > MAX_BATCH_FILES) return;
     const names = uniqueBatchFilenames(files.map((file) => `${sanitizeBatchFilename(file.name)}.pqc`));
     startFiles(
       files.map((file, index) => ({ file, outputFilename: names[index] })),
-      (file, outputFilename, signal) => encrypt(file, publicKey, outputFilename, signal)
+      (file, outputFilename, signal) => expectedRecipientFingerprint === undefined
+        ? encrypt(file, publicKey, outputFilename, signal)
+        : encrypt(file, publicKey, outputFilename, signal, expectedRecipientFingerprint)
     );
   }, [encrypt, startFiles]);
   const encryptionItems: BatchEncryptionItem[] = items.map((item) => ({

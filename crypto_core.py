@@ -9,6 +9,7 @@ import io
 import binascii
 import ctypes.util
 import importlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Protocol
@@ -79,6 +80,14 @@ class SizeLimitError(ValueError):
 
 class InvalidKeyFormatError(ValueError):
     """Raised when a key file is malformed or semantically invalid."""
+
+
+class InvalidRecipientFingerprintError(ValueError):
+    """Raised when an expected recipient fingerprint is not canonical."""
+
+
+class RecipientFingerprintMismatchError(ValueError):
+    """Raised when the loaded public key differs from the expected recipient."""
 
 
 @dataclass(frozen=True)
@@ -340,6 +349,26 @@ def get_public_key_fingerprint(key_bytes: bytes, kem_alg: str) -> str:
         + key_bytes
     )
     return f"QE1-SHA3-256:{hashlib.sha3_256(fingerprint_input).hexdigest()}"
+
+
+def validate_recipient_fingerprint(expected_fingerprint: str) -> str:
+    """Require a complete canonical fingerprint without silently normalizing input."""
+    if (
+        not isinstance(expected_fingerprint, str)
+        or re.fullmatch(r"QE1-SHA3-256:[0-9a-f]{64}", expected_fingerprint) is None
+    ):
+        raise InvalidRecipientFingerprintError("Provide the complete canonical recipient fingerprint.")
+    return expected_fingerprint
+
+
+def verify_recipient_fingerprint(public_key: bytes, kem_alg: str, expected_fingerprint: str | None = None) -> str:
+    """Compare an independently supplied fingerprint with the actual validated key."""
+    if expected_fingerprint is not None:
+        validate_recipient_fingerprint(expected_fingerprint)
+    actual_fingerprint = get_public_key_fingerprint(public_key, kem_alg)
+    if expected_fingerprint is not None and not hmac.compare_digest(actual_fingerprint, expected_fingerprint):
+        raise RecipientFingerprintMismatchError("The public key does not match the expected recipient fingerprint.")
+    return actual_fingerprint
 
 
 def get_public_key_from_private(private_key_bytes: bytes, kem_alg: str) -> bytes:

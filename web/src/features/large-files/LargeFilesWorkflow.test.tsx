@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { KeyInspectResult } from "../../api";
@@ -44,6 +44,60 @@ async function prepare(user: ReturnType<typeof userEvent.setup>, mode: LargeFile
 }
 
 describe("LargeFilesWorkflow", () => {
+  it.each([
+    ["QE1-SHA3-256:incomplete", true],
+    [`QE1-SHA3-256:${"b".repeat(64)}`, true],
+    [fingerprint, undefined]
+  ])("blocks file reservation for an invalid, mismatched, or unsupported expectation (%s)", async (expected, supportsRecipientFingerprint) => {
+    const user = userEvent.setup();
+    const api = operations();
+    render(<LargeFilesWorkflow health={{ ...health, supportsRecipientFingerprint }} inspect={inspect()} operations={api} />);
+    await prepare(user);
+    const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+    await user.type(field, expected as string);
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("button", { name: "Encrypt large file" })).toBeDisabled();
+    fireEvent.submit(field.closest("form")!);
+    expect(api.create).not.toHaveBeenCalled();
+    expect(api.upload).not.toHaveBeenCalled();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("retains the submitted expectation through upload and clears it with the temporary job", async () => {
+    const user = userEvent.setup();
+    const api = operations();
+    const upload = deferred<LargeFileJob>();
+    vi.mocked(api.upload).mockReturnValue(upload.promise);
+    render(<LargeFilesWorkflow health={health} inspect={inspect()} operations={api} />);
+    const { key } = await prepare(user);
+    const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+    await user.type(field, ` ${fingerprint} `);
+    expect(screen.getByText("Expected fingerprint matches the selected public key.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Encrypt large file" }));
+    await waitFor(() => expect(api.upload).toHaveBeenCalled());
+    expect(field).toBeDisabled();
+    fireEvent.change(field, { target: { value: "" } });
+    expect(field).toHaveValue(` ${fingerprint} `);
+    expect(api.start).not.toHaveBeenCalled();
+    await act(async () => upload.resolve(snapshot("encrypt", { state: "ready" })));
+    await screen.findByRole("button", { name: "Download result" });
+    expect(api.start).toHaveBeenCalledWith("job-one", key, "", expect.any(AbortSignal), fingerprint);
+    expect(api.start).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "Clear temporary files" }));
+    expect(field).toHaveValue("");
+    expect(field).toBeEnabled();
+  });
+
+  it("resets the expectation when changing operation mode", async () => {
+    const user = userEvent.setup();
+    render(<LargeFilesWorkflow health={health} inspect={inspect()} operations={operations()} />);
+    await user.type(screen.getByLabelText("Expected recipient fingerprint (optional)"), fingerprint);
+    await user.selectOptions(screen.getByLabelText("Operation"), "decrypt");
+    expect(screen.queryByLabelText("Expected recipient fingerprint (optional)")).not.toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("Operation"), "encrypt");
+    expect(screen.getByLabelText("Expected recipient fingerprint (optional)")).toHaveValue("");
+  });
+
   it.each([
     ["encrypting", "Encrypting file."],
     ["verifying", "Authenticating file."],

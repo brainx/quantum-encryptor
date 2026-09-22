@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "../../api";
@@ -30,6 +30,74 @@ async function prepareEncryption(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe("EncryptWorkflow", () => {
+  it.each(["QE1-SHA3-256:abc", `QE1-SHA3-256:${"A".repeat(64)}`, `QE1-SHA3-256:${"b".repeat(64)}`, `QE1-SHA3-256:\n${"a".repeat(64)}`])(
+    "blocks encryption when the expected fingerprint is malformed or mismatched (%s)", async (expected) => {
+      const user = userEvent.setup();
+      const encrypt = vi.fn();
+      render(<EncryptWorkflow health={READY_HEALTH} inspect={vi.fn().mockResolvedValue(publicKeyInspection())} encrypt={encrypt} />);
+      await prepareEncryption(user);
+      const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+      expect(field).toHaveValue("");
+      await user.type(field, expected);
+      expect(field).toHaveAttribute("aria-invalid", "true");
+      expect(screen.getByRole("button", { name: "Encrypt file" })).toBeDisabled();
+      fireEvent.submit(field.closest("form")!);
+      expect(encrypt).not.toHaveBeenCalled();
+    }
+  );
+
+  it("trims and forwards the independently entered matching fingerprint", async () => {
+    const user = userEvent.setup();
+    const encrypt = vi.fn().mockResolvedValue({ filename: "report.pqc", blob: new Blob(["encrypted"]) });
+    render(<EncryptWorkflow health={READY_HEALTH} inspect={vi.fn().mockResolvedValue(publicKeyInspection())} encrypt={encrypt} save={vi.fn()} />);
+    await prepareEncryption(user);
+    const field = screen.getByRole("textbox", { name: "Expected recipient fingerprint (optional)" });
+    expect(field).toHaveAttribute("rows", "2");
+    await user.type(field, `\n  ${TEST_PUBLIC_KEY_FINGERPRINT}  \n`);
+    expect(screen.getByText("Expected fingerprint matches the selected public key.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Encrypt file" }));
+    expect(encrypt).toHaveBeenCalledWith(expect.any(File), expect.any(File), "report_encrypted.pqc", expect.any(AbortSignal), TEST_PUBLIC_KEY_FINGERPRINT);
+  });
+
+  it("blocks a supplied expectation on an older service but preserves optional encryption", async () => {
+    const user = userEvent.setup();
+    const encrypt = vi.fn();
+    render(<EncryptWorkflow health={{ ...READY_HEALTH, supportsRecipientFingerprint: undefined }} inspect={vi.fn().mockResolvedValue(publicKeyInspection())} encrypt={encrypt} />);
+    await prepareEncryption(user);
+    const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+    await user.type(field, TEST_PUBLIC_KEY_FINGERPRINT);
+    expect(screen.getByText("Restart an updated local service to enforce the expected recipient fingerprint.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Encrypt file" })).toBeDisabled();
+    expect(screen.queryByText("Expected fingerprint matches the selected public key.")).not.toBeInTheDocument();
+    await user.clear(field);
+    expect(screen.getByRole("button", { name: "Encrypt file" })).toBeEnabled();
+    expect(encrypt).not.toHaveBeenCalled();
+  });
+
+  it("retains the expected fingerprint while revoking stale matches on key changes", async () => {
+    const user = userEvent.setup();
+    let resolveOld!: (value: ReturnType<typeof publicKeyInspection>) => void;
+    let resolveCurrent!: (value: ReturnType<typeof publicKeyInspection>) => void;
+    const inspect = vi.fn().mockResolvedValueOnce(publicKeyInspection())
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveCurrent = resolve; }));
+    render(<EncryptWorkflow health={READY_HEALTH} inspect={inspect} encrypt={vi.fn()} />);
+    await prepareEncryption(user);
+    const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+    await user.type(field, TEST_PUBLIC_KEY_FINGERPRINT);
+    expect(screen.getByText("Expected fingerprint matches the selected public key.")).toBeVisible();
+    await user.upload(screen.getByLabelText("Recipient public key"), new File(["old"], "old.pem"));
+    expect(field).toHaveValue(TEST_PUBLIC_KEY_FINGERPRINT);
+    expect(screen.queryByText("Expected fingerprint matches the selected public key.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Encrypt file" })).toBeDisabled();
+    await user.upload(screen.getByLabelText("Recipient public key"), new File(["current"], "current.pem"));
+    await act(async () => resolveCurrent({ ...publicKeyInspection(), keyInfo: { ...publicKeyInspection().keyInfo, public_key_fingerprint: `QE1-SHA3-256:${"b".repeat(64)}` } }));
+    await act(async () => resolveOld(publicKeyInspection()));
+    expect(screen.getByText(/The expected fingerprint does not match/)).toBeVisible();
+    expect(screen.queryByText("Expected fingerprint matches the selected public key.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Encrypt file" })).toBeDisabled();
+  });
+
   it("encrypts with a compatible public key and saves the returned file", async () => {
     const inspect = vi.fn().mockResolvedValue(publicKeyInspection());
     const encrypt = vi.fn().mockResolvedValue({

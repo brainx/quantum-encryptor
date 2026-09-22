@@ -32,6 +32,48 @@ async function prepareBatch(user: ReturnType<typeof userEvent.setup>, files = [n
 }
 
 describe("BatchEncryptWorkflow", () => {
+  it.each([
+    ["not a fingerprint", true],
+    [`QE1-SHA3-256:${"b".repeat(64)}`, true],
+    [FINGERPRINT, undefined]
+  ])("blocks an invalid, mismatched, or unsupported batch expectation (%s)", async (expected, supportsRecipientFingerprint) => {
+    const user = userEvent.setup();
+    const encrypt = vi.fn();
+    render(<BatchEncryptWorkflow health={{ ...READY_HEALTH, supportsRecipientFingerprint }} inspect={vi.fn().mockResolvedValue(publicKeyInspection())} encrypt={encrypt} />);
+    await prepareBatch(user);
+    const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+    await user.type(field, expected as string);
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("button", { name: "Encrypt batch" })).toBeDisabled();
+    fireEvent.submit(field.closest("form")!);
+    expect(encrypt).not.toHaveBeenCalled();
+  });
+
+  it("captures one expectation for every file and clears it only when the batch is cleared", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<DownloadResult>();
+    const encrypt = vi.fn().mockReturnValueOnce(pending.promise).mockResolvedValueOnce(ciphertext("b.txt.pqc"));
+    render(<BatchEncryptWorkflow health={READY_HEALTH} inspect={vi.fn().mockResolvedValue(publicKeyInspection())} encrypt={encrypt} />);
+    const files = [new File(["a"], "a.txt"), new File(["b"], "b.txt")];
+    await prepareBatch(user, files);
+    const field = screen.getByLabelText("Expected recipient fingerprint (optional)");
+    await user.type(field, ` ${FINGERPRINT} `);
+    await user.click(screen.getByRole("button", { name: "Encrypt batch" }));
+    expect(field).toBeDisabled();
+    fireEvent.change(field, { target: { value: `QE1-SHA3-256:${"b".repeat(64)}` } });
+    expect(field).toHaveValue(` ${FINGERPRINT} `);
+    await act(async () => pending.resolve(ciphertext("a.txt.pqc")));
+    await screen.findByRole("button", { name: "Download b.txt.pqc" });
+    for (const [index, file] of files.entries()) {
+      expect(encrypt).toHaveBeenNthCalledWith(index + 1, file, expect.any(File), `${file.name}.pqc`, expect.any(AbortSignal), FINGERPRINT);
+    }
+    expect(encrypt).toHaveBeenCalledTimes(2);
+    expect(field).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Clear batch" }));
+    expect(field).toHaveValue("");
+    expect(field).toBeEnabled();
+  });
+
   it("adds selected and dropped files, removes files, and allows selecting them again", async () => {
     const user = userEvent.setup();
     render(<BatchEncryptWorkflow health={READY_HEALTH} />);

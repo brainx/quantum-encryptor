@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchHealth } from "./client";
 import { largeFileOperations, type LargeFileJob } from "./largeFiles";
+import { READY_HEALTH } from "../test/fixtures";
 
 vi.mock("./client", async (actual) => ({ ...await actual<typeof import("./client")>(), fetchHealth: vi.fn() }));
 const job: LargeFileJob = { id: "opaque-id", mode: "encrypt", state: "awaiting_upload", phase: "upload", processedBytes: 0, totalBytes: 3, expiresAt: "2099-01-01T00:00:00Z" };
@@ -22,10 +23,51 @@ class UploadRequest {
   abort = vi.fn(() => this.onabort?.());
 }
 
-beforeEach(() => { vi.mocked(fetchHealth).mockResolvedValue({} as Awaited<ReturnType<typeof fetchHealth>>); });
+beforeEach(() => { vi.mocked(fetchHealth).mockResolvedValue(READY_HEALTH); });
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe("large file client", () => {
+  it.each([undefined, false])("refuses protected start when the refreshed service does not enforce fingerprints (%s)", async (supportsRecipientFingerprint) => {
+    vi.mocked(fetchHealth).mockResolvedValue({ ...READY_HEALTH, supportsRecipientFingerprint });
+    const fetch = vi.fn().mockResolvedValue(json({ ok: true, job }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(largeFileOperations.start(job.id, new File(["PEM"], "public.pem"), "", new AbortController().signal, `QE1-SHA3-256:${"a".repeat(64)}`))
+      .rejects.toMatchObject({ status: 409, code: "recipient_fingerprint_unsupported", message: "Restart an updated local service to enforce the expected recipient fingerprint." });
+    expect(fetchHealth).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not start after cancellation during the fresh support check", async () => {
+    let resolveHealth!: (health: typeof READY_HEALTH) => void;
+    vi.mocked(fetchHealth).mockReturnValue(new Promise((resolve) => { resolveHealth = resolve; }));
+    const fetch = vi.fn().mockResolvedValue(json({ ok: true, job }));
+    vi.stubGlobal("fetch", fetch);
+    const controller = new AbortController();
+    const pending = largeFileOperations.start(job.id, new File(["PEM"], "public.pem"), "", controller.signal, `QE1-SHA3-256:${"a".repeat(64)}`);
+    controller.abort();
+    resolveHealth(READY_HEALTH);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, `QE1-SHA3-256:${"a".repeat(64)}`, ""])("sends a supplied recipient expectation only with start (%s)", async (expected) => {
+    const fetch = vi.fn().mockResolvedValue(json({ ok: true, job }));
+    vi.stubGlobal("fetch", fetch);
+    await largeFileOperations.start(job.id, new File(["PEM"], "public.pem"), "", new AbortController().signal, expected);
+    const [url, request] = fetch.mock.calls[0];
+    expect(url).toBe("/api/jobs/opaque-id/start");
+    expect(request.body.get("expected_recipient_fingerprint")).toBe(expected ?? null);
+    expect(request.body.get("password")).toBe("");
+  });
+
+  it("does not replay a rejected recipient check at start", async () => {
+    const fetch = vi.fn().mockResolvedValue(json({ error_code: "recipient_fingerprint_mismatch", message: "Check the expected fingerprint." }, 400));
+    vi.stubGlobal("fetch", fetch);
+    await expect(largeFileOperations.start(job.id, new File(["PEM"], "public.pem"), "", new AbortController().signal, `QE1-SHA3-256:${"a".repeat(64)}`))
+      .rejects.toMatchObject({ status: 400, code: "recipient_fingerprint_mismatch" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("bootstraps the cookie and reserves using metadata only", async () => {
     const fetch = vi.fn().mockResolvedValue(json({ ok: true, job }));
     vi.stubGlobal("fetch", fetch);

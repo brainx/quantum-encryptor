@@ -10,6 +10,7 @@ export type Health = {
   supportsKeyPasswordChange?: boolean;
   supportsPublicKeyRecovery?: boolean;
   supportsFileVerification?: boolean;
+  supportsRecipientFingerprint?: boolean;
   largeFiles?: {
     available: boolean;
     maxPlaintextBytes: number;
@@ -140,7 +141,8 @@ export type EncryptFileOperation = (
   file: File,
   publicKey: File,
   outputFilename: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expectedRecipientFingerprint?: string
 ) => Promise<DownloadResult>;
 export type DecryptFileOperation = (
   file: File,

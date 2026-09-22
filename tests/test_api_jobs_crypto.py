@@ -188,6 +188,60 @@ def test_jobs_run_real_stream_crypto_with_authenticated_results(fake_oqs, keys, 
     asyncio.run(_successful_operation(mode, keys[0]))
 
 
+@pytest.mark.parametrize("matched", [False, True])
+def test_job_recipient_fingerprint_checked_before_output_creation(
+    monkeypatch, fake_oqs, keys, temporary_files, matched
+):
+    material, other = keys
+    expected = core.get_public_key_fingerprint((material if matched else other).public, cfg.HYBRID_KEM_ALG)
+    if not matched:
+        monkeypatch.setattr(
+            jobs.stream, "encrypt_stream", lambda *_args, **_kwargs: pytest.fail("Mismatch must not encrypt")
+        )
+
+    async def scenario():
+        store = jobs.JobStore(CryptoWorker())
+        try:
+            job = await _ready(store, "encrypt", PLAINTEXT)
+            store.start(job, material.public_pem, "", "result.pqc", expected)
+            assert job.task is not None
+            await asyncio.wait_for(job.task, 10)
+            if matched:
+                assert job.state == "complete" and job.output is not None
+                assert core.decrypt_file_pro(job.output.read(), material.private)[0] == PLAINTEXT
+            else:
+                assert job.snapshot()["error"] == {
+                    "code": "recipient_fingerprint_mismatch",
+                    "message": "The public key does not match the expected recipient fingerprint.",
+                }
+                assert job.state == "failed" and job.output is None and job.result is None
+                assert len(temporary_files) == 1 and temporary_files[0].closed
+                lease = store.worker.acquire()
+                assert lease is not None
+                lease.close()
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("encrypt", ""), ("decrypt", "QE1-SHA3-256:" + "a" * 64), ("verify", "QE1-SHA3-256:" + "a" * 64)]
+)
+def test_job_recipient_fingerprint_invalid_start_does_not_launch_worker(temporary_files, mode, expected):
+    async def scenario():
+        store = jobs.JobStore(CryptoWorker())
+        try:
+            job = await _ready(store, mode, b"input")
+            with pytest.raises(core.InvalidRecipientFingerprintError):
+                store.start(job, "unused key", "", "result", expected)
+            assert job.state == "ready" and job.task is None and job.output is None
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("mode", ["decrypt", "verify"])
 @pytest.mark.parametrize("failure", ["password", "wrong_key", "tampered_payload"])
 def test_job_authentication_failures_have_no_plaintext_result(fake_oqs, keys, temporary_files, mode, failure):

@@ -5,10 +5,12 @@ import { ActionButton } from "../../components/ActionButton";
 import { FilePicker } from "../../components/FilePicker";
 import { Notice } from "../../components/Notice";
 import { PasswordField } from "../../components/PasswordField";
+import { RecipientFingerprintField } from "../../components/RecipientFingerprintField";
 import { WorkflowLayout } from "../../components/WorkflowLayout";
 import { useKeyInspection } from "../../hooks/useKeyInspection";
 import { terminalJob, useLargeFileJob } from "../../hooks/useLargeFileJob";
 import { formatBytes } from "../../lib/format";
+import { isPublicKeyFingerprint, recipientFingerprintError } from "../../lib/recipientFingerprint";
 
 export type LargeFilesWorkflowProps = {
   health: Health;
@@ -16,10 +18,6 @@ export type LargeFilesWorkflowProps = {
   operations?: LargeFileOperations;
   onSensitiveResultChange?: (pending: boolean) => void;
 };
-
-function canonicalFingerprint(value: unknown): value is string {
-  return typeof value === "string" && value.length === "QE1-SHA3-256:".length + 64 && /^QE1-SHA3-256:[0-9a-f]{64}$/.test(value);
-}
 
 function runningStatus(phase: string): string {
   if (phase === "encrypting") return "Encrypting file.";
@@ -32,6 +30,7 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
   const [mode, setMode] = useState<LargeFileMode>("encrypt");
   const [file, setFile] = useState<File | null>(null);
   const [key, setKey] = useState<File | null>(null);
+  const [expectedFingerprint, setExpectedFingerprint] = useState("");
   const [password, setPassword] = useState("");
   const [downloadRequested, setDownloadRequested] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -44,10 +43,13 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
   const keyError = key && key.size > health.maxPemBytes ? `This key exceeds the ${formatBytes(health.maxPemBytes)} limit.` : null;
   const inspection = useKeyInspection(available ? key : null, health.maxPemBytes, inspect);
   const publicKey = inspection.result?.ok && inspection.result.keyInfo.key_type === "public" &&
-    inspection.result.keyInfo.kem === health.kem && canonicalFingerprint(inspection.result.keyInfo.public_key_fingerprint);
+    inspection.result.keyInfo.kem === health.kem && isPublicKeyFingerprint(inspection.result.keyInfo.public_key_fingerprint);
   const privateKey = inspection.result?.ok && inspection.result.keyInfo.key_type === "private" &&
     inspection.result.keyInfo.private_key_encrypted === true;
   const validKey = mode === "encrypt" ? publicKey : privateKey;
+  const fingerprint = publicKey ? inspection.result?.keyInfo.public_key_fingerprint : null;
+  const fingerprintError = mode === "encrypt"
+    ? recipientFingerprintError(expectedFingerprint, fingerprint, health.supportsRecipientFingerprint === true) : null;
   const snapshot = job.job;
   const locked = Boolean(snapshot || job.stage || job.restoring);
   const pending = Boolean(job.stage || job.restoring || (snapshot && (!terminalJob(snapshot) ||
@@ -58,7 +60,7 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
   };
   const backendCapability = mode === "encrypt" ? health.capabilities.encrypt : health.capabilities.decrypt;
   const ready = available && backendCapability.available && !locked && file && !fileError && !keyError &&
-    validKey && !inspection.loading && !inspection.error && (mode === "encrypt" || Boolean(password));
+    validKey && !inspection.loading && !inspection.error && !fingerprintError && (mode === "encrypt" || Boolean(password));
   const terminal = snapshot ? terminalJob(snapshot) : false;
   const progress = job.stage === "uploading" ? job.uploadBytes : snapshot?.processedBytes ?? 0;
   const total = job.stage === "uploading" ? file?.size ?? 0 : snapshot?.totalBytes ?? 0;
@@ -66,7 +68,7 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
   const verification = snapshot?.verification;
   const validVerification = snapshot?.mode === "verify" && verification?.ok && verification.verified === true &&
     Number.isSafeInteger(verification.bytesVerified) && verification.bytesVerified >= 0 &&
-    verification.bytesVerified <= (limits?.maxPlaintextBytes ?? 0) && canonicalFingerprint(verification.publicKeyFingerprint);
+    verification.bytesVerified <= (limits?.maxPlaintextBytes ?? 0) && isPublicKeyFingerprint(verification.publicKeyFingerprint);
   const validResult = snapshot?.result && typeof snapshot.result.filename === "string" && snapshot.result.filename.length > 0 &&
     Number.isSafeInteger(snapshot.result.bytes) && snapshot.result.bytes >= 0;
 
@@ -75,7 +77,7 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
 
   function selectMode(next: LargeFileMode) {
     if (locked) return;
-    setMode(next); setFile(null); setKey(null); setPassword(""); setDownloadError(null); setDownloadRequested(false);
+    setMode(next); setFile(null); setKey(null); setPassword(""); setExpectedFingerprint(""); setDownloadError(null); setDownloadRequested(false);
   }
 
   function submit(event: FormEvent<HTMLFormElement>) {
@@ -83,12 +85,12 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
     if (!ready || !file || !key) return;
     const secret = password;
     setPassword(""); setDownloadError(null); setDownloadRequested(false);
-    void job.start(mode, file, key, secret);
+    void job.start(mode, file, key, secret, mode === "encrypt" ? expectedFingerprint.trim() || undefined : undefined);
   }
 
   async function clear() {
     if (await job.clear()) {
-      setFile(null); setKey(null); setPassword(""); setDownloadError(null); setDownloadRequested(false);
+      setFile(null); setKey(null); setPassword(""); setExpectedFingerprint(""); setDownloadError(null); setDownloadRequested(false);
     }
   }
 
@@ -128,6 +130,8 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
             <p>Recipient public-key fingerprint</p><p className="fingerprint">{inspection.result?.keyInfo.public_key_fingerprint}</p>
             <p>Compare this complete fingerprint over a separate trusted channel before encrypting.</p>
           </section>}
+          {mode === "encrypt" && <RecipientFingerprintField id="large-file-expected-fingerprint" value={expectedFingerprint} actual={fingerprint}
+            supported={health.supportsRecipientFingerprint === true} disabled={locked} onChange={setExpectedFingerprint} />}
           {privateKey && mode !== "encrypt" && <p>Supported encrypted private key; match not yet verified</p>}
           {mode !== "encrypt" && <PasswordField id="large-file-password" label="Private key password" autoComplete="current-password"
             disabled={locked} value={password} onChange={(value) => { if (!locked) setPassword(value); }} />}
