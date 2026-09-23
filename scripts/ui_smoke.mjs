@@ -157,7 +157,7 @@ let captureStaleInspectionRoute;
 const staleInspectionRouteCaptured = new Promise((resolve) => {
   captureStaleInspectionRoute = resolve;
 });
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true, executablePath: process.env.UI_BROWSER_EXECUTABLE });
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();

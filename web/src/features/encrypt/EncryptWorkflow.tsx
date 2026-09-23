@@ -10,12 +10,14 @@ import { isAbortError, safeOperationError } from "../../api/errors";
 import { ActionButton } from "../../components/ActionButton";
 import { FilePicker } from "../../components/FilePicker";
 import { Notice } from "../../components/Notice";
+import { RecipientFingerprintField } from "../../components/RecipientFingerprintField";
 import { TechnicalDetails } from "../../components/TechnicalDetails";
 import { WorkflowLayout } from "../../components/WorkflowLayout";
 import { useKeyInspection } from "../../hooks/useKeyInspection";
 import { downloadBlob } from "../../lib/download";
 import { suggestedEncryptedName } from "../../lib/filenames";
 import { formatBytes } from "../../lib/format";
+import { isPublicKeyFingerprint, recipientFingerprintError } from "../../lib/recipientFingerprint";
 import { deriveWorkflowPhase } from "../../lib/workflow";
 
 export type EncryptWorkflowProps = {
@@ -29,17 +31,6 @@ function limitMessage(label: string, maxBytes: number): string {
   return `${label} exceeds the ${maxBytes.toLocaleString()} byte limit.`;
 }
 
-const PUBLIC_KEY_FINGERPRINT_PREFIX = "QE1-SHA3-256:";
-const PUBLIC_KEY_FINGERPRINT_PATTERN = /^QE1-SHA3-256:[0-9a-f]{64}$/;
-
-function isValidPublicKeyFingerprint(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length === PUBLIC_KEY_FINGERPRINT_PREFIX.length + 64 &&
-    PUBLIC_KEY_FINGERPRINT_PATTERN.test(value)
-  );
-}
-
 export function EncryptWorkflow({
   health,
   inspect,
@@ -48,6 +39,7 @@ export function EncryptWorkflow({
 }: EncryptWorkflowProps) {
   const [file, setFile] = useState<File | null>(null);
   const [publicKey, setPublicKey] = useState<File | null>(null);
+  const [expectedFingerprint, setExpectedFingerprint] = useState("");
   const [outputFilename, setOutputFilename] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [completedFilename, setCompletedFilename] = useState<string | null>(null);
@@ -68,7 +60,7 @@ export function EncryptWorkflow({
   const recipientPublicKeyFingerprint =
     inspection?.ok &&
     inspection.keyInfo.key_type === "public" &&
-    isValidPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)
+    isPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)
       ? inspection.keyInfo.public_key_fingerprint
       : null;
   const compatiblePublicKey = Boolean(
@@ -77,6 +69,8 @@ export function EncryptWorkflow({
       inspection.keyInfo.kem === health.kem &&
       recipientPublicKeyFingerprint
   );
+  const fingerprintError = recipientFingerprintError(expectedFingerprint,
+    compatiblePublicKey ? recipientPublicKeyFingerprint : null, health.supportsRecipientFingerprint === true);
 
   const readinessReason = useMemo(() => {
     if (!capability.available) return capability.reason;
@@ -91,9 +85,10 @@ export function EncryptWorkflow({
     if (inspection.keyInfo.kem !== health.kem) {
       return `This public key uses ${inspection.keyInfo.kem}; encryption requires ${health.kem}.`;
     }
-    if (!isValidPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)) {
+    if (!isPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)) {
       return "The recipient public key did not provide a valid fingerprint.";
     }
+    if (fingerprintError) return fingerprintError;
     if (!outputFilename.trim()) return "Enter an output filename.";
     return null;
   }, [
@@ -101,6 +96,7 @@ export function EncryptWorkflow({
     capability.reason,
     file,
     fileError,
+    fingerprintError,
     health.kem,
     inspection,
     inspecting,
@@ -165,7 +161,10 @@ export function EncryptWorkflow({
     setCompletedFilename(null);
 
     try {
-      const result = await encrypt(file, publicKey, outputFilename.trim(), controller.signal);
+      const expected = expectedFingerprint.trim();
+      const result = expected
+        ? await encrypt(file, publicKey, outputFilename.trim(), controller.signal, expected)
+        : await encrypt(file, publicKey, outputFilename.trim(), controller.signal);
       if (!mountedRef.current || requestId !== requestIdRef.current) return;
       try {
         save(result);
@@ -254,6 +253,10 @@ export function EncryptWorkflow({
                 encrypting.
               </p>
             )}
+            <RecipientFingerprintField id="encrypt-expected-fingerprint" value={expectedFingerprint}
+              actual={compatiblePublicKey ? recipientPublicKeyFingerprint : null}
+              supported={health.supportsRecipientFingerprint === true} disabled={busy}
+              onChange={(value) => { setExpectedFingerprint(value); clearOutcome(); }} />
             <div className="output-filename-field">
               <label htmlFor="encrypt-output-filename">Output filename</label>
               <input
@@ -264,7 +267,7 @@ export function EncryptWorkflow({
                 value={outputFilename}
               />
             </div>
-            {readinessReason && !busy && readinessReason !== fileError && readinessReason !== keyError && readinessReason !== safeInspectionError && (
+            {readinessReason && !busy && readinessReason !== fileError && readinessReason !== keyError && readinessReason !== safeInspectionError && readinessReason !== fingerprintError && (
               <p className="workflow-readiness-reason" role="status">{readinessReason}</p>
             )}
           </section>

@@ -1,4 +1,4 @@
-import { ApiError, fetchHealth } from "./client";
+import { ApiError, assertRecipientFingerprintSupport, fetchHealth } from "./client";
 import type { FileVerification } from "./contracts";
 
 export type LargeFileMode = "encrypt" | "decrypt" | "verify";
@@ -18,7 +18,7 @@ export type LargeFileJob = {
 export type LargeFileOperations = {
   create: (mode: LargeFileMode, file: File, signal: AbortSignal) => Promise<LargeFileJob>;
   upload: (id: string, file: File, progress: (loaded: number, total: number) => void, signal: AbortSignal) => Promise<LargeFileJob>;
-  start: (id: string, key: File, password: string, signal: AbortSignal) => Promise<LargeFileJob>;
+  start: (id: string, key: File, password: string, signal: AbortSignal, expectedRecipientFingerprint?: string) => Promise<LargeFileJob>;
   status: (id: string, signal?: AbortSignal) => Promise<LargeFileJob>;
   cancel: (id: string, signal?: AbortSignal) => Promise<LargeFileJob>;
   clear: (id: string, signal?: AbortSignal) => Promise<unknown>;
@@ -98,10 +98,17 @@ export const largeFileOperations: LargeFileOperations = {
       try { xhr.send(file); } catch (error) { finish(); reject(error); }
     });
   },
-  async start(id, key, password, signal) {
+  async start(id, key, password, signal, expectedRecipientFingerprint) {
+    if (expectedRecipientFingerprint !== undefined) {
+      signal.throwIfAborted();
+      const health = await fetchHealth();
+      signal.throwIfAborted();
+      assertRecipientFingerprintSupport(health);
+    }
     const form = new FormData();
     form.append("key", key);
     form.append("password", password);
+    if (expectedRecipientFingerprint !== undefined) form.append("expected_recipient_fingerprint", expectedRecipientFingerprint);
     const response = await fetch(jobUrl(id, "start"), { method: "POST", body: form, credentials: "same-origin", signal });
     return jobPayload(await parseResponse(response) as { job: LargeFileJob; ok: boolean });
   },

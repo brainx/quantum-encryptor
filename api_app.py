@@ -18,7 +18,7 @@ from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, UploadFile
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import BaseRoute, Mount, Route
@@ -533,6 +533,15 @@ def _form_text(form: Any, name: str, required: bool = True) -> str:
     return str(value)
 
 
+def _form_recipient_fingerprint(form: FormData) -> str | None:
+    values = form.getlist("expected_recipient_fingerprint")
+    if not values:
+        return None
+    if len(values) != 1 or not isinstance(values[0], str):
+        raise core.InvalidRecipientFingerprintError("Provide the complete canonical recipient fingerprint.")
+    return core.validate_recipient_fingerprint(values[0])
+
+
 def _form_upload(form: Any, name: str) -> UploadFile:
     value = form.get(name)
     if not isinstance(value, UploadFile):
@@ -617,6 +626,7 @@ def _health_payload() -> dict[str, Any]:
         "supportsKeyPasswordChange": True,
         "supportsPublicKeyRecovery": True,
         "supportsFileVerification": True,
+        "supportsRecipientFingerprint": True,
         "backendReady": current_backend_ready,
         "backendMessage": backend_message,
         "capabilities": capabilities,
@@ -968,7 +978,7 @@ async def verify_file(request: Request) -> JSONResponse:
         await request.close()
 
 
-def _encrypt_bytes(input_data: bytes, public_pem: str) -> bytes:
+def _encrypt_bytes(input_data: bytes, public_pem: str, expected_recipient_fingerprint: str | None = None) -> bytes:
     public_key_bytes, kem_alg_from_key, key_type = core.load_key_pem(public_pem)
     if not public_key_bytes or not kem_alg_from_key or key_type != "public":
         raise ApiError(400, "invalid_public_key", "Upload a supported PQC public key PEM file.")
@@ -979,6 +989,8 @@ def _encrypt_bytes(input_data: bytes, public_pem: str) -> bytes:
             "Generate a new ML-KEM-768+X25519-v2 public key for encryption.",
         )
 
+    if expected_recipient_fingerprint is not None:
+        core.verify_recipient_fingerprint(public_key_bytes, kem_alg_from_key, expected_recipient_fingerprint)
     encrypted_blob = core.encrypt_file_pro(input_data, public_key_bytes, kem_alg_from_key)
     del input_data
     del public_key_bytes
@@ -990,7 +1002,8 @@ def _encrypt_bytes(input_data: bytes, public_pem: str) -> bytes:
 
 async def encrypt_file(request: Request) -> Response:
     try:
-        form = await _form(request, max_files=2)
+        form = await _form(request, max_files=3)
+        expected_recipient_fingerprint = _form_recipient_fingerprint(form)
         uploaded_file = _form_upload(form, "file")
         public_key_file = _form_upload(form, "public_key")
         original_filename = Path(uploaded_file.filename or "file")
@@ -1001,12 +1014,26 @@ async def encrypt_file(request: Request) -> Response:
 
         input_data = await _read_upload_bytes(uploaded_file, cfg.MAX_FILE_BYTES, "Input file")
         public_pem = await _read_upload_text(public_key_file, cfg.MAX_PEM_BYTES, "Public key file")
-        encrypted_blob = await request.state.crypto_lease.run(_encrypt_bytes, input_data, public_pem)
+        encrypted_blob = await request.state.crypto_lease.run(
+            _encrypt_bytes, input_data, public_pem, expected_recipient_fingerprint
+        )
         del input_data
 
         return _download_response(encrypted_blob, output_filename)
     except ApiError as exc:
         return _json_error(exc)
+    except core.InvalidRecipientFingerprintError:
+        return _json_error(
+            ApiError(400, "invalid_recipient_fingerprint", "Provide the complete canonical recipient fingerprint.")
+        )
+    except core.RecipientFingerprintMismatchError:
+        return _json_error(
+            ApiError(
+                400,
+                "recipient_fingerprint_mismatch",
+                "The public key does not match the expected recipient fingerprint.",
+            )
+        )
     except core.CryptoDependencyError:
         return _json_error(ApiError(503, "backend_unavailable", "Post-quantum backend is not ready."))
     except Exception as exc:
@@ -1080,6 +1107,8 @@ def _job_error(exc: Exception) -> JSONResponse:
         error = ApiError(exc.status, exc.code, exc.message)
     elif isinstance(exc, ApiError):
         error = exc
+    elif isinstance(exc, core.InvalidRecipientFingerprintError):
+        error = ApiError(400, "invalid_recipient_fingerprint", "Provide the complete canonical recipient fingerprint.")
     elif isinstance(exc, RequestBodyTooLarge):
         error = ApiError(413, "request_too_large", "Request body exceeds the configured size limit.")
     elif isinstance(exc, OSError):
@@ -1136,11 +1165,16 @@ async def upload_job(request: Request) -> JSONResponse:
 async def start_job(request: Request) -> JSONResponse:
     try:
         jobs, job = _request_job(request)
-        form = await _form(request, max_files=1, max_fields=1)
+        form = await _form(request, max_files=2, max_fields=3)
+        expected_recipient_fingerprint = _form_recipient_fingerprint(form)
+        if expected_recipient_fingerprint is not None and job.mode != "encrypt":
+            raise core.InvalidRecipientFingerprintError("Recipient verification applies only to encryption.")
         pem = await _read_upload_text(_form_upload(form, "key"), cfg.MAX_PEM_BYTES, "Key file")
         password = "" if job.mode == "encrypt" else _workflow_password(form)
         filename = f"{job.filename}.pqc" if job.mode == "encrypt" else guess_decrypted_filename(Path(job.filename))
-        jobs.start(job, pem, password, sanitize_download_filename(filename, "download.bin"))
+        jobs.start(
+            job, pem, password, sanitize_download_filename(filename, "download.bin"), expected_recipient_fingerprint
+        )
         return _success_json({"job": job.snapshot()})
     except Exception as exc:
         return _job_error(exc)

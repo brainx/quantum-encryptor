@@ -398,7 +398,6 @@ def test_encrypt_rejects_existing_output_without_overwrite(monkeypatch, tmp_path
     output_path = tmp_path / "message.pqc"
     output_path.write_bytes(b"existing")
 
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     _mock_stream_encryption(monkeypatch, lambda _data: b"encrypted")
 
@@ -762,7 +761,6 @@ def test_encrypt_mocked_flow_writes_encrypted_file(monkeypatch, tmp_path, capsys
     monkeypatch.chdir(tmp_path)
     (tmp_path / "message.txt").write_bytes(b"hello")
     (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
-    monkeypatch.setattr(core, "load_key_pem", lambda _pem: (b"public", cfg.HYBRID_KEM_ALG, "public"))
     monkeypatch.setattr(tools, "_resolve_backend", lambda _operation, kem_alg=cfg.KEM_ALG: kem_alg)
     _mock_stream_encryption(monkeypatch, lambda data: b"encrypted:" + data)
 
@@ -847,8 +845,11 @@ def test_stream_execution_failures_preserve_json_error_contract(
     public = command == "encrypt"
     (tmp_path / "key.pem").write_text(_valid_public_pem() if public else _valid_private_pem(), encoding="utf-8")
     monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "correct horse battery staple")
+    key_bytes = bytes(range(cfg.X25519_KEY_BYTES)) + bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES) if public else b"key"
     monkeypatch.setattr(
-        core, "load_key_pem", lambda *_args, **_kwargs: (b"key", cfg.HYBRID_KEM_ALG, "public" if public else "private")
+        core,
+        "load_key_pem",
+        lambda *_args, **_kwargs: (key_bytes, cfg.HYBRID_KEM_ALG, "public" if public else "private"),
     )
     monkeypatch.setattr(tools, "_resolve_backend", lambda *_args: cfg.KEM_ALG)
     monkeypatch.setattr(tools, "_resolve_decryption_backends", lambda *_args: (cfg.KEM_ALG,))
@@ -1333,3 +1334,82 @@ def test_stream_reports_directory_sync_failure_after_publication(monkeypatch, tm
     assert "published" in exc.value.message
     assert output.read_bytes() == b"complete output"
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("provide_expected", [False, True])
+def test_encrypt_reports_actual_recipient_fingerprint_with_matching_or_omitted_expectation(
+    monkeypatch, tmp_path, capsys, provide_expected
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "message.txt").write_bytes(b"hello")
+    (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
+    key_bytes = bytes(range(cfg.X25519_KEY_BYTES)) + bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES)
+    fingerprint = core.get_public_key_fingerprint(key_bytes, cfg.HYBRID_KEM_ALG)
+    monkeypatch.setattr(tools, "_resolve_backend", lambda *_args: cfg.KEM_ALG)
+
+    def encrypt(source, sink, public_key, kem, **_kwargs):
+        assert public_key == key_bytes
+        assert kem == cfg.HYBRID_KEM_ALG
+        assert source.read() == b"hello"
+        sink.write(b"encrypted result")
+        return _stream_metadata(5, total_bytes=len(b"encrypted result"))
+
+    monkeypatch.setattr(tools.streaming, "encrypt_stream", encrypt)
+    arguments = ["encrypt", "--input", "message.txt", "--public-key", "recipient.pem", "--output", "message.pqc"]
+    if provide_expected:
+        arguments += ["--expected-recipient-fingerprint", fingerprint]
+    code, payload = _run_agent(arguments, capsys)
+    assert code == tools.EXIT_SUCCESS
+    assert payload["public_key_fingerprint"] == fingerprint
+    assert payload["bytes_written"] == len(b"encrypted result")
+    assert (tmp_path / "message.pqc").read_bytes() == b"encrypted result"
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize(
+    "expectation", ["different_recipient", "", "QE1-SHA3-256:abcd", "QE1-SHA3-256:" + "g" * 64, "非ASCII"]
+)
+def test_encrypt_rejects_recipient_expectation_before_crypto_or_output_creation(
+    monkeypatch, tmp_path, capsys, overwrite, expectation
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "message.txt").write_bytes(b"private plaintext")
+    (tmp_path / "recipient.pem").write_text(_valid_public_pem(), encoding="utf-8")
+    output = tmp_path / "message.pqc"
+    if overwrite:
+        output.write_bytes(b"original destination")
+    mismatch = expectation == "different_recipient"
+    if mismatch:
+        other_key = bytes(reversed(range(cfg.X25519_KEY_BYTES))) + bytes(cfg.MLKEM768_PUBLIC_KEY_BYTES)
+        expectation = core.get_public_key_fingerprint(other_key, cfg.HYBRID_KEM_ALG)
+    before = sorted(tmp_path.iterdir())
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("recipient verification must finish before backend work or output creation")
+
+    monkeypatch.setattr(tools, "_resolve_backend", forbidden)
+    monkeypatch.setattr(tools.streaming, "encrypt_stream", forbidden)
+    monkeypatch.setattr(tools, "_create_temporary_output", forbidden)
+    arguments = [
+        "encrypt",
+        "--input",
+        "message.txt",
+        "--public-key",
+        "recipient.pem",
+        "--output",
+        "message.pqc",
+        "--expected-recipient-fingerprint",
+        expectation,
+    ]
+    if overwrite:
+        arguments.append("--overwrite")
+    code, payload = _run_agent(arguments, capsys)
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["operation"] == "encrypt"
+    assert payload["error_code"] == ("recipient_fingerprint_mismatch" if mismatch else "invalid_recipient_fingerprint")
+    assert "private plaintext" not in str(payload)
+    assert sorted(tmp_path.iterdir()) == before
+    if overwrite:
+        assert output.read_bytes() == b"original destination"
+    else:
+        assert not output.exists()

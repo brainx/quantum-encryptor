@@ -62,6 +62,8 @@ The custom web UI is served by `api_app.py` at exactly `http://127.0.0.1:<PORT>`
 
 `backendReady` and `backendMessage` remain in the response for compatibility, while new clients use operation-specific capabilities. A capability `reason` is a safe user-facing summary of an unavailable operation; it is not a raw backend exception.
 
+`supportsRecipientFingerprint: true` advertises server enforcement of optional expected-recipient fingerprints on single-file encryption and encrypt-mode job starts. Clients offering this check must fetch current health and require this flag before submitting an expectation, including after an authentication refresh before retrying. Older servers may ignore unknown form fields; a stale UI capability is insufficient. The web client rejects unsupported protected requests with `recipient_fingerprint_unsupported`.
+
 ### Response caching and generated-key custody
 
 Every HTTP response under `/api/*` carries `Cache-Control: no-store` and `Pragma: no-cache`, including JSON successes and errors, authorization or body-limit middleware rejections, unmatched API routes, framework-generated 500 responses, and file downloads. The policy is applied centrally so new API handlers inherit it; static UI responses outside `/api/*` keep their own cache behavior. These directives reduce retention by conforming HTTP caches but do not securely erase browser or process memory.
@@ -78,7 +80,7 @@ All job routes require the existing local authentication and origin checks. IDs 
 | --- | --- | --- |
 | `/api/jobs` | Multipart `mode` (`encrypt`, `decrypt`, `verify`), `filename`, decimal `size` | `{ok: true, job}` reservation |
 | `/api/jobs/{id}/upload` | Raw `application/octet-stream`, exactly the reserved size | `{ok: true, job}` |
-| `/api/jobs/{id}/start` | Multipart PEM file `key`, plus `password` for private-key operations | `{ok: true, job}` |
+| `/api/jobs/{id}/start` | Multipart PEM file `key`, plus `password` for private-key operations; optional `expected_recipient_fingerprint` for encryption | `{ok: true, job}` |
 | `/api/jobs/{id}/status` | Empty body | `{ok: true, job}` |
 | `/api/jobs/{id}/cancel` | Empty body | `{ok: true, job}`; active work may remain `cancelling` |
 | `/api/jobs/{id}/clear` | Empty body | `{ok: true}` after cleanup; `409` while work/download owns files |
@@ -109,6 +111,14 @@ The external representation is `QE1-SHA3-256:<64 lowercase hexadecimal character
 The agent `generate-keys` and public `inspect-key` results use the JSON field `public_key_fingerprint`. For an encrypted private key, `inspect-key` omits it unless `--password-env NAME` is explicitly supplied; only a successful AES-GCM password authentication followed by canonical private-key validation permits derivation of the corresponding public key and fingerprint. No fingerprint is stored in or trusted from visible encrypted private-key metadata.
 
 Compare the complete fingerprint over an independently authenticated channel separate from key delivery. Equality identifies the same validated algorithm label and canonical public bytes, but it is not a certificate, signature, trust chain, proof of identity, proof of private-key control, or protection against a channel that substitutes both the key and comparison value.
+
+### Expected-recipient encryption
+
+`POST /api/files/encrypt` and encrypt-mode `POST /api/jobs/{id}/start` accept the optional multipart text field `expected_recipient_fingerprint`. It must contain exactly the canonical complete representation above. Absent means no expected-recipient check; a supplied empty value, malformed value, duplicate field, or uploaded file in place of text returns `400 invalid_recipient_fingerprint`. The field is rejected on decrypt/verify jobs rather than ignored.
+
+The service recomputes the fingerprint from the decoded public key used for encryption and compares the complete values before encryption or output creation. Single-file mismatches return `400 recipient_fingerprint_mismatch`. Large-file mismatches fail the job with `error.code: recipient_fingerprint_mismatch`; no encrypted result is published. The expectation is captured at job start and applies to that job's key. Batch encryption sends the same captured expectation with every file request. Existing PEM and ciphertext formats are unchanged.
+
+The CLI exposes the same check as `encrypt --expected-recipient-fingerprint VALUE`; omitted preserves existing behavior, while explicitly empty is invalid. Errors use `invalid_recipient_fingerprint` or `recipient_fingerprint_mismatch` and leave output destinations unchanged. Successful encryption includes `public_key_fingerprint`, the actual recipient key's identifier. Do not derive the expected value from the key being checked: supply the independently authenticated comparison value.
 
 ### Agent JSON Contract
 
@@ -347,6 +357,11 @@ def load_key_pem(
 ```python
 def get_public_key_fingerprint(key_bytes: bytes, kem_alg: str) -> str:
     """Validate canonical public-key bytes and return their versioned SHA3-256 fingerprint."""
+
+def verify_recipient_fingerprint(
+    public_key: bytes, kem_alg: str, expected_fingerprint: str | None = None
+) -> str:
+    """Return the actual fingerprint; reject a malformed or mismatching supplied expectation."""
 
 def get_private_key_public_fingerprint(private_key_bytes: bytes, kem_alg: str) -> str:
     """Derive and fingerprint the public key from already authenticated private-key bytes."""

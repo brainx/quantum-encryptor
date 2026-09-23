@@ -157,7 +157,7 @@ export function useLargeFileJob(operations: LargeFileOperations = largeFileOpera
     if (current(run)) accept(run, next);
   }
 
-  async function start(mode: LargeFileMode, file: File, key: File, password: string) {
+  async function start(mode: LargeFileMode, file: File, key: File, password: string, expectedRecipientFingerprint?: string) {
     if (!mounted.current || active.current || changing.current) return;
     const run: Run = { controller: new AbortController(), job: null, mode, credentials: { key, password }, cancelled: false, epoch: 0, cleanupRequested: false, cleanupPromise: null };
     active.current = run;
@@ -184,7 +184,9 @@ export function useLargeFileJob(operations: LargeFileOperations = largeFileOpera
       const credentials = run.credentials;
       run.credentials = null;
       if (!credentials) return;
-      const response = operations.start(reservation.id, credentials.key, credentials.password, run.controller.signal);
+      const response = expectedRecipientFingerprint === undefined
+        ? operations.start(reservation.id, credentials.key, credentials.password, run.controller.signal)
+        : operations.start(reservation.id, credentials.key, credentials.password, run.controller.signal, expectedRecipientFingerprint);
       credentials.password = "";
       const started = await response;
       if (current(run) && !run.cancelled) accept(run, started);

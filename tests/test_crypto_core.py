@@ -134,6 +134,48 @@ def _fake_hybrid_keys() -> tuple[bytes, bytes, bytes, bytes]:
     )
 
 
+def test_recipient_fingerprint_accepts_only_the_loaded_public_key(monkeypatch):
+    public, _private, _mlkem_public, _mlkem_private = _fake_hybrid_keys()
+    fingerprint = core.get_public_key_fingerprint(public, cfg.HYBRID_KEM_ALG)
+    monkeypatch.setattr(
+        core, "_require_oqs", lambda: pytest.fail("Fingerprint verification requires no native backend")
+    )
+    assert core.verify_recipient_fingerprint(public, cfg.HYBRID_KEM_ALG) == fingerprint
+    assert core.verify_recipient_fingerprint(public, cfg.HYBRID_KEM_ALG, fingerprint) == fingerprint
+    different_public, *_rest = _fake_hybrid_keys()
+    with pytest.raises(core.RecipientFingerprintMismatchError):
+        core.verify_recipient_fingerprint(different_public, cfg.HYBRID_KEM_ALG, fingerprint)
+    with pytest.raises(core.RecipientFingerprintMismatchError):
+        core.verify_recipient_fingerprint(public, cfg.LEGACY_HYBRID_KEM_ALG, fingerprint)
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        "",
+        " ",
+        "a" * 64,
+        "QE1-SHA3-256:" + "A" * 64,
+        "QE1-SHA3-256:" + "a" * 63,
+        "QE1-SHA3-256:" + "a" * 65,
+        "QE1-SHA3-256:" + "a" * 64 + "\n",
+        " QE1-SHA3-256:" + "a" * 64,
+        "QE1-SHA3-256:" + "é" * 64,
+        42,
+        b"fingerprint",
+    ],
+)
+def test_recipient_fingerprint_rejects_noncanonical_expected_values(expected):
+    public, *_rest = _fake_hybrid_keys()
+    with pytest.raises(core.InvalidRecipientFingerprintError):
+        core.verify_recipient_fingerprint(public, cfg.HYBRID_KEM_ALG, expected)
+
+
+def test_recipient_fingerprint_still_validates_key_material():
+    with pytest.raises(core.InvalidKeyFormatError):
+        core.verify_recipient_fingerprint(b"invalid key", cfg.HYBRID_KEM_ALG)
+
+
 @pytest.fixture
 def fake_oqs_backend(monkeypatch):
     """Provide deterministic KEM behavior without requiring a native liboqs installation."""

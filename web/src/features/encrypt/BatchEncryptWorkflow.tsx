@@ -9,10 +9,12 @@ import {
 import { ActionButton } from "../../components/ActionButton";
 import { FilePicker } from "../../components/FilePicker";
 import { Notice } from "../../components/Notice";
+import { RecipientFingerprintField } from "../../components/RecipientFingerprintField";
 import { WorkflowLayout } from "../../components/WorkflowLayout";
 import { useKeyInspection } from "../../hooks/useKeyInspection";
 import { downloadBlob } from "../../lib/download";
 import { formatBytes } from "../../lib/format";
+import { isPublicKeyFingerprint, recipientFingerprintError } from "../../lib/recipientFingerprint";
 import { deriveWorkflowPhase } from "../../lib/workflow";
 import { MAX_BATCH_FILES, useBatchEncryption, validateBatchFiles } from "./useBatchEncryption";
 
@@ -24,7 +26,6 @@ export type BatchEncryptWorkflowProps = {
   onPendingResultsChange?: (pending: boolean) => void;
 };
 
-const FINGERPRINT_PREFIX = "QE1-SHA3-256:";
 const ITEM_STATUS_LABELS = {
   queued: "Queued",
   encrypting: "Encrypting",
@@ -32,11 +33,6 @@ const ITEM_STATUS_LABELS = {
   failed: "Failed",
   cancelled: "Cancelled"
 };
-
-function validFingerprint(value: unknown): value is string {
-  return typeof value === "string" && value.length === FINGERPRINT_PREFIX.length + 64 &&
-    /^QE1-SHA3-256:[0-9a-f]{64}$/.test(value);
-}
 
 export function BatchEncryptWorkflow({
   health,
@@ -47,6 +43,7 @@ export function BatchEncryptWorkflow({
 }: BatchEncryptWorkflowProps) {
   const [files, setFiles] = useState<File[]>([]);
   const [publicKey, setPublicKey] = useState<File | null>(null);
+  const [expectedFingerprint, setExpectedFingerprint] = useState("");
   const [selectionError, setSelectionError] = useState<string | null>(null);
   const [downloaded, setDownloaded] = useState<Set<number>>(() => new Set());
   const [downloadErrors, setDownloadErrors] = useState<Record<number, string>>({});
@@ -64,9 +61,10 @@ export function BatchEncryptWorkflow({
     : null;
   const compatibleKey = Boolean(
     inspection?.ok && inspection.keyInfo.key_type === "public" &&
-    inspection.keyInfo.kem === health.kem && validFingerprint(inspection.keyInfo.public_key_fingerprint)
+    inspection.keyInfo.kem === health.kem && isPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)
   );
   const fingerprint = compatibleKey ? inspection?.keyInfo.public_key_fingerprint : null;
+  const fingerprintError = recipientFingerprintError(expectedFingerprint, fingerprint, health.supportsRecipientFingerprint === true);
   const validationError = validateBatchFiles(files, health.maxFileBytes);
   function getReadinessReason(): string | null {
     if (!capability.available) return capability.reason;
@@ -79,10 +77,10 @@ export function BatchEncryptWorkflow({
     if (inspection.keyInfo.kem !== health.kem) {
       return `This public key uses ${inspection.keyInfo.kem}; encryption requires ${health.kem}.`;
     }
-    if (!validFingerprint(inspection.keyInfo.public_key_fingerprint)) {
+    if (!isPublicKeyFingerprint(inspection.keyInfo.public_key_fingerprint)) {
       return "The recipient public key did not provide a valid fingerprint.";
     }
-    return null;
+    return fingerprintError;
   }
   const readinessReason = getReadinessReason();
   const canStart = !locked && !readinessReason;
@@ -131,7 +129,7 @@ export function BatchEncryptWorkflow({
     if (!canStart || !publicKey) return;
     setSelectionError(null);
     setCancelling(false);
-    start(files, publicKey);
+    start(files, publicKey, expectedFingerprint.trim() || undefined);
   }
 
   function clearBatch() {
@@ -139,6 +137,7 @@ export function BatchEncryptWorkflow({
     clear();
     setFiles([]);
     setPublicKey(null);
+    setExpectedFingerprint("");
     setDownloaded(new Set());
     setDownloadErrors({});
     setSelectionError(null);
@@ -244,7 +243,9 @@ export function BatchEncryptWorkflow({
               </p>
             </section>
           )}
-          {!locked && readinessReason && <p className="workflow-readiness-reason" role="status">{readinessReason}</p>}
+          <RecipientFingerprintField id="batch-encrypt-expected-fingerprint" value={expectedFingerprint} actual={fingerprint}
+            supported={health.supportsRecipientFingerprint === true} disabled={locked} onChange={setExpectedFingerprint} />
+          {!locked && readinessReason && readinessReason !== fingerprintError && <p className="workflow-readiness-reason" role="status">{readinessReason}</p>}
           {!items.length && <ActionButton busyLabel="Encrypting batch" disabled={!canStart} type="submit">Encrypt batch</ActionButton>}
           {busy && (
             <button

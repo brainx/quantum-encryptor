@@ -10,14 +10,14 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
   <a href="docs/SCREENSHOTS.md">
     <img
       src="docs/screenshots/custom-web-encrypt-workflow.png"
-      alt="Quantum Encryptor custom web app showing the Encrypt workflow and its technical details"
+      alt="Quantum Encryptor showing an expected recipient fingerprint matching the selected public key"
       width="900"
     >
   </a>
 </p>
 
 <p align="center">
-  <strong>Monochrome local web interface for ML-KEM-768 + X25519 key generation, file encryption, decryption, and PEM key inspection.</strong>
+  <strong>Local file encryption with recipient fingerprint checks, batch processing, and large-file jobs.</strong>
 </p>
 
 ## Features
@@ -26,6 +26,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Authenticated File Encryption**: Derives AES-256-GCM keys from both ML-KEM and X25519 shared secrets
 - **Password-Protected Keys**: Private keys are always encrypted with scrypt-derived AES-256-GCM keys
 - **Public-Key Fingerprints**: Full versioned SHA3-256 identifiers support independent public-key comparison
+- **Expected Recipient Checks**: Optionally require an independently obtained fingerprint before single-file, batch, large-file, or CLI encryption; the backend rejects a different public key
 - **User-Friendly Interface**: Custom local web UI with progressive technical details and a Python ASGI API
 - **Batch Encryption**: Encrypt up to 25 files for one recipient with sequential processing, per-file results, cancellation, and explicit downloads
 - **Batch Decryption**: Restore up to 25 encrypted files with one private key and password, retaining successful results when another file fails
@@ -38,7 +39,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 
 ## Screenshots
 
-The current browser smoke captures show the responsive Encrypt and Inspect key workflows. Click either image to open the full screenshot page.
+These captures show the real local app with sample files and freshly generated keys: recipient fingerprint comparison, a completed large-file job, and mobile key inspection. Open the gallery for full-size images.
 
 <p>
   <a href="docs/SCREENSHOTS.md#custom-web-encrypt-workflow">
@@ -48,6 +49,8 @@ The current browser smoke captures show the responsive Encrypt and Inspect key w
     <img src="docs/screenshots/custom-web-mobile-inspect.png" alt="Custom web mobile key inspection workflow" width="32%">
   </a>
 </p>
+
+![Completed large-file encryption with an explicit result download](docs/screenshots/custom-web-large-file-result.png)
 
 See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page.
 
@@ -152,6 +155,10 @@ The web app keeps its generated-result references in the current tab's in-memory
 
 Successful key generation and validated public-key inspection return a complete fingerprint in the form `QE1-SHA3-256:<64 lowercase hexadecimal characters>`. The Generate workflow shows the fingerprint for the new pair, Inspect key shows it for a validated public key, and Encrypt shows the recipient fingerprint before encryption. Compare the entire value with the key owner over an independently authenticated channel, separate from the channel that delivered the key.
 
+To enforce that comparison, paste the independently obtained value into **Expected recipient fingerprint (optional)** in Encrypt, Batch encrypt, or Large files. A malformed or different value blocks submission, and the backend checks it again against the actual key before encryption. Changing the selected public key keeps your expectation so a substitution cannot silently clear the check. Leaving the field empty preserves ordinary encryption. This feature requires an engine advertising recipient-fingerprint support; a supplied expectation cannot be used with an older engine.
+
+For the CLI, add `--expected-recipient-fingerprint "$RECIPIENT_FINGERPRINT"` to `encrypt`, where `RECIPIENT_FINGERPRINT` contains the independently obtained complete value. A malformed or mismatching expectation fails before creating an output or replacing an existing destination.
+
 A matching fingerprint identifies the same validated algorithm label and canonical public-key bytes. It does not prove the owner's identity or control of the private key, certify that the key is trustworthy, or protect a comparison performed through the same compromised channel. Fingerprints are public identifiers and do not change the PEM or encrypted-file formats. Metadata-only inspection of an encrypted private key omits the fingerprint because deriving it requires an authenticated password unlock.
 
 ## Verification
@@ -184,7 +191,7 @@ When a native `liboqs` installation is available to the running app, also run th
 npm run ui-native
 ```
 
-Do not treat the browser smoke test as proof that the native cryptographic backend is installed; it verifies the built interface against the local API contract. `npm run ui-native` verifies key generation, encryption, and decryption through the available native backend.
+Do not treat the browser smoke test as proof that the native cryptographic backend is installed; it verifies the built interface against the local API contract. `npm run ui-native` verifies key generation, recipient checks, encryption/decryption, key recovery/password changes, file verification, and large-file jobs through the available native backend. To refresh the committed screenshots during that same run, use `npm run ui-native -- --screenshots`. See [the screenshot capture notes](docs/SCREENSHOTS.md#refreshing-the-images).
 
 ### Key Generation
 
@@ -198,7 +205,7 @@ Do not treat the browser smoke test as proof that the native cryptographic backe
 1. Select "Encrypt" from the workflow navigation
 2. Upload the file you want to encrypt
 3. Upload the recipient's public key (.pem file)
-4. Compare the complete recipient fingerprint over an independently authenticated channel
+4. Obtain the complete fingerprint over an independently authenticated channel and optionally paste it into **Expected recipient fingerprint** to enforce a match
 5. Specify the output filename
 6. Download the encrypted file
 
@@ -213,7 +220,7 @@ Do not treat the browser smoke test as proof that the native cryptographic backe
 ### Batch Encryption
 
 1. Choose **Batch encrypt** and select or drop up to 25 files. Their combined plaintext size must fit the displayed file limit (100 MiB by default).
-2. Select the recipient's public key and compare its complete fingerprint over an independently authenticated channel.
+2. Select the recipient's public key. Optionally enter its independently obtained complete fingerprint to require a match for every file in the batch.
 3. Choose **Encrypt batch**. Files run one at a time, with separate progress and error states. A failed file does not discard successful results or automatically retry the failed request.
 4. Download each completed result. Batch output names retain the original extension, such as `report.pdf.pqc`; duplicate names receive a numeric suffix.
 5. Choose **Clear batch** when finished. Results live only in the current tab; there is no persistent batch history or server-side recovery.

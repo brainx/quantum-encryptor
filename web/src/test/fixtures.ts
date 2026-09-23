@@ -5,6 +5,7 @@ export const READY_HEALTH: Health = {
   supportsKeyPasswordChange: true,
   supportsPublicKeyRecovery: true,
   supportsFileVerification: true,
+  supportsRecipientFingerprint: true,
   backendReady: true,
   backendMessage: "Post-quantum backend ready.",
   capabilities: {
