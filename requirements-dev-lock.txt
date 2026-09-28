@@ -709,9 +709,9 @@ keyring==25.7.0 \
     --hash=sha256:be4a0b195f149690c166e850609a477c532ddbfbaed96a404d4e43f8d5e2689f \
     --hash=sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b
     # via twine
-liboqs-python==0.16.0 \
-    --hash=sha256:50bb11a9767b88f68099cedef8de09f798f31eaba1aa18b483988bfcd50df440 \
-    --hash=sha256:ee01445ccfbeab8dced956a642ce1eb5ba69438caba7ec291eea14083627d5c0
+liboqs-python==0.16.0.1 \
+    --hash=sha256:4791212549d88094659580d9f89a31af8b2bab9adc40b0a44ccaf570279f1d18 \
+    --hash=sha256:8e7f8c9a5fd3d3a65133238c07a0c465737a48591567ed175f1f75ee40508072
     # via -r requirements.txt
 librt==0.15.0 \
     --hash=sha256:04d5387b908676c0b8d5d2f5fb58373b4ea382d81f7a6f0fab8ea2a462bb4738 \
