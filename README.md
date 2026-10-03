@@ -88,7 +88,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
-   npm install
+   npm ci
    ```
 
    For a reproducible runtime install with pinned hashes:
@@ -336,7 +336,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - Generated-key cache and leave-page guards reduce accidental retention or loss but do not protect against developer tools, browser extensions, or malicious local software. Browser and operating-system settings determine downloaded private-key file permissions; the web app cannot guarantee POSIX mode `0600`.
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
-- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.16.0 release commit; repository CodeQL default setup provides static analysis
+- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.16.0 release commit; the CodeQL workflow scans every PR to `main`, including dependency-only changes
 - See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for repository trust boundaries, assets, abuse cases, and invariants
 - **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
 
