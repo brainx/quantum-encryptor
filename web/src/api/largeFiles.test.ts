@@ -27,6 +27,40 @@ beforeEach(() => { vi.mocked(fetchHealth).mockResolvedValue(READY_HEALTH); });
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe("large file client", () => {
+  it("renews an expired local session only for read-only status", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(json({ error_code: "missing_api_token", message: "Expired session" }, 403))
+      .mockResolvedValueOnce(json({ error_code: "job_expired", message: "The old job is gone" }, 410));
+    vi.stubGlobal("fetch", fetch);
+    await expect(largeFileOperations.status(job.id)).rejects.toMatchObject({ status: 410, code: "job_expired" });
+    expect(fetchHealth).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/jobs/opaque-id/status", "/api/jobs/opaque-id/status"]);
+  });
+
+  it("does not retry status when the Origin is rejected", async () => {
+    const fetch = vi.fn().mockResolvedValue(json({ error_code: "forbidden_origin", message: "Forbidden" }, 403));
+    vi.stubGlobal("fetch", fetch);
+    await expect(largeFileOperations.status(job.id)).rejects.toMatchObject({ code: "forbidden_origin" });
+    expect(fetchHealth).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds status session renewal to one attempt", async () => {
+    const fetch = vi.fn().mockImplementation(() => Promise.resolve(json({ error_code: "missing_api_token", message: "No session" }, 403)));
+    vi.stubGlobal("fetch", fetch);
+    await expect(largeFileOperations.status(job.id)).rejects.toMatchObject({ code: "missing_api_token" });
+    expect(fetchHealth).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry status if it was cancelled during session renewal", async () => {
+    const controller = new AbortController();
+    vi.mocked(fetchHealth).mockImplementationOnce(async () => { controller.abort(); return READY_HEALTH; });
+    const fetch = vi.fn().mockResolvedValue(json({ error_code: "missing_api_token", message: "No session" }, 403));
+    vi.stubGlobal("fetch", fetch);
+    await expect(largeFileOperations.status(job.id, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it.each([undefined, false])("refuses protected start when the refreshed service does not enforce fingerprints (%s)", async (supportsRecipientFingerprint) => {
     vi.mocked(fetchHealth).mockResolvedValue({ ...READY_HEALTH, supportsRecipientFingerprint });
     const fetch = vi.fn().mockResolvedValue(json({ ok: true, job }));

@@ -394,9 +394,14 @@ class SecurityHeadersMiddleware:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 existing = {name.lower() for name, _value in headers}
-                is_app_document = scope.get("path") in {"/", "/index.html"} and any(
-                    name.lower() == b"content-type" and value.lower().startswith(b"text/html")
-                    for name, value in headers
+                is_app_document = scope.get("path") in {"/", "/index.html"} and (
+                    # A 304 omits Content-Type, but its headers update the cached
+                    # document. Keep the same policy as the original HTML response.
+                    message.get("status") == 304
+                    or any(
+                        name.lower() == b"content-type" and value.lower().startswith(b"text/html")
+                        for name, value in headers
+                    )
                 )
                 for name, value in SECURITY_HEADERS:
                     if name not in existing:

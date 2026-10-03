@@ -268,6 +268,10 @@ Choose **Large files** in the web app to encrypt, decrypt, or verify one file up
 
 One large-file job can be retained at a time. **Cancel operation** requests cancellation; wait for cleanup to finish before choosing **Clear temporary files**. Completed results remain downloadable until cleared or until the 15-minute deadline measured from reservation. Expiry also cancels unfinished jobs. Closing or losing the tab may leave a job until automatic expiry. Temporary files use private, automatically removed storage; decrypted results occupy disk until cleared or expired, including after a download. Allow roughly three times the selected file size plus a small reserve in the system temporary directory. Deleting files is not secure erasure.
 
+Refresh recovery is optional and off by default. Without it, leaving the workflow requests cancellation or cleanup. Enable it before starting to retain the job across refreshes and navigation. Only its opaque ID is saved under a versioned `sessionStorage` key; filenames, keys, passwords, and results are never stored there. If saving fails, default cleanup remains enabled. Returning checks live status before offering a download. Interrupted uploads and unstarted operations require cleanup and reselected inputs; recovery never automatically repeats them.
+
+Recovery does not extend the deadline or survive a service restart. Closing a tab may lose its reference, while browser session restoration may restore it. Duplicated tabs may share one job; clearing it affects both. Use **Clear temporary files** when finished, especially after decryption. Recovery is not a backup or secure-erasure control.
+
 Cryptographic work runs on a single background worker. Other expensive operations return a retryable busy response while a job is reserved or running; health and key inspection remain available. A completed retained result releases the cryptographic worker, although it must be cleared before reserving another large-file job. Jobs are local, process-owned, and are not resumable across service restarts.
 
 ## Automation Usage
