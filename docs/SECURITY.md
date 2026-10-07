@@ -90,6 +90,8 @@ The application is designed to protect against the following threats:
 - Unencrypted private keys are rejected in the core, UI, and agent CLI.
 - The core module defines its own logger but leaves root logging configuration to application entry points.
 - The local agent CLI is not a network service, accepts only workspace-relative paths, rejects symlink escapes, creates non-overwrite outputs with exclusive file creation, stores private keys and decrypted plaintext with owner-only permissions on POSIX systems, and reads passwords from environment variables instead of command-line arguments.
+- CLI public-key recovery and password changes use the existing authenticated core helpers without native liboqs. They require separate output paths and stage publication atomically; changing a password preserves the key pair and does not revoke older copies. Current legacy passwords can be authenticated for migration, while new passwords must meet the current strength policy.
+- Batch verification returns no plaintext to the browser. Its explicit JSON download is an unsigned report containing filenames, sizes, statuses, and authenticated metadata for successful files. Treat filenames and recipient fingerprints as potentially sensitive; the report does not establish sender identity or authenticate a subsequently changed file.
 - CI runs static checks, tests without native `liboqs`, and a native `liboqs` integration test job.
 
 ## Security Best Practices

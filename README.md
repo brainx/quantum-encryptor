@@ -33,6 +33,8 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Private-Key Password Changes**: Download a newly password-protected copy of the same private key without replacing your public key or re-encrypting existing files
 - **Public-Key Recovery**: Recover the public PEM from an unlocked private key and check whether a supplied public key matches
 - **File Verification**: Inspect encrypted-file metadata and authenticate an entire file without downloading its plaintext
+- **Batch Verification**: Authenticate up to 25 encrypted files with one key, retain individual results, and explicitly download an unsigned JSON report without plaintext
+- **CLI Key Maintenance**: Recover a public key or change a private-key password with environment-based passwords and atomic workspace output
 - **Large-file CLI**: Encrypt, decrypt, inspect, and verify files up to 1 GiB using bounded buffers and authenticated, atomic output
 - **Large-file Web Jobs**: Encrypt, decrypt, and verify up to 1 GiB with upload progress, cancellation, expiring temporary results, and explicit downloads
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
@@ -262,6 +264,12 @@ Verification requires the native backend and decrypts the bounded file in local 
 
 These endpoints follow the existing local API authentication, exact-origin, no-store, and upload-cleanup rules. Password changes, public-key recovery, file inspection, and file verification share one worker admission slot, retained until the operation finishes even if its HTTP request is cancelled. Busy requests receive `429` with `Retry-After: 1`; passwords are bounded to 4096 UTF-8 bytes and PEM files to the advertised limit.
 
+### Batch Verification
+
+Choose **Batch verify**, select up to 25 encrypted files within the displayed combined-size limit, then supply one encrypted private key and its password. **Verify batch** authenticates files sequentially without returning plaintext. Each file receives its own result; a damaged file or one encrypted for another key does not discard successful checks or automatically retry a request. The password field clears when the batch starts.
+
+**Cancel batch** stops queued files and aborts the active browser request; native work already running may still finish. Once requests settle, **Download verification report** exports the successful, failed, and cancelled results as JSON. The report includes filenames, sizes, and authenticated metadata for successful files. It contains no file contents, keys, or passwords, but filenames and recipient fingerprints may still be sensitive. Reports are unsigned local records, not portable proofs of authenticity or sender identity. There is no saved history: download the report or choose **Clear batch** before leaving.
+
 ## Large files
 
 Choose **Large files** in the web app to encrypt, decrypt, or verify one file up to 1 GiB. Select the operation, file, and appropriate PEM key. The app shows upload and processing progress, clears the password field when you start, and waits for an explicit **Download result** action. Downloads stream directly from the local service; the browser app does not retain a full result blob. Verification returns an authentication report without a plaintext download.
@@ -308,6 +316,17 @@ python -m pqc_agent_tools decrypt \
   --input data/message.pqc \
   --private-key keys/agent-private.pem \
   --output data/message.decrypted.txt
+
+python -m pqc_agent_tools recover-public-key \
+  --private-key keys/agent-private.pem \
+  --compare-public-key keys/agent-public.pem \
+  --output keys/recovered-public.pem
+
+export PQC_NEW_PRIVATE_KEY_PASSWORD='<different-strong-private-key-password>'
+python -m pqc_agent_tools change-key-password \
+  --private-key keys/agent-private.pem \
+  --new-password-env PQC_NEW_PRIVATE_KEY_PASSWORD \
+  --output keys/updated-private.pem
 ```
 
 The installed console entry point is equivalent:
@@ -317,6 +336,8 @@ quantum-encryptor-agent health --json
 ```
 
 The CLI prints JSON only and never includes plaintext, private keys, passwords, raw file bytes, or absolute local paths in its output. Private-key generation, decryption, and verification read passwords from the environment variable named by `--password-env`, defaulting to `PQC_PRIVATE_KEY_PASSWORD`. `inspect-key` remains metadata-only for an encrypted private key unless `--password-env NAME` is explicitly supplied; after a successful authenticated unlock it returns the corresponding `public_key_fingerprint`.
+
+`recover-public-key` and `change-key-password` also read the current password through `--password-env`, and work without native liboqs. Recovery optionally compares the supplied public key and reports `matches_supplied_public_key`; a mismatch does not prevent recovering the correct public key. Password changes preserve the key pair and fingerprint, accept authenticated older passwords for migration, and require a different new password meeting the current strength policy. Both commands require a separate output path, even with `--overwrite`, and publish output atomically. Updated private keys use POSIX mode `0600`. Test the new copy before replacing an original: changing a password does not revoke old copies or recover a forgotten password.
 
 ## Security Considerations
 

@@ -842,7 +842,7 @@ class TestPublicKeyRecovery:
         else:
             pem = pem.replace(f"n={cfg.SCRYPT_N}", "n=1073741824")
             error = core.UnsupportedKDFError
-        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("KDF must not run"))
 
         with pytest.raises(error):
             core.recover_public_key_pem(pem, "" if failure == "missing_password" else self.password)
@@ -914,7 +914,7 @@ class TestPrivateKeyPasswordChange:
     @pytest.mark.parametrize("new_password", ["short", "river metal orbit cactus 47"])
     def test_password_change_rejects_weak_or_unchanged_password_before_kdf(self, monkeypatch, new_password):
         original = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
-        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("KDF must not run"))
 
         with pytest.raises(core.WeakPasswordError):
             core.rewrap_private_key_pem(original, self.current_password, new_password)
@@ -922,7 +922,7 @@ class TestPrivateKeyPasswordChange:
     @pytest.mark.parametrize("missing", ["current", "new"])
     def test_password_change_requires_both_passwords(self, monkeypatch, missing):
         original = _syntactic_encrypted_private_pem(bytes(cfg.MLKEM768_PRIVATE_KEY_BYTES + cfg.AES_TAG_BYTES))
-        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("KDF must not run"))
 
         with pytest.raises(core.PasswordRequiredError):
             core.rewrap_private_key_pem(
@@ -946,7 +946,7 @@ class TestPrivateKeyPasswordChange:
                 ]
             )
             expected_error = core.UnencryptedPrivateKeyError
-        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("KDF must not run"))
 
         with pytest.raises(expected_error):
             core.rewrap_private_key_pem(pem, self.current_password, self.new_password)
@@ -962,7 +962,7 @@ class TestPrivateKeyPasswordChange:
             expected_error = core.UnsupportedKDFError
         else:
             pem += " " * cfg.MAX_PEM_BYTES
-        monkeypatch.setattr(core, "derive_key_from_password", lambda *_args: pytest.fail("KDF must not run"))
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("KDF must not run"))
 
         with pytest.raises(expected_error):
             core.rewrap_private_key_pem(pem, self.current_password, self.new_password)
@@ -974,6 +974,86 @@ class TestPrivateKeyPasswordChange:
 
         with pytest.raises(core.CryptoCoreError, match="Could not encrypt"):
             core.rewrap_private_key_pem(original, self.current_password, self.new_password)
+
+
+class TestExistingPrivateKeyPasswords:
+    new_password = "harbor maple cloud copper 93"
+
+    @staticmethod
+    def encrypted_fixture(monkeypatch, password="old", format_version=3):
+        raw_private = _synthetic_mlkem_private()
+        # Build an authentic historical envelope, then restore today's creation policy.
+        with monkeypatch.context() as fixture_policy:
+            fixture_policy.setattr(core, "validate_private_key_password", lambda value: value)
+            fixture_policy.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", format_version)
+            pem = core.save_key_pem(raw_private, cfg.KEM_ALG, "private", password)
+        assert pem is not None
+        return raw_private, pem
+
+    @pytest.mark.parametrize("format_version", [2, 3])
+    @pytest.mark.parametrize("password", ["old", " é "])
+    def test_maintenance_unlocks_authenticated_weak_existing_password(self, monkeypatch, format_version, password):
+        raw_private, pem = self.encrypted_fixture(monkeypatch, password, format_version)
+
+        public_pem, public_alg, fingerprint = core.recover_public_key_pem(pem, password)
+        updated_pem, updated_alg, updated_fingerprint = core.rewrap_private_key_pem(pem, password, self.new_password)
+
+        assert core.load_key_pem(public_pem) == (_synthetic_mlkem_public(), cfg.KEM_ALG, "public")
+        assert public_alg == updated_alg == cfg.KEM_ALG
+        assert fingerprint == updated_fingerprint == core.get_private_key_public_fingerprint(raw_private, cfg.KEM_ALG)
+        assert core.load_key_pem(updated_pem, self.new_password) == (raw_private, cfg.KEM_ALG, "private")
+        assert core.load_key_pem(updated_pem, password) == (None, None, None)
+        assert core.load_key_pem(pem, password) == (raw_private, cfg.KEM_ALG, "private")
+
+    @pytest.mark.parametrize("failure", ["wrong_password", "payload", "metadata"])
+    def test_weak_existing_password_still_requires_authentic_envelope(self, monkeypatch, failure):
+        _raw_private, pem = self.encrypted_fixture(monkeypatch)
+        password = "bad" if failure == "wrong_password" else "old"
+        parsed = core._parse_key_pem_strict(pem)
+        assert parsed.private_envelope is not None
+        if failure == "payload":
+            encoded = base64.b64encode(parsed.payload).decode("ascii")
+            pem = pem.replace(
+                "\n".join(encoded[index : index + 64] for index in range(0, len(encoded), 64)),
+                base64.b64encode(_tamper(parsed.payload, -1)).decode("ascii"),
+            )
+        elif failure == "metadata":
+            nonce = parsed.private_envelope.nonce
+            pem = pem.replace(base64.b64encode(nonce).decode(), base64.b64encode(_tamper(nonce, 0)).decode())
+        monkeypatch.setattr(core, "get_public_key_from_private", lambda *_args: pytest.fail("Must authenticate first"))
+
+        with pytest.raises(core.AuthenticationFailedError):
+            core.recover_public_key_pem(pem, password)
+        with pytest.raises(core.AuthenticationFailedError):
+            core.rewrap_private_key_pem(pem, password, self.new_password)
+
+    @pytest.mark.parametrize("password", ["old", "aaaaaaaaaaaaaaaa"])
+    def test_weak_password_cannot_create_a_new_private_key(self, monkeypatch, password):
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("Creation policy must run before KDF"))
+        with pytest.raises(core.WeakPasswordError):
+            core.derive_key_from_password(password, bytes(cfg.SCRYPT_SALT_BYTES))
+        assert core.encrypt_private_key(_synthetic_mlkem_private(), password, cfg.KEM_ALG) == (None, None)
+
+    @pytest.mark.parametrize("password", ["short", "old"])
+    def test_weak_or_unchanged_replacement_is_rejected_before_unlock(self, monkeypatch, password):
+        _raw_private, pem = self.encrypted_fixture(monkeypatch)
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("Replacement policy must run before KDF"))
+        with pytest.raises(core.WeakPasswordError):
+            core.rewrap_private_key_pem(pem, "old", password)
+
+    @pytest.mark.parametrize("password", ["", "\ud800"])
+    def test_invalid_existing_password_is_rejected_before_kdf(self, monkeypatch, password):
+        _raw_private, pem = self.encrypted_fixture(monkeypatch)
+        monkeypatch.setattr(core, "Scrypt", lambda **_kwargs: pytest.fail("Invalid text must fail before KDF"))
+        assert core.load_key_pem(pem, password) == (None, None, None)
+
+    def test_existing_long_password_remains_loadable(self):
+        password = "river metal orbit cactus 47 " * 160
+        assert len(password.encode("utf-8")) > 4096
+        raw_private = _synthetic_mlkem_private()
+        pem = core.save_key_pem(raw_private, cfg.KEM_ALG, "private", password)
+        assert pem is not None
+        assert core.load_key_pem(pem, password) == (raw_private, cfg.KEM_ALG, "private")
 
 
 class TestPEMKeyFormat:

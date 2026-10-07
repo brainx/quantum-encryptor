@@ -706,9 +706,8 @@ def _parse_private_key_kdf_line(line: str) -> Dict[str, int | str]:
     return parsed
 
 
-def derive_key_from_password(password: str, salt: bytes) -> bytes:
-    """Derives a private-key encryption key from a password using scrypt."""
-    validate_private_key_password(password)
+def _derive_password_key(password_bytes: bytes, salt: bytes) -> bytes:
+    """Derive with fixed scrypt parameters after the caller validates its password policy."""
     kdf = Scrypt(
         salt=salt,
         length=cfg.AES_KEY_BYTES,  # Derive key suitable for AES-256
@@ -717,9 +716,15 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
         p=cfg.SCRYPT_P,
         backend=default_backend(),
     )
+    return kdf.derive(password_bytes)
+
+
+def derive_key_from_password(password: str, salt: bytes) -> bytes:
+    """Derive a private-key encryption key after enforcing the creation password policy."""
+    validate_private_key_password(password)
     password_bytes = password.encode("utf-8")
     try:
-        return kdf.derive(password_bytes)
+        return _derive_password_key(password_bytes, salt)
     finally:
         # Drop this local reference only; immutable bytes are not securely zeroized in Python.
         del password_bytes
@@ -781,12 +786,6 @@ def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Op
         logger.error("Missing salt, nonce, or encrypted data for private key decryption.")
         return None
 
-    try:
-        validate_private_key_password(password)
-    except (PasswordRequiredError, WeakPasswordError) as exc:
-        logger.error(str(exc))
-        return None
-
     kdf_name = encrypted_key_data.get("kdf")
     kdf_n = encrypted_key_data.get("kdf_n")
     kdf_r = encrypted_key_data.get("kdf_r")
@@ -817,9 +816,17 @@ def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Op
             return None
         metadata_kem_alg = kem_alg
 
+    # Existing credentials may predate today's creation policy. Authenticate their
+    # exact UTF-8 bytes; imposing a new strength or length rule would lock out keys.
+    try:
+        password_bytes = password.encode("utf-8")
+    except UnicodeEncodeError:
+        logger.error("Private-key password must be valid UTF-8 text.")
+        return None
+
     derived_key = None  # Ensure cleanup
     try:
-        derived_key = derive_key_from_password(password, salt)
+        derived_key = _derive_password_key(password_bytes, salt)
         aesgcm = AESGCM(derived_key)
         aad = None
         if not use_legacy_aad:
@@ -847,6 +854,7 @@ def decrypt_private_key(encrypted_key_data: Dict[str, Any], password: str) -> Op
         logger.exception(f"Failed to decrypt private key: {e}")
         return None
     finally:
+        del password_bytes
         if derived_key:
             del derived_key
 

@@ -23,6 +23,9 @@ python -m pqc_agent_tools encrypt --input data/plain.txt --public-key keys/publi
 python -m pqc_agent_tools inspect-file --input data/plain.pqc
 python -m pqc_agent_tools verify-file --input data/plain.pqc --private-key keys/private.pem
 python -m pqc_agent_tools decrypt --input data/plain.pqc --private-key keys/private.pem --output data/plain.out.txt
+python -m pqc_agent_tools recover-public-key --private-key keys/private.pem --output keys/recovered.pem
+export PQC_NEW_PRIVATE_KEY_PASSWORD='<different-strong-private-key-password>'
+python -m pqc_agent_tools change-key-password --private-key keys/private.pem --output keys/updated-private.pem --new-password-env PQC_NEW_PRIVATE_KEY_PASSWORD
 ```
 
 The installed console script is:
@@ -31,7 +34,9 @@ The installed console script is:
 quantum-encryptor-agent health --json
 ```
 
-Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, symlink escapes, and existing output files are rejected unless the command includes `--overwrite`. Private-key and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
+Agent commands must use workspace-relative paths. Absolute paths, `..` traversal, and symlink escapes are rejected. Existing output files require `--overwrite`. Private-key and decrypted plaintext outputs are written with owner-only permissions on POSIX systems.
+
+`recover-public-key` and `change-key-password` authenticate the encrypted input using the environment variable named by `--password-env` (default `PQC_PRIVATE_KEY_PASSWORD`). They require `--output` to differ from the input key, even with `--overwrite`, and publish using the staged atomic workspace writer. Neither command requires native liboqs. Successful JSON includes the preserved `kem`, canonical `public_key_fingerprint`, and workspace-relative paths; PEM contents and passwords are never printed. Recovery optionally accepts `--compare-public-key PATH` and returns `matches_supplied_public_key` as `true`, `false`, or `null` when no comparison was requested. A mismatch is informational and does not suppress the recovered output. Password changes require `--new-password-env NAME`; the new password must differ and meet the creation policy, while an authenticated legacy password need not meet today's strength policy. Old key copies are not revoked.
 
 File commands use the `crypto_stream` module with 1 MiB payload blocks and a default 1 GiB plaintext limit. `--max-file-bytes BYTES` can lower that limit on `encrypt`, `decrypt`, `inspect-file`, and `verify-file`. The bytes-based `crypto_core` functions and existing web routes keep their 100 MiB limit. Streaming operations preserve the v4 container format and authenticated legacy decryption; existing small-file containers remain compatible.
 
@@ -119,6 +124,12 @@ Compare the complete fingerprint over an independently authenticated channel sep
 The service recomputes the fingerprint from the decoded public key used for encryption and compares the complete values before encryption or output creation. Single-file mismatches return `400 recipient_fingerprint_mismatch`. Large-file mismatches fail the job with `error.code: recipient_fingerprint_mismatch`; no encrypted result is published. The expectation is captured at job start and applies to that job's key. Batch encryption sends the same captured expectation with every file request. Existing PEM and ciphertext formats are unchanged.
 
 The CLI exposes the same check as `encrypt --expected-recipient-fingerprint VALUE`; omitted preserves existing behavior, while explicitly empty is invalid. Errors use `invalid_recipient_fingerprint` or `recipient_fingerprint_mismatch` and leave output destinations unchanged. Successful encryption includes `public_key_fingerprint`, the actual recipient key's identifier. Do not derive the expected value from the key being checked: supply the independently authenticated comparison value.
+
+### Batch verification reports
+
+The browser's **Batch verify** workflow sends one existing `POST /api/files/verify` request per file, sequentially, after checking `supportsFileVerification` and decryption readiness. It limits selection to 25 files and the advertised aggregate encrypted-file size. Server authentication, size bounds, worker admission, and verification remain authoritative; there is no new batch endpoint or automatic retry.
+
+After the batch settles, an explicit download exports `verification-report.json` with `schemaVersion: 1`, `reportType: "batch-file-verification"`, an unsigned-report notice, `totals` (`files`, `authenticated`, `failed`, `cancelled`), and ordered `files`. Each entry contains `index`, `filename`, `encryptedBytes`, and `status`. Only authenticated entries contain `verification` with `kem`, `formatVersion`, `bytesVerified`, and `publicKeyFingerprint`; failures include a safe `error`. The report includes no PEM, password, or plaintext and does not establish sender identity or authenticate later changes to a file.
 
 ### Agent JSON Contract
 
