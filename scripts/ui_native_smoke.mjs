@@ -6,14 +6,17 @@ import { fileURLToPath } from "node:url";
 
 import AxeBuilder from "@axe-core/playwright";
 import { chromium } from "playwright";
+import { LARGE_FILE_RECOVERY_KEY } from "../web/src/lib/largeFileRecovery.ts";
 
 const baseUrl = process.env.UI_NATIVE_URL ?? "http://127.0.0.1:4000/";
 const password = "correct horse battery staple";
 const updatedPassword = "new correct horse battery staple";
 const inputBytes = Buffer.from("native browser round trip");
-const screenshotDirectory = process.argv.includes("--screenshots")
-  ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../docs/screenshots")
-  : null;
+const screenshotDirectory = process.env.UI_SCREENSHOT_DIR
+  ? path.resolve(process.env.UI_SCREENSHOT_DIR)
+  : process.argv.includes("--screenshots")
+    ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../docs/screenshots")
+    : null;
 
 async function capture(page, filename) {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true,
@@ -318,6 +321,65 @@ async function runFileVerification(page, temporaryDirectory, privateKeyPath, enc
   }
 }
 
+async function runBatchVerification(page, temporaryDirectory, privateKeyPath, encryptedPath, fingerprint) {
+  const encrypted = await readFile(encryptedPath);
+  const tampered = Buffer.from(encrypted);
+  tampered[tampered.length - 1] ^= 1;
+  const tamperedPath = path.join(temporaryDirectory, "batch-tampered.pqc");
+  const finalPath = path.join(temporaryDirectory, "batch-final.pqc");
+  await writeFile(tamperedPath, tampered);
+  await writeFile(finalPath, encrypted);
+  const downloads = [];
+  const requests = [];
+  const onDownload = (download) => downloads.push(download);
+  const onRequest = (request) => {
+    if (new URL(request.url()).pathname === "/api/files/verify") requests.push(request);
+  };
+  page.on("download", onDownload);
+  page.on("request", onRequest);
+  try {
+    await page.getByRole("navigation", { name: "Workflows", exact: true }).getByRole("button", { name: "Batch verify", exact: true }).click();
+    await page.getByRole("heading", { name: "Verify multiple files", exact: true }).waitFor();
+    await page.getByLabel("Files to verify", { exact: true }).setInputFiles([encryptedPath, tamperedPath, finalPath]);
+    await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
+    await page.getByLabel("Private key password", { exact: true }).fill(password);
+    await page.getByRole("button", { name: "Verify batch", exact: true }).click();
+    await page.getByText("3 of 3 files processed · 2 authenticated · 1 failed · 0 cancelled", { exact: true }).waitFor();
+    assert.equal(await page.getByLabel("Private key password", { exact: true }).inputValue(), "");
+    assert.equal(downloads.length, 0, "Batch verification must not automatically download a report or plaintext.");
+    assert.equal(requests.length, 3, "Each selected file must be verified exactly once, including after a failure.");
+    assert.equal((await page.getByRole("main").innerText()).includes(inputBytes.toString("utf8")), false);
+    await capture(page, "custom-web-batch-verification.png");
+    await page.setViewportSize({ width: 390, height: 844 });
+    await capture(page, "custom-web-mobile-batch-verification.png");
+    await page.setViewportSize({ width: 1440, height: 900 });
+
+    const reportPath = path.join(temporaryDirectory, "verification-report.json");
+    await downloadFromButton(page, "Download verification report", reportPath);
+    const reportText = await readFile(reportPath, "utf8");
+    const report = JSON.parse(reportText);
+    assert.equal(report.schemaVersion, 1);
+    assert.equal(report.reportType, "batch-file-verification");
+    assert.match(report.notice, /Unsigned local report/);
+    assert.deepEqual(report.totals, { files: 3, authenticated: 2, failed: 1, cancelled: 0 });
+    assert.deepEqual(report.files.map((file) => file.status), ["authenticated", "failed", "authenticated"]);
+    for (const file of [report.files[0], report.files[2]]) {
+      assert.equal(file.verification.bytesVerified, inputBytes.length);
+      assert.equal(file.verification.publicKeyFingerprint, fingerprint);
+    }
+    assert.equal(report.files[1].verification, undefined);
+    assert.equal(reportText.includes(password), false);
+    assert.equal(reportText.includes(inputBytes.toString("utf8")), false);
+    assert.equal(reportText.includes("PRIVATE KEY"), false);
+    assert.equal(downloads.length, 1, "Only the requested metadata report may be downloaded.");
+    await page.getByRole("button", { name: "Clear batch", exact: true }).click();
+    assert.equal(await page.getByRole("region", { name: "Batch verification results", exact: true }).count(), 0);
+  } finally {
+    page.off("download", onDownload);
+    page.off("request", onRequest);
+  }
+}
+
 async function downloadLargeResult(page, destination) {
   const context = page.context();
   const watchedPages = new Set();
@@ -339,6 +401,37 @@ async function downloadLargeResult(page, destination) {
   }
 }
 
+async function assertRecoveryStorage(page, identifier) {
+  if (identifier !== null) assert.match(identifier, /^[0-9a-f]{32}$/);
+  const storage = await page.evaluate(() => ({
+    session: Object.entries(sessionStorage),
+    local: Object.entries(localStorage)
+  }));
+  assert.deepEqual(storage.session, identifier === null ? [] : [[LARGE_FILE_RECOVERY_KEY, identifier]],
+    "Recovery must store only the canonical job ID in this tab's session storage.");
+  assert.deepEqual(storage.local, [], "Recovery must not persist data in local storage.");
+}
+
+async function reloadLargeFileJob(page, identifier, mode, result) {
+  assert.match(identifier, /^[0-9a-f]{32}$/, "An opted-in job must have a recoverable identifier before reloading.");
+  await assertRecoveryStorage(page, identifier);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Large files", exact: true }).waitFor();
+  await result.waitFor();
+  assert.equal(await page.getByLabel("Operation", { exact: true }).inputValue(), mode,
+    "Recovery must restore the operation reported by the server.");
+  assert.equal(await page.locator('input[type="password"], input[type="file"]').evaluateAll((inputs) =>
+    inputs.every((input) => input.type === "file" ? input.files.length === 0 : input.value === "")
+  ), true, "A reload must not restore passwords or selected files.");
+  await assertRecoveryStorage(page, identifier);
+}
+
+async function clearLargeFileJob(page) {
+  await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
+  await page.getByRole("region", { name: "Large file job status", exact: true }).waitFor({ state: "hidden" });
+  await assertRecoveryStorage(page, null);
+}
+
 async function runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, privateKeyPath, fingerprint) {
   const plaintext = Buffer.alloc(2 * 1024 * 1024 + 17);
   for (let index = 0; index < plaintext.length; index += 1) plaintext[index] = index % 251;
@@ -350,41 +443,76 @@ async function runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, pr
   const onResponse = (response) => {
     if (/\/api\/jobs\/[^/]+\/download$/.test(new URL(response.url()).pathname)) responses.push(response);
   };
+  const dialogs = [];
+  const onDialog = (dialog) => {
+    dialogs.push(dialog.type());
+    void dialog.accept();
+  };
+  const recoveryChoice = page.getByRole("checkbox", { name: "Keep this job available after refresh", exact: true });
+  const resultButton = page.getByRole("button", { name: "Download result", exact: true });
+  const readJobId = () => page.evaluate((key) => sessionStorage.getItem(key), LARGE_FILE_RECOVERY_KEY);
   page.context().on("response", onResponse);
+  page.on("dialog", onDialog);
   try {
     await page.getByRole("navigation", { name: "Workflows", exact: true }).getByRole("button", { name: "Large files", exact: true }).click();
     await page.getByRole("heading", { name: "Large files", exact: true }).waitFor();
+    assert.equal(await recoveryChoice.isChecked(), false, "Recovery must default to off.");
+    await assertRecoveryStorage(page, null);
+    await recoveryChoice.check();
     await page.getByLabel("File to encrypt", { exact: true }).setInputFiles(inputPath);
     await page.getByLabel("Recipient public key", { exact: true }).setInputFiles(publicKeyPath);
     await selectExpectedRecipient(page, fingerprint, "Encrypt large file");
     await page.getByRole("button", { name: "Encrypt large file", exact: true }).click();
-    await page.getByRole("button", { name: "Download result", exact: true }).waitFor();
+    await resultButton.waitFor();
+    const encryptedJobId = await readJobId();
+    await reloadLargeFileJob(page, encryptedJobId, "encrypt", resultButton);
+    await page.getByRole("navigation", { name: "Workflows", exact: true }).getByRole("button", { name: "Inspect key", exact: true }).click();
+    await page.getByRole("heading", { name: "Inspect a key", exact: true }).waitFor();
+    await assertRecoveryStorage(page, encryptedJobId);
+    await page.getByRole("navigation", { name: "Workflows", exact: true }).getByRole("button", { name: "Large files", exact: true }).click();
+    await resultButton.waitFor();
+    await assertRecoveryStorage(page, encryptedJobId);
     await capture(page, "custom-web-large-file-result.png");
     assert.equal(responses.length, 0, "Large-file encryption must wait for an explicit download.");
     await downloadLargeResult(page, encryptedPath);
     await page.getByText("Download requested. The browser controls whether it finishes.", { exact: true }).waitFor();
-    await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
-    await page.getByRole("button", { name: "Encrypt large file", exact: true }).waitFor();
+    await clearLargeFileJob(page);
 
     await page.getByLabel("Operation", { exact: true }).selectOption("decrypt");
+    await recoveryChoice.check();
     await page.getByLabel("Encrypted file", { exact: true }).setInputFiles(encryptedPath);
     await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
     await page.getByLabel("Private key password", { exact: true }).fill(password);
+    const acceptedDecryption = page.waitForResponse((response) =>
+      /\/api\/jobs\/[0-9a-f]{32}\/start$/.test(new URL(response.url()).pathname) && response.request().method() === "POST"
+    );
     await page.getByRole("button", { name: "Decrypt large file", exact: true }).click();
     assert.equal(await page.getByLabel("Private key password", { exact: true }).inputValue(), "");
-    await page.getByRole("button", { name: "Download result", exact: true }).waitFor();
+    const acceptedResponse = await acceptedDecryption;
+    assert.equal(acceptedResponse.ok(), true);
+    const acceptedJob = (await acceptedResponse.json()).job;
+    assert.equal(acceptedJob.state, "running", "The real service must accept decryption before the reload.");
+    assert.equal(acceptedJob.id, await readJobId());
+    // Reload after real server acceptance; the native worker may finish before the
+    // new document mounts. Both running and completed jobs must be recoverable.
+    await reloadLargeFileJob(page, acceptedJob.id, "decrypt", resultButton);
     assert.equal(responses.length, 1, "Large-file decryption must wait for an explicit download.");
     await downloadLargeResult(page, decryptedPath);
     assert.deepEqual(await readFile(decryptedPath), plaintext, "The large-file browser round trip changed the plaintext.");
-    await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
-    await page.getByRole("button", { name: "Decrypt large file", exact: true }).waitFor();
+    await clearLargeFileJob(page);
 
     await page.getByLabel("Operation", { exact: true }).selectOption("verify");
+    await recoveryChoice.check();
     await page.getByLabel("Encrypted file", { exact: true }).setInputFiles(encryptedPath);
     await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
     await page.getByLabel("Private key password", { exact: true }).fill(password);
     await page.getByRole("button", { name: "Verify large file", exact: true }).click();
-    await page.getByText("File authenticated", { exact: true }).waitFor();
+    const verifiedResult = page.getByText("File authenticated", { exact: true });
+    await verifiedResult.waitFor();
+    await reloadLargeFileJob(page, await readJobId(), "verify", verifiedResult);
+    const verificationReport = page.getByRole("status").filter({ has: verifiedResult });
+    assert.equal((await verificationReport.innerText()).includes(`${plaintext.length.toLocaleString()} bytes authenticated.`), true,
+      "The recovered verification report must authenticate the complete file.");
     assert.equal(await page.getByRole("button", { name: "Download result", exact: true }).count(), 0);
     assert.equal(responses.length, 2, "Large-file verification must not download plaintext.");
     for (const response of responses) {
@@ -393,10 +521,11 @@ async function runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, pr
       const headers = await response.request().allHeaders();
       assert.equal(headers.origin, new URL(baseUrl).origin, "Attachment navigation must preserve the trusted Origin.");
     }
-    await page.getByRole("button", { name: "Clear temporary files", exact: true }).click();
-    await page.getByRole("button", { name: "Verify large file", exact: true }).waitFor();
+    assert.deepEqual(dialogs, [], "Opt-in recovery must allow reloads and workflow navigation without cleanup prompts.");
+    await clearLargeFileJob(page);
   } finally {
     page.context().off("response", onResponse);
+    page.off("dialog", onDialog);
   }
 }
 
@@ -416,22 +545,36 @@ async function run() {
     browser = await chromium.launch({ headless: true, executablePath: process.env.UI_BROWSER_EXECUTABLE });
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const page = await context.newPage();
+    const pageErrors = [];
+    const consoleErrors = [];
+    page.on("pageerror", (error) => { pageErrors.push(error.name); });
+    page.on("console", (message) => {
+      if (!["error", "warning"].includes(message.type())) return;
+      // The smoke flow deliberately submits mismatched fingerprints, a wrong
+      // password, and damaged ciphertext. Their checked 400 responses are expected.
+      if (message.type() === "error" && message.text().startsWith("Failed to load resource: the server responded with a status of 400") &&
+          /\/api\/files\/(encrypt|decrypt|verify)$/.test(message.location().url)) return;
+      consoleErrors.push(message.text());
+    });
+    const encryptionRequests = [];
+    await page.exposeFunction("recordRecipientCheck", (request) => { encryptionRequests.push(request); });
     // Chromium may omit file-backed multipart bodies from request events. Observe
     // only the public comparison field, forwarding every fetch unchanged.
     await page.addInitScript(() => {
-      window.recipientChecks = [];
       const originalFetch = window.fetch;
       window.fetch = function (input, init) {
         const pathname = new URL(input instanceof Request ? input.url : input, location.href).pathname;
         if (init?.method === "POST" && init.body instanceof FormData &&
           (pathname === "/api/files/encrypt" || /^\/api\/jobs\/[^/]+\/start$/.test(pathname))) {
-          window.recipientChecks.push({ pathname, expected: init.body.getAll("expected_recipient_fingerprint") });
+          void window.recordRecipientCheck({ pathname, expected: init.body.getAll("expected_recipient_fingerprint") });
         }
         return originalFetch.call(this, input, init);
       };
     });
 
     await page.goto(baseUrl, { waitUntil: "networkidle" });
+    assert.equal(page.url(), new URL(baseUrl).href);
+    assert.equal(await page.title(), "Quantum Encryptor");
     await page.getByRole("heading", { name: "Encrypt a file" }).waitFor();
 
     const health = await page.evaluate(async () => {
@@ -480,9 +623,9 @@ async function run() {
     await runPasswordChange(page, temporaryDirectory, privateKeyPath, encryptedPath);
     await runPublicKeyRecovery(page, temporaryDirectory, publicKeyPath, privateKeyPath);
     await runFileVerification(page, temporaryDirectory, privateKeyPath, encryptedPath);
+    await runBatchVerification(page, temporaryDirectory, privateKeyPath, encryptedPath, fingerprint);
     assert.equal(health.largeFiles?.available, true, "Large-file jobs must be available for the native browser checks.");
     await runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, privateKeyPath, fingerprint);
-    const encryptionRequests = await page.evaluate(() => window.recipientChecks);
     assert.deepEqual(encryptionRequests.filter(({ pathname }) => pathname === "/api/files/encrypt")
       .map(({ expected }) => expected), [[fingerprint], [fingerprint], [fingerprint]],
       "Single-file and both batch requests must carry exactly one expected recipient.");
@@ -496,7 +639,9 @@ async function run() {
     await page.getByRole("main").getByText("Technical details", { exact: true }).click();
     await page.setViewportSize({ width: 390, height: 844 });
     await capture(page, "custom-web-mobile-inspect.png");
-    console.log("Native browser recipient verification, encryption/decryption, key password change, public-key recovery, verification, and large-file checks passed.");
+    assert.deepEqual(pageErrors, [], "Native workflows and reload recovery must not raise uncaught browser errors.");
+    assert.deepEqual(consoleErrors, [], "The workflows must not log unexpected browser errors or warnings.");
+    console.log("Native browser recipient verification, encryption/decryption, key password change, public-key recovery, single and batch verification, and large-file refresh recovery checks passed.");
   } finally {
     try {
       await browser?.close();

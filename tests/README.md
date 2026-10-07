@@ -96,7 +96,7 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs:
 - Python security linting with `bandit`
 - A native `liboqs` integration job so backend-dependent KEM round-trip tests run in CI
 
-GitHub CodeQL default setup provides repository static analysis without a duplicate advanced-configuration workflow.
+The CodeQL workflow in `.github/workflows/codeql.yml` scans Python, JavaScript/TypeScript, and GitHub Actions on every pull request to `main`, main pushes, and a weekly schedule. It emits the three `Analyze (...)` checks required by branch protection even for dependency-only changes. The repository must use CodeQL advanced setup, with default setup disabled, before this workflow can upload results.
 
 ## Coverage Goals
 

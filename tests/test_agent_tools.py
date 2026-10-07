@@ -1413,3 +1413,335 @@ def test_encrypt_rejects_recipient_expectation_before_crypto_or_output_creation(
         assert output.read_bytes() == b"original destination"
     else:
         assert not output.exists()
+
+
+MAINTENANCE_PASSWORD = "Current-private-key-passphrase-42!"
+MAINTENANCE_NEW_PASSWORD = "Updated-private-key-passphrase-73!"
+
+
+def _maintenance_key(monkeypatch, tmp_path, password=MAINTENANCE_PASSWORD, kem=cfg.HYBRID_KEM_ALG):
+    raw = core._parse_key_pem_strict(_valid_private_pem(encrypted=False)).payload
+    if kem == "Kyber768":
+        raw = raw[cfg.X25519_KEY_BYTES :]
+    # Historical keys may have a password below today's creation-strength policy.
+    with monkeypatch.context() as creation:
+        creation.setattr(core, "validate_private_key_password", lambda value: value)
+        if kem == "Kyber768":
+            creation.setattr(cfg, "PEM_PRIVATE_KEY_FORMAT_VERSION", 2)
+        pem = core.save_key_pem(raw, kem, "private", password=password)
+    assert pem is not None
+    (tmp_path / "private.pem").write_text(pem, encoding="ascii")
+    public = core.get_public_key_from_private(raw, kem)
+    public_pem = core.save_key_pem(public, kem, "public")
+    assert public_pem is not None
+    (tmp_path / "public.pem").write_text(public_pem, encoding="ascii")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, password)
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+    return raw, pem, public_pem, core.get_public_key_fingerprint(public, kem)
+
+
+def _maintenance_args(operation, *extra):
+    args = [operation, "--private-key", "private.pem", "--output", "result.pem"]
+    if operation == "change-key-password":
+        args += ["--new-password-env", "PQC_NEW_TEST_PASSWORD"]
+    return args + list(extra)
+
+
+@pytest.mark.parametrize("comparison", [None, "match", "different"])
+def test_key_maintenance_recovers_authenticated_public_key_without_native_backend(
+    monkeypatch, tmp_path, capsys, comparison
+):
+    monkeypatch.chdir(tmp_path)
+    _raw, original, public_pem, fingerprint = _maintenance_key(monkeypatch, tmp_path)
+    monkeypatch.setattr(core, "_require_oqs", lambda: pytest.fail("key maintenance must work without liboqs"))
+    arguments = _maintenance_args("recover-public-key")
+    if comparison:
+        if comparison == "different":
+            (tmp_path / "public.pem").write_text(_valid_public_pem(), encoding="ascii")
+        arguments += ["--compare-public-key", "public.pem"]
+    code, payload = _run_agent(arguments, capsys)
+    assert code == tools.EXIT_SUCCESS
+    assert payload == {
+        "ok": True,
+        "operation": "recover-public-key",
+        "format_version": cfg.FORMAT_VERSION,
+        "kem": cfg.HYBRID_KEM_ALG,
+        "private_key": "private.pem",
+        "output": "result.pem",
+        "public_key_fingerprint": fingerprint,
+        "matches_supplied_public_key": None if comparison is None else comparison == "match",
+    }
+    assert (tmp_path / "result.pem").read_text() == public_pem
+    assert (tmp_path / "private.pem").read_text() == original
+
+
+@pytest.mark.parametrize("kem", [cfg.HYBRID_KEM_ALG, "Kyber768"])
+@pytest.mark.parametrize("password", [MAINTENANCE_PASSWORD, "old"])
+def test_key_maintenance_changes_password_preserving_identity_and_original(
+    monkeypatch, tmp_path, capsys, kem, password
+):
+    monkeypatch.chdir(tmp_path)
+    raw, original, _public_pem, fingerprint = _maintenance_key(monkeypatch, tmp_path, password, kem)
+    monkeypatch.setattr(core, "_require_oqs", lambda: pytest.fail("key maintenance must work without liboqs"))
+    code, payload = _run_agent(_maintenance_args("change-key-password"), capsys)
+    assert code == tools.EXIT_SUCCESS
+    assert payload["operation"] == "change-key-password"
+    assert payload["kem"] == kem
+    assert payload["public_key_fingerprint"] == fingerprint
+    assert payload["private_key"] == "private.pem"
+    assert payload["output"] == "result.pem"
+    assert payload["private_key_encrypted"] is True
+    assert payload["private_key_kdf"] == cfg.PRIVATE_KEY_KDF_ALG
+    updated = (tmp_path / "result.pem").read_text()
+    assert updated != original
+    updated_info = core.inspect_key_pem_strict(updated)
+    assert updated_info["private_key_format_version"] == cfg.PEM_PRIVATE_KEY_FORMAT_VERSION
+    assert core.load_key_pem(updated, MAINTENANCE_NEW_PASSWORD) == (raw, kem, "private")
+    assert core.load_key_pem(updated, password) == (None, None, None)
+    assert core.load_key_pem(original, password) == (raw, kem, "private")
+    assert (tmp_path / "private.pem").read_text() == original
+    if os.name != "nt":
+        assert stat.S_IMODE((tmp_path / "result.pem").stat().st_mode) == 0o600
+    for secret in (original, updated, MAINTENANCE_NEW_PASSWORD, str(tmp_path)):
+        assert secret not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+def test_key_maintenance_wrong_password_preserves_existing_output(monkeypatch, tmp_path, capsys, operation):
+    monkeypatch.chdir(tmp_path)
+    _maintenance_key(monkeypatch, tmp_path)
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, "wrong password")
+    (tmp_path / "result.pem").write_bytes(b"existing destination")
+    code, payload = _run_agent(_maintenance_args(operation, "--overwrite"), capsys)
+    assert code == tools.EXIT_CRYPTO_FAILURE
+    assert payload["operation"] == operation
+    assert payload["error_code"] == "private_key_load_failed"
+    assert "wrong password" not in payload["message"]
+    assert (tmp_path / "result.pem").read_bytes() == b"existing destination"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+@pytest.mark.parametrize(
+    "kind,error_code",
+    [
+        ("malformed", "invalid_key"),
+        ("public", "invalid_key"),
+        ("unencrypted", "unencrypted_private_key"),
+        ("kdf", "unsupported_kdf"),
+    ],
+)
+def test_key_maintenance_rejects_invalid_private_keys(monkeypatch, tmp_path, capsys, operation, kind, error_code):
+    monkeypatch.chdir(tmp_path)
+    pem = {
+        "malformed": "not a key",
+        "public": _valid_public_pem(),
+        "unencrypted": _valid_private_pem(encrypted=False),
+        "kdf": _valid_private_pem().replace(f"n={cfg.SCRYPT_N}", "n=1"),
+    }[kind]
+    (tmp_path / "private.pem").write_text(pem)
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+    code, payload = _run_agent(_maintenance_args(operation), capsys)
+    assert code in (tools.EXIT_INVALID_INPUT, tools.EXIT_CRYPTO_FAILURE)
+    assert payload["error_code"] == error_code
+    assert not (tmp_path / "result.pem").exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "value,error_code",
+    [
+        (None, "password_required"),
+        ("weak", "weak_password"),
+        (MAINTENANCE_PASSWORD, "weak_password"),
+        ("密" * 1366, "password_too_long"),
+    ],
+)
+def test_key_maintenance_rejects_invalid_new_password(monkeypatch, tmp_path, capsys, value, error_code):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem())
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    if value is None:
+        monkeypatch.delenv("PQC_NEW_TEST_PASSWORD", raising=False)
+    else:
+        monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", value)
+    monkeypatch.setattr(core, "load_key_pem", lambda *_args: pytest.fail("reject the new password before unlocking"))
+    code, payload = _run_agent(_maintenance_args("change-key-password"), capsys)
+    assert code in (tools.EXIT_INVALID_INPUT, tools.EXIT_CRYPTO_FAILURE)
+    assert payload["error_code"] == error_code
+    assert not (tmp_path / "result.pem").exists()
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+@pytest.mark.parametrize(
+    "target", ["private.pem", "alias.pem", "hardlink.pem", "../escape.pem", "absolute", "outside.pem", "exists.pem"]
+)
+def test_key_maintenance_preflights_output_before_unlocking(monkeypatch, tmp_path, capsys, operation, target):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    original = _valid_private_pem()
+    (workspace / "private.pem").write_text(original)
+    (workspace / "alias.pem").symlink_to("private.pem")
+    os.link(workspace / "private.pem", workspace / "hardlink.pem")
+    outside = tmp_path / "outside.pem"
+    outside.write_bytes(b"outside")
+    (workspace / "outside.pem").symlink_to(outside)
+    (workspace / "exists.pem").write_bytes(b"existing output")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+    monkeypatch.setattr(core, "recover_public_key_pem", lambda *_args: pytest.fail("unsafe output"))
+    monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: pytest.fail("unsafe output"))
+    arguments = _maintenance_args(operation)
+    arguments[arguments.index("--output") + 1] = str(outside) if target == "absolute" else target
+    if target != "exists.pem":
+        arguments.append("--overwrite")
+    code, payload = _run_agent(arguments, capsys)
+    assert code in (tools.EXIT_PATH_VIOLATION, tools.EXIT_INVALID_INPUT)
+    assert payload["error_code"] == (
+        "invalid_path"
+        if target in ("private.pem", "alias.pem", "hardlink.pem")
+        else "output_exists" if target == "exists.pem" else "path_outside_workspace"
+    )
+    assert (workspace / "private.pem").read_text() == original
+    assert outside.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+def test_key_maintenance_rechecks_output_alias_after_unlock(monkeypatch, tmp_path, capsys, operation):
+    monkeypatch.chdir(tmp_path)
+    original = _valid_private_pem()
+    (tmp_path / "private.pem").write_text(original)
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+
+    def swapped(*_args):
+        (tmp_path / "result.pem").symlink_to("private.pem")
+        return "completed PEM", cfg.HYBRID_KEM_ALG, "fingerprint"
+
+    helper = "recover_public_key_pem" if operation == "recover-public-key" else "rewrap_private_key_pem"
+    monkeypatch.setattr(core, helper, swapped)
+    code, payload = _run_agent(_maintenance_args(operation, "--overwrite"), capsys)
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "invalid_path"
+    assert (tmp_path / "private.pem").read_text() == original
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+def test_key_maintenance_output_collision_during_unlock_preserves_other_file(monkeypatch, tmp_path, capsys, operation):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem())
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+
+    def collided(*_args):
+        (tmp_path / "result.pem").write_bytes(b"other writer")
+        return "completed PEM", cfg.HYBRID_KEM_ALG, "fingerprint"
+
+    helper = "recover_public_key_pem" if operation == "recover-public-key" else "rewrap_private_key_pem"
+    monkeypatch.setattr(core, helper, collided)
+    code, payload = _run_agent(_maintenance_args(operation), capsys)
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "output_exists"
+    assert (tmp_path / "result.pem").read_bytes() == b"other writer"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+@pytest.mark.parametrize("value,error_code", [(None, "password_required"), ("密" * 1366, "password_too_long")])
+def test_key_maintenance_bounds_current_password(monkeypatch, tmp_path, capsys, operation, value, error_code):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem())
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+    if value is None:
+        monkeypatch.delenv(tools.DEFAULT_PASSWORD_ENV, raising=False)
+    else:
+        monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, value)
+    monkeypatch.setattr(core, "recover_public_key_pem", lambda *_args: pytest.fail("reject before crypto"))
+    monkeypatch.setattr(core, "rewrap_private_key_pem", lambda *_args: pytest.fail("reject before crypto"))
+    code, payload = _run_agent(_maintenance_args(operation), capsys)
+    assert code in (tools.EXIT_INVALID_INPUT, tools.EXIT_CRYPTO_FAILURE)
+    assert payload["error_code"] == error_code
+    assert not (tmp_path / "result.pem").exists()
+
+
+@pytest.mark.parametrize("operation", ["recover-public-key", "change-key-password"])
+@pytest.mark.parametrize("failure", ["short_write", "disk_error", "fsync", "cancel"])
+def test_key_maintenance_staging_failure_keeps_original_and_existing_destination(
+    monkeypatch, tmp_path, capsys, operation, failure
+):
+    monkeypatch.chdir(tmp_path)
+    original = _valid_private_pem()
+    (tmp_path / "private.pem").write_text(original)
+    (tmp_path / "result.pem").write_bytes(b"existing destination")
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    monkeypatch.setenv("PQC_NEW_TEST_PASSWORD", MAINTENANCE_NEW_PASSWORD)
+    helper = "recover_public_key_pem" if operation == "recover-public-key" else "rewrap_private_key_pem"
+    monkeypatch.setattr(core, helper, lambda *_args: ("complete PEM content", cfg.HYBRID_KEM_ALG, "fingerprint"))
+    real_fdopen = tools.os.fdopen
+
+    class FailingSink:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.sink.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.sink, name)
+
+        def write(self, data):
+            written = self.sink.write(data[:3])
+            if failure == "cancel":
+                raise KeyboardInterrupt
+            if failure == "disk_error":
+                raise OSError("private disk error detail")
+            return written
+
+    def fdopen(fd, mode, **kwargs):
+        sink = real_fdopen(fd, mode, **kwargs)
+        return FailingSink(sink) if mode == "wb" else sink
+
+    def fsync_failed(_fd):
+        raise OSError("private disk error detail")
+
+    if failure == "fsync":
+        monkeypatch.setattr(tools.os, "fsync", fsync_failed)
+    else:
+        monkeypatch.setattr(tools.os, "fdopen", fdopen)
+    code, payload = _run_agent(_maintenance_args(operation, "--overwrite"), capsys)
+    assert code == (tools.EXIT_CRYPTO_FAILURE if failure == "cancel" else tools.EXIT_INVALID_INPUT)
+    assert payload["error_code"] == ("cancelled" if failure == "cancel" else "write_failed")
+    assert "private disk error detail" not in payload["message"]
+    assert (tmp_path / "result.pem").read_bytes() == b"existing destination"
+    assert (tmp_path / "private.pem").read_text() == original
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_key_maintenance_rejects_private_comparison_key_before_unlock(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "private.pem").write_text(_valid_private_pem())
+    monkeypatch.setenv(tools.DEFAULT_PASSWORD_ENV, MAINTENANCE_PASSWORD)
+    monkeypatch.setattr(core, "recover_public_key_pem", lambda *_args: pytest.fail("comparison must be a public key"))
+    code, payload = _run_agent(_maintenance_args("recover-public-key", "--compare-public-key", "private.pem"), capsys)
+    assert code == tools.EXIT_INVALID_INPUT
+    assert payload["error_code"] == "invalid_key"
+    assert not (tmp_path / "result.pem").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_key_maintenance_overwritten_private_key_is_owner_only(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    _maintenance_key(monkeypatch, tmp_path)
+    output = tmp_path / "result.pem"
+    output.write_bytes(b"previous output")
+    output.chmod(0o644)
+    code, payload = _run_agent(_maintenance_args("change-key-password", "--overwrite"), capsys)
+    assert code == tools.EXIT_SUCCESS
+    assert payload["private_key_encrypted"] is True
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600

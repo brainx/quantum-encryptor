@@ -3,9 +3,11 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { READY_HEALTH } from "../test/fixtures";
+import type { FileVerification } from "../api/contracts";
 import { ApiError } from "../api/client";
 import type { LargeFileJob, LargeFileMode } from "../api/largeFiles";
 import App from "./App";
+import { LARGE_FILE_RECOVERY_KEY } from "../lib/largeFileRecovery";
 
 const TEST_PUBLIC_KEY_FINGERPRINT = `QE1-SHA3-256:${"a".repeat(64)}`;
 
@@ -16,6 +18,7 @@ const client = vi.hoisted(() => ({
   encryptFile: vi.fn(),
   decryptFile: vi.fn(),
   changeKeyPassword: vi.fn(),
+  verifyFile: vi.fn(),
   save: vi.fn()
 }));
 
@@ -63,7 +66,8 @@ vi.mock("../api/client", async (importOriginal) => {
     inspectKey: client.inspectKey,
     encryptFile: client.encryptFile,
     decryptFile: client.decryptFile,
-    changeKeyPassword: client.changeKeyPassword
+    changeKeyPassword: client.changeKeyPassword,
+    verifyFile: client.verifyFile
   };
 });
 
@@ -97,6 +101,7 @@ async function openGeneratedKeys(user: ReturnType<typeof userEvent.setup>) {
 }
 
 beforeEach(() => {
+  window.sessionStorage.clear();
   Object.values(largeJobs).forEach((operation) => operation.mockReset());
   client.fetchHealth.mockReset();
   client.fetchHealth.mockResolvedValue(READY_HEALTH);
@@ -130,9 +135,157 @@ beforeEach(() => {
     ok: true, privatePem: "ENCRYPTED UPDATED PEM", privateFilename: "updated.pem",
     kem: READY_HEALTH.kem, publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT
   });
+  client.verifyFile.mockReset();
+  client.verifyFile.mockResolvedValue({ ok: true, verified: true, kem: READY_HEALTH.kem,
+    formatVersion: 4, bytesVerified: 3, publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT });
 });
 
 describe("App", () => {
+  it("cancels an active verification batch only after navigation is confirmed", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    let finish!: (report: FileVerification) => void;
+    let signal!: AbortSignal;
+    client.verifyFile.mockImplementation((_file, _key, _password, requestSignal: AbortSignal) => {
+      signal = requestSignal;
+      return new Promise<FileVerification>((resolve) => { finish = resolve; });
+    });
+    client.inspectKey.mockResolvedValue({ ok: true,
+      keyInfo: { kem: READY_HEALTH.kem, key_type: "private", private_key_encrypted: true }, display: {} });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Batch verify" }));
+    await user.upload(screen.getByLabelText("Files to verify"), new File(["ciphertext"], "report.pqc"));
+    await user.upload(screen.getByLabelText("Private key", { exact: true }), new File(["key"], "private.pem"));
+    await user.type(screen.getByLabelText("Private key password", { exact: true }), "correct horse battery staple");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Verify batch" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Verify batch" }));
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(signal.aborted).toBe(false);
+    expect(screen.getByRole("heading", { name: "Verify multiple files" })).toBeVisible();
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish({ ok: true, verified: true, kem: READY_HEALTH.kem,
+      formatVersion: 4, bytesVerified: 3, publicKeyFingerprint: TEST_PUBLIC_KEY_FINGERPRINT }));
+    expect(screen.getByRole("heading", { name: "Inspect a key" })).toBeVisible();
+    expect(client.save).not.toHaveBeenCalled();
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+  });
+
+  it("guards a batch verification report until an explicit download is requested", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    client.inspectKey.mockResolvedValue({ ok: true,
+      keyInfo: { kem: READY_HEALTH.kem, key_type: "private", private_key_encrypted: true }, display: {} });
+    render(<App />);
+    await screen.findByRole("heading", { name: "Encrypt a file" });
+    await user.click(screen.getByRole("button", { name: "Batch verify" }));
+    await user.upload(screen.getByLabelText("Files to verify"), new File(["ciphertext"], "report.pqc"));
+    await user.upload(screen.getByLabelText("Private key", { exact: true }), new File(["key"], "private.pem"));
+    await user.type(screen.getByLabelText("Private key password", { exact: true }), "correct horse battery staple");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Verify batch" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Verify batch" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Download verification report" })).toBeEnabled());
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(confirm).toHaveBeenCalledWith("Batch verification is running or its report has not been downloaded. Leave and discard this batch?");
+    expect(screen.getByRole("heading", { name: "Verify multiple files" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Download verification report" }));
+    expect(client.save).toHaveBeenCalledTimes(1);
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(screen.getByRole("heading", { name: "Inspect a key" })).toBeVisible();
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a saved job only after health bootstrap and does not replay the operation", async () => {
+    const id = "b".repeat(32);
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, id);
+    let resolveHealth!: (value: typeof READY_HEALTH) => void;
+    client.fetchHealth.mockReturnValue(new Promise<typeof READY_HEALTH>((resolve) => { resolveHealth = resolve; }));
+    largeJobs.status.mockResolvedValue({ ...largeSnapshot("decrypt", "complete"), id });
+    render(<App />);
+    expect(screen.getByText("Loading local engine status.")).toBeVisible();
+    expect(largeJobs.status).not.toHaveBeenCalled();
+    await act(async () => resolveHealth({ ...READY_HEALTH, largeFiles: {
+      available: true, maxPlaintextBytes: 1024, maxEncryptedBytes: 2048, resultTtlSeconds: 60
+    } }));
+    expect(await screen.findByRole("heading", { name: "Large files" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Download result" })).toBeEnabled();
+    expect(screen.getByLabelText("Operation")).toHaveValue("decrypt");
+    expect(screen.getByLabelText("Private key password", { exact: true })).toHaveValue("");
+    expect(largeJobs.create).not.toHaveBeenCalled();
+    expect(largeJobs.upload).not.toHaveBeenCalled();
+    expect(largeJobs.start).not.toHaveBeenCalled();
+    expect(largeJobs.download).not.toHaveBeenCalled();
+  });
+
+  it("keeps an opted-in job across workflow navigation and restores its download", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await openLargeFile(user, "decrypt");
+    const id = "c".repeat(32);
+    largeJobs.create.mockResolvedValue({ ...largeSnapshot("decrypt", "awaiting_upload"), id });
+    largeJobs.upload.mockResolvedValue({ ...largeSnapshot("decrypt", "ready"), id });
+    largeJobs.start.mockResolvedValue({ ...largeSnapshot("decrypt", "complete"), id });
+    largeJobs.status.mockResolvedValue({ ...largeSnapshot("decrypt", "complete"), id });
+    const recovery = screen.getByRole("checkbox", { name: "Keep this job available after refresh" });
+    expect(recovery).not.toBeChecked();
+    await user.click(recovery);
+    await user.click(screen.getByRole("button", { name: "Decrypt large file" }));
+    await screen.findByRole("button", { name: "Download result" });
+    expect(sessionStorage.getItem(LARGE_FILE_RECOVERY_KEY)).toBe(id);
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Inspect key" }));
+    expect(screen.getByRole("heading", { name: "Inspect a key" })).toBeVisible();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(largeJobs.cancel).not.toHaveBeenCalled();
+    expect(largeJobs.clear).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Large files" }));
+    await screen.findByRole("button", { name: "Download result" });
+    expect(screen.getByLabelText("Operation")).toHaveValue("decrypt");
+    expect(largeJobs.create).toHaveBeenCalledTimes(1);
+    expect(largeJobs.start).toHaveBeenCalledTimes(1);
+    expect(largeJobs.download).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Clear temporary files" }));
+    expect(sessionStorage.getItem(LARGE_FILE_RECOVERY_KEY)).toBeNull();
+  });
+
+  it("guards a batch report independently of a recoverable large-file job", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const id = "d".repeat(32);
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, id);
+    largeJobs.status.mockResolvedValue({ ...largeSnapshot("encrypt", "complete"), id });
+    client.inspectKey.mockResolvedValue({ ok: true,
+      keyInfo: { kem: READY_HEALTH.kem, key_type: "private", private_key_encrypted: true }, display: {} });
+    render(<App />);
+    await screen.findByRole("button", { name: "Download result" });
+    await user.click(screen.getByRole("button", { name: "Batch verify" }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem(LARGE_FILE_RECOVERY_KEY)).toBe(id);
+    await user.upload(screen.getByLabelText("Files to verify"), new File(["ciphertext"], "report.pqc"));
+    await user.upload(screen.getByLabelText("Private key", { exact: true }), new File(["key"], "private.pem"));
+    await user.type(screen.getByLabelText("Private key password", { exact: true }), "correct horse battery staple");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Verify batch" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Verify batch" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Download verification report" })).toBeEnabled());
+    expect(window.dispatchEvent(new Event("beforeunload", { cancelable: true }))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Large files" }));
+    expect(confirm).toHaveBeenCalledWith("Batch verification is running or its report has not been downloaded. Leave and discard this batch?");
+    expect(screen.getByRole("heading", { name: "Verify multiple files" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Download verification report" }));
+    await user.click(screen.getByRole("button", { name: "Large files" }));
+    expect(await screen.findByRole("button", { name: "Download result" })).toBeEnabled();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(largeJobs.create).not.toHaveBeenCalled();
+    expect(largeJobs.clear).not.toHaveBeenCalled();
+    expect(largeJobs.cancel).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem(LARGE_FILE_RECOVERY_KEY)).toBe(id);
+  });
+
   it("guards an active large-file upload and requests cancellation only after confirmed navigation", async () => {
     const user = userEvent.setup();
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);

@@ -33,6 +33,9 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **Private-Key Password Changes**: Download a newly password-protected copy of the same private key without replacing your public key or re-encrypting existing files
 - **Public-Key Recovery**: Recover the public PEM from an unlocked private key and check whether a supplied public key matches
 - **File Verification**: Inspect encrypted-file metadata and authenticate an entire file without downloading its plaintext
+- **Batch Verification**: Authenticate up to 25 encrypted files with one key, retain individual results, and explicitly download an unsigned JSON report without plaintext
+- **CLI Key Maintenance**: Recover a public key or change a private-key password with environment-based passwords and atomic workspace output
+- **Encrypted Folder Backups**: Protect a directory tree in one authenticated backup and restore it into a new folder, preserving file contents, relative paths, and empty directories
 - **Large-file CLI**: Encrypt, decrypt, inspect, and verify files up to 1 GiB using bounded buffers and authenticated, atomic output
 - **Large-file Web Jobs**: Encrypt, decrypt, and verify up to 1 GiB with upload progress, cancellation, expiring temporary results, and explicit downloads
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
@@ -88,7 +91,7 @@ See [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md) for the dedicated screenshot page
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
-   npm install
+   npm ci
    ```
 
    For a reproducible runtime install with pinned hashes:
@@ -262,11 +265,42 @@ Verification requires the native backend and decrypts the bounded file in local 
 
 These endpoints follow the existing local API authentication, exact-origin, no-store, and upload-cleanup rules. Password changes, public-key recovery, file inspection, and file verification share one worker admission slot, retained until the operation finishes even if its HTTP request is cancelled. Busy requests receive `429` with `Retry-After: 1`; passwords are bounded to 4096 UTF-8 bytes and PEM files to the advertised limit.
 
+### Batch Verification
+
+Choose **Batch verify**, select up to 25 encrypted files within the displayed combined-size limit, then supply one encrypted private key and its password. **Verify batch** authenticates files sequentially without returning plaintext. Each file receives its own result; a damaged file or one encrypted for another key does not discard successful checks or automatically retry a request. The password field clears when the batch starts.
+
+**Cancel batch** stops queued files and aborts the active browser request; native work already running may still finish. Once requests settle, **Download verification report** exports the successful, failed, and cancelled results as JSON. The report includes filenames, sizes, and authenticated metadata for successful files. It contains no file contents, keys, or passwords, but filenames and recipient fingerprints may still be sensitive. Reports are unsigned local records, not portable proofs of authenticity or sender identity. There is no saved history: download the report or choose **Clear batch** before leaving.
+
+## Encrypted folder backups (macOS and Linux)
+
+The CLI can protect a whole directory tree as one `.pqc` file using the existing hybrid encryption format. File names and the directory structure are inside the encrypted payload. Recovery authenticates the entire container and validates the archive before creating a private staging directory; the finished tree becomes visible at the destination in one atomic operation.
+
+```bash
+python -m pqc_agent_tools backup-directory \
+  --input documents --public-key keys/recipient-public.pem \
+  --output backups/documents.pqc
+
+export PQC_PRIVATE_KEY_PASSWORD='<private-key-password>'
+python -m pqc_agent_tools restore-directory \
+  --input backups/documents.pqc --private-key keys/recipient-private.pem \
+  --output restored-documents
+```
+
+All paths are workspace-relative. Create the output's parent directory first. The backup must be outside its source directory; an existing backup requires `--overwrite`. Restoration always requires a new, absent destination: it never merges with or overwrites an existing folder. Add `--expected-recipient-fingerprint "$RECIPIENT_FINGERPRINT"` to require an independently verified recipient before backup work starts.
+
+Backups support regular files and directories, including empty ones, with at most 10,000 entries and a 1 GiB uncompressed ZIP archive including metadata. `--max-file-bytes` lowers that limit. Paths are normalized to NFC Unicode and must fit 1,024 UTF-8 bytes, 32 levels, and 255 bytes per component. Case/normalization collisions, traversal, symbolic links, special files, and unsupported ZIP features are rejected. Restored directories are owner-only (`0700`) and files are `0600`; original permissions, timestamps, ownership, ACLs, extended attributes, and hard-link relationships are not restored.
+
+The implementation uses a strict, uncompressed ZIP profile inside the unchanged PQC container. Existing `verify-file` can authenticate the encrypted backup; `restore-directory` additionally checks its archive structure. Keep source applications quiet while making a backup; this is not a filesystem snapshot. Packing and recovery use bounded buffers and private temporary files, which require additional disk space and may contain plaintext. Cleanup releases those files but does not securely erase storage. A failed authentication, invalid archive, cancellation, or pre-publication write failure leaves the destination absent. If publication succeeds but directory synchronization fails, the CLI reports `output_durability_failed`; verify the published folder before retrying. Atomic folder restoration is supported on macOS and Linux and fails closed on other platforms.
+
 ## Large files
 
 Choose **Large files** in the web app to encrypt, decrypt, or verify one file up to 1 GiB. Select the operation, file, and appropriate PEM key. The app shows upload and processing progress, clears the password field when you start, and waits for an explicit **Download result** action. Downloads stream directly from the local service; the browser app does not retain a full result blob. Verification returns an authentication report without a plaintext download.
 
 One large-file job can be retained at a time. **Cancel operation** requests cancellation; wait for cleanup to finish before choosing **Clear temporary files**. Completed results remain downloadable until cleared or until the 15-minute deadline measured from reservation. Expiry also cancels unfinished jobs. Closing or losing the tab may leave a job until automatic expiry. Temporary files use private, automatically removed storage; decrypted results occupy disk until cleared or expired, including after a download. Allow roughly three times the selected file size plus a small reserve in the system temporary directory. Deleting files is not secure erasure.
+
+Refresh recovery is optional and off by default. Without it, leaving the workflow requests cancellation or cleanup. Enable it before starting to retain the job across refreshes and navigation. Only its opaque ID is saved under a versioned `sessionStorage` key; filenames, keys, passwords, and results are never stored there. If saving fails, default cleanup remains enabled. Returning checks live status before offering a download. Interrupted uploads and unstarted operations require cleanup and reselected inputs; recovery never automatically repeats them.
+
+Recovery does not extend the deadline or survive a service restart. Closing a tab may lose its reference, while browser session restoration may restore it. Duplicated tabs may share one job; clearing it affects both. Use **Clear temporary files** when finished, especially after decryption. Recovery is not a backup or secure-erasure control.
 
 Cryptographic work runs on a single background worker. Other expensive operations return a retryable busy response while a job is reserved or running; health and key inspection remain available. A completed retained result releases the cryptographic worker, although it must be cleared before reserving another large-file job. Jobs are local, process-owned, and are not resumable across service restarts.
 
@@ -308,6 +342,17 @@ python -m pqc_agent_tools decrypt \
   --input data/message.pqc \
   --private-key keys/agent-private.pem \
   --output data/message.decrypted.txt
+
+python -m pqc_agent_tools recover-public-key \
+  --private-key keys/agent-private.pem \
+  --compare-public-key keys/agent-public.pem \
+  --output keys/recovered-public.pem
+
+export PQC_NEW_PRIVATE_KEY_PASSWORD='<different-strong-private-key-password>'
+python -m pqc_agent_tools change-key-password \
+  --private-key keys/agent-private.pem \
+  --new-password-env PQC_NEW_PRIVATE_KEY_PASSWORD \
+  --output keys/updated-private.pem
 ```
 
 The installed console entry point is equivalent:
@@ -317,6 +362,8 @@ quantum-encryptor-agent health --json
 ```
 
 The CLI prints JSON only and never includes plaintext, private keys, passwords, raw file bytes, or absolute local paths in its output. Private-key generation, decryption, and verification read passwords from the environment variable named by `--password-env`, defaulting to `PQC_PRIVATE_KEY_PASSWORD`. `inspect-key` remains metadata-only for an encrypted private key unless `--password-env NAME` is explicitly supplied; after a successful authenticated unlock it returns the corresponding `public_key_fingerprint`.
+
+`recover-public-key` and `change-key-password` also read the current password through `--password-env`, and work without native liboqs. Recovery optionally compares the supplied public key and reports `matches_supplied_public_key`; a mismatch does not prevent recovering the correct public key. Password changes preserve the key pair and fingerprint, accept authenticated older passwords for migration, and require a different new password meeting the current strength policy. Both commands require a separate output path, even with `--overwrite`, and publish output atomically. Updated private keys use POSIX mode `0600`. Test the new copy before replacing an original: changing a password does not revoke old copies or recover a forgotten password.
 
 ## Security Considerations
 
@@ -336,7 +383,7 @@ The CLI prints JSON only and never includes plaintext, private keys, passwords, 
 - Generated-key cache and leave-page guards reduce accidental retention or loss but do not protect against developer tools, browser extensions, or malicious local software. Browser and operating-system settings determine downloaded private-key file permissions; the web app cannot guarantee POSIX mode `0600`.
 - The local agent CLI accepts only workspace-relative paths, returns machine-readable JSON without secret material, and writes private keys plus decrypted outputs with owner-only permissions on POSIX systems; non-overwrite output creation uses exclusive file creation
 - Native `liboqs` is loaded lazily and missing backend support disables key generation/encryption instead of crashing the app
-- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.16.0 release commit; repository CodeQL default setup provides static analysis
+- CI runs Python formatting, linting, type checks, unit tests, custom web UI build/type checks, API client tests, browser UI smoke, isolated installed-wheel checks, Python/npm dependency audits, locked runtime install, and a native `liboqs` integration test job pinned to the matching 0.16.0 release commit; the CodeQL workflow scans every PR to `main`, including dependency-only changes
 - See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for repository trust boundaries, assets, abuse cases, and invariants
 - **Disclaimer**: This software has not undergone an independent security audit and should be reviewed before production use
 

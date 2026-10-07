@@ -1,12 +1,16 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiError } from "../../api/client";
 import type { KeyInspectResult } from "../../api";
 import type { LargeFileJob, LargeFileMode, LargeFileOperations } from "../../api/largeFiles";
 import { READY_HEALTH } from "../../test/fixtures";
 import { LargeFilesWorkflow } from "./LargeFilesWorkflow";
+import { LARGE_FILE_RECOVERY_KEY } from "../../lib/largeFileRecovery";
 
 const fingerprint = `QE1-SHA3-256:${"a".repeat(64)}`;
+const recoveryId = "a".repeat(32);
+beforeEach(() => window.sessionStorage.clear());
 const health = { ...READY_HEALTH, largeFiles: { available: true, maxPlaintextBytes: 10, maxEncryptedBytes: 20, resultTtlSeconds: 60 } };
 const publicInspection: KeyInspectResult = { ok: true, keyInfo: { key_type: "public", kem: READY_HEALTH.kem, public_key_fingerprint: fingerprint }, display: {} };
 const privateInspection: KeyInspectResult = { ok: true, keyInfo: { key_type: "private", kem: READY_HEALTH.kem, private_key_encrypted: true }, display: {} };
@@ -44,6 +48,108 @@ async function prepare(user: ReturnType<typeof userEvent.setup>, mode: LargeFile
 }
 
 describe("LargeFilesWorkflow", () => {
+  it("revalidates a saved decrypted result even when the crypto backend is unavailable", async () => {
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, recoveryId);
+    const api = operations("decrypt");
+    const status = deferred<LargeFileJob>();
+    vi.mocked(api.status).mockReturnValue(status.promise);
+    const offlineHealth = { ...health, largeFiles: { ...health.largeFiles, available: false },
+      capabilities: { ...health.capabilities, decrypt: { available: false, reason: "Backend unavailable" } } };
+    render(<LargeFilesWorkflow health={offlineHealth} operations={api} />);
+    expect(await screen.findByText("Reconnecting to the temporary job.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Download result" })).not.toBeInTheDocument();
+    await act(async () => status.resolve(snapshot("decrypt", { id: recoveryId, state: "complete", result: { filename: "restored.txt", bytes: 3 } })));
+    expect(await screen.findByText("Job reconnected")).toBeVisible();
+    expect(screen.getByLabelText("Operation")).toHaveValue("decrypt");
+    expect(screen.getByLabelText("Private key password", { exact: true })).toHaveValue("");
+    expect(screen.getByText(/Decrypted output is stored temporarily/)).toBeVisible();
+    expect(api.create).not.toHaveBeenCalled();
+    expect(api.upload).not.toHaveBeenCalled();
+    expect(api.start).not.toHaveBeenCalled();
+    expect(api.download).not.toHaveBeenCalled();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Download result" }));
+    expect(api.download).toHaveBeenCalledWith(recoveryId);
+  });
+
+  it("keeps creation locked during recovery failure and retries only status", async () => {
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, recoveryId);
+    const api = operations("verify");
+    vi.mocked(api.status).mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValue(snapshot("verify", { id: recoveryId, state: "complete", verification: {
+        ok: true, verified: true, bytesVerified: 3, kem: health.kem, formatVersion: 4, publicKeyFingerprint: fingerprint
+      } }));
+    render(<LargeFilesWorkflow health={health} operations={api} />);
+    const retry = await screen.findByRole("button", { name: "Retry status" });
+    expect(screen.getByLabelText("Operation")).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Encrypt large file" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Download result" })).not.toBeInTheDocument();
+    await userEvent.setup().click(retry);
+    expect(await screen.findByText("File authenticated")).toBeVisible();
+    expect(screen.getByLabelText("Operation")).toHaveValue("verify");
+    expect(api.create).not.toHaveBeenCalled();
+    expect(api.upload).not.toHaveBeenCalled();
+    expect(api.start).not.toHaveBeenCalled();
+    expect(api.download).not.toHaveBeenCalled();
+  });
+
+  it("keeps completed result actions locked after a failed page restoration until status is confirmed", async () => {
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, recoveryId);
+    const api = operations("decrypt");
+    const complete = snapshot("decrypt", { id: recoveryId, state: "complete", result: { filename: "restored.txt", bytes: 3 } });
+    const retry = deferred<LargeFileJob>();
+    vi.mocked(api.status).mockResolvedValueOnce(complete).mockRejectedValueOnce(new TypeError("offline"))
+      .mockReturnValueOnce(retry.promise);
+    const user = userEvent.setup();
+    render(<LargeFilesWorkflow health={health} operations={api} />);
+    expect(await screen.findByRole("button", { name: "Download result" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Clear temporary files" })).toBeEnabled();
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+      window.dispatchEvent(new Event("pageshow"));
+    });
+    expect(await screen.findByText("Waiting to reconnect to the temporary job.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Download result" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear temporary files" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Clear temporary files" }));
+    expect(api.clear).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Retry status" }));
+    expect(screen.getByText("Reconnecting to the temporary job.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Clear temporary files" })).toBeDisabled();
+    await act(async () => { retry.resolve(complete); });
+    expect(await screen.findByRole("button", { name: "Download result" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Clear temporary files" })).toBeEnabled();
+    expect(api.download).not.toHaveBeenCalled();
+    expect(api.create).not.toHaveBeenCalled();
+    expect(api.upload).not.toHaveBeenCalled();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("offers explicit cleanup when preparation was interrupted without replaying it", async () => {
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, recoveryId);
+    const api = operations();
+    vi.mocked(api.status).mockResolvedValue(snapshot("encrypt", { id: recoveryId, state: "ready" }));
+    render(<LargeFilesWorkflow health={health} operations={api} />);
+    expect(await screen.findByText(/Preparation was interrupted/)).toBeVisible();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Clear temporary files" }));
+    expect(api.clear).toHaveBeenCalledWith(recoveryId);
+    expect(sessionStorage.getItem(LARGE_FILE_RECOVERY_KEY)).toBeNull();
+    expect(screen.getByLabelText("Operation")).toBeEnabled();
+    expect(api.upload).not.toHaveBeenCalled();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("discards an expired recovery reference and enables a fresh operation", async () => {
+    sessionStorage.setItem(LARGE_FILE_RECOVERY_KEY, recoveryId);
+    const api = operations();
+    vi.mocked(api.status).mockRejectedValue(new ApiError(410, "job_expired", "Expired"));
+    render(<LargeFilesWorkflow health={health} operations={api} />);
+    expect(await screen.findByText(/temporary job has expired/)).toBeVisible();
+    expect(sessionStorage.getItem(LARGE_FILE_RECOVERY_KEY)).toBeNull();
+    expect(screen.getByLabelText("Operation")).toBeEnabled();
+    expect(api.clear).not.toHaveBeenCalled();
+    expect(api.cancel).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["QE1-SHA3-256:incomplete", true],
     [`QE1-SHA3-256:${"b".repeat(64)}`, true],

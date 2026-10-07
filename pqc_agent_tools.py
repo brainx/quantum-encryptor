@@ -15,6 +15,7 @@ from typing import Any, BinaryIO, Callable, Iterator, NoReturn, Optional, Sequen
 from crypto_config import cfg
 import crypto_core as core
 import crypto_stream as streaming
+import crypto_archive as archives
 
 EXIT_SUCCESS = 0
 EXIT_UNEXPECTED = 1
@@ -25,6 +26,7 @@ EXIT_PATH_VIOLATION = 5
 
 # Environment variable name, not a password value.
 DEFAULT_PASSWORD_ENV = "PQC_PRIVATE_KEY_PASSWORD"  # nosec B105
+MAX_KEY_PASSWORD_BYTES = 4096
 StreamResult = TypeVar("StreamResult")
 _STREAM_ERRORS = (
     core.CryptoCoreError,
@@ -32,6 +34,14 @@ _STREAM_ERRORS = (
     core.SizeLimitError,
     core.InvalidKeyFormatError,
     core.UnsupportedAlgorithmError,
+)
+_KEY_MAINTENANCE_ERRORS = (
+    core.CryptoCoreError,
+    core.InvalidKeyFormatError,
+    core.UnsupportedAlgorithmError,
+    core.WeakPasswordError,
+    core.UnencryptedPrivateKeyError,
+    core.UnsupportedKDFError,
 )
 
 
@@ -97,6 +107,16 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _inside_directory(path: Path, directory: Path) -> bool:
+    """Include physical aliases on case-insensitive filesystems in exclusion checks."""
+    if _is_relative_to(path, directory):
+        return True
+    try:
+        return any(parent.samefile(directory) for parent in path.parents)
+    except OSError as exc:
+        raise AgentCommandError("invalid_path", "Could not inspect output ancestry.", EXIT_INVALID_INPUT) from exc
 
 
 def _reject_unsafe_path_text(path_text: str) -> Path:
@@ -491,8 +511,16 @@ def _write_workspace_stream(
     overwrite: bool,
     operation: str,
     private_file: bool = False,
+    protected_input: Optional[Path] = None,
+    excluded_directory: Optional[Path] = None,
 ) -> tuple[Path, StreamResult]:
     path = _resolve_output_path(path_text, workspace, overwrite)
+    if protected_input is not None:
+        _require_separate_key_output(path, protected_input, operation)
+    if excluded_directory is not None and _inside_directory(path, excluded_directory):
+        raise AgentCommandError(
+            "invalid_path", "Backup output must be outside the source directory.", EXIT_INVALID_INPUT, operation
+        )
     directory_fd: Optional[int] = None
     try:
         if os.name != "nt":
@@ -528,6 +556,29 @@ def _password_from_env(env_name: str, operation: str, required: bool) -> Optiona
     return None
 
 
+def _key_password_from_env(env_name: str, operation: str) -> str:
+    """Bound existing credentials without applying the policy for creating new passwords."""
+    password = os.environ.get(env_name)
+    if not password:
+        raise AgentCommandError(
+            "password_required", f"Set {env_name} before running this command.", EXIT_CRYPTO_FAILURE, operation
+        )
+    try:
+        password_bytes = len(password.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise AgentCommandError(
+            "invalid_password", "Private-key passwords must be valid UTF-8 text.", EXIT_INVALID_INPUT, operation
+        ) from exc
+    if password_bytes > MAX_KEY_PASSWORD_BYTES:
+        raise AgentCommandError(
+            "password_too_long",
+            f"Private-key passwords must not exceed {MAX_KEY_PASSWORD_BYTES} UTF-8 bytes.",
+            EXIT_INVALID_INPUT,
+            operation,
+        )
+    return password
+
+
 def _agent_error_from_core(operation: str, exc: Exception) -> AgentCommandError:
     if isinstance(exc, streaming.OperationCancelled):
         return AgentCommandError("cancelled", "Operation cancelled.", EXIT_CRYPTO_FAILURE, operation)
@@ -546,6 +597,13 @@ def _agent_error_from_core(operation: str, exc: Exception) -> AgentCommandError:
             operation,
         )
     if isinstance(exc, core.AuthenticationFailedError):
+        if operation in {"recover-public-key", "change-key-password"}:
+            return AgentCommandError(
+                "private_key_load_failed",
+                "Could not unlock the private key. Check the password and key file.",
+                EXIT_CRYPTO_FAILURE,
+                operation,
+            )
         return AgentCommandError(
             "verification_failed" if operation == "verify-file" else "decryption_failed",
             "Authentication failed. Check private key, password, and ciphertext integrity.",
@@ -730,6 +788,114 @@ def handle_generate_keys(args: argparse.Namespace, workspace: Path) -> int:
     )
 
 
+def _require_separate_key_output(output_path: Path, private_path: Path, operation: str) -> None:
+    try:
+        same_file = output_path == private_path or output_path.samefile(private_path)
+    except FileNotFoundError:
+        same_file = False
+    except OSError as exc:
+        raise AgentCommandError(
+            "invalid_path", "Could not inspect output path.", EXIT_INVALID_INPUT, operation
+        ) from exc
+    # File identity also covers aliases on case-insensitive filesystems.
+    if same_file:
+        raise AgentCommandError(
+            "invalid_path", "Output must differ from the source private key.", EXIT_INVALID_INPUT, operation
+        )
+
+
+def _key_maintenance_source(args: argparse.Namespace, workspace: Path, operation: str) -> tuple[Path, str]:
+    private_path, private_pem = _read_workspace_text(args.private_key, workspace)
+    output_path = _resolve_output_path(args.output, workspace, args.overwrite)
+    _require_separate_key_output(output_path, private_path, operation)
+    return private_path, private_pem
+
+
+def _publish_key_result(
+    args: argparse.Namespace, workspace: Path, operation: str, private_path: Path, pem: str, *, private_file: bool
+) -> Path:
+    encoded = pem.encode("ascii")
+
+    def write_key(sink: BinaryIO) -> None:
+        # A short write must never publish a truncated key.
+        if sink.write(encoded) != len(encoded):
+            raise OSError("Could not write the complete key.")
+
+    output_path, _ = _write_workspace_stream(
+        args.output,
+        workspace,
+        write_key,
+        args.overwrite,
+        operation,
+        private_file=private_file,
+        protected_input=private_path,
+    )
+    return output_path
+
+
+def handle_recover_public_key(args: argparse.Namespace, workspace: Path) -> int:
+    operation = "recover-public-key"
+    private_path, private_pem = _key_maintenance_source(args, workspace, operation)
+    comparison_fingerprint = None
+    password = _key_password_from_env(args.password_env, operation)
+    try:
+        with _suppress_library_output():
+            if args.compare_public_key is not None:
+                _, comparison_pem = _read_workspace_text(args.compare_public_key, workspace)
+                public_key, kem, key_type = core.load_key_pem(comparison_pem)
+                if public_key is None or kem is None or key_type != "public":
+                    raise AgentCommandError(
+                        "invalid_key",
+                        "Comparison file must contain a supported public key.",
+                        EXIT_INVALID_INPUT,
+                        operation,
+                    )
+                comparison_fingerprint = core.get_public_key_fingerprint(public_key, kem)
+            public_pem, kem, fingerprint = core.recover_public_key_pem(private_pem, password)
+    except _KEY_MAINTENANCE_ERRORS as exc:
+        raise _agent_error_from_core(operation, exc) from exc
+    finally:
+        del password
+        del private_pem
+    output_path = _publish_key_result(args, workspace, operation, private_path, public_pem, private_file=False)
+    return _success(
+        operation,
+        kem=kem,
+        private_key=_relative_to_workspace(private_path, workspace),
+        output=_relative_to_workspace(output_path, workspace),
+        public_key_fingerprint=fingerprint,
+        matches_supplied_public_key=(
+            None if comparison_fingerprint is None else secrets.compare_digest(fingerprint, comparison_fingerprint)
+        ),
+    )
+
+
+def handle_change_key_password(args: argparse.Namespace, workspace: Path) -> int:
+    operation = "change-key-password"
+    private_path, private_pem = _key_maintenance_source(args, workspace, operation)
+    password = _key_password_from_env(args.password_env, operation)
+    new_password = _key_password_from_env(args.new_password_env, operation)
+    try:
+        with _suppress_library_output():
+            updated_pem, kem, fingerprint = core.rewrap_private_key_pem(private_pem, password, new_password)
+    except _KEY_MAINTENANCE_ERRORS as exc:
+        raise _agent_error_from_core(operation, exc) from exc
+    finally:
+        del password
+        del new_password
+        del private_pem
+    output_path = _publish_key_result(args, workspace, operation, private_path, updated_pem, private_file=True)
+    return _success(
+        operation,
+        kem=kem,
+        private_key=_relative_to_workspace(private_path, workspace),
+        output=_relative_to_workspace(output_path, workspace),
+        public_key_fingerprint=fingerprint,
+        private_key_encrypted=True,
+        private_key_kdf=cfg.PRIVATE_KEY_KDF_ALG,
+    )
+
+
 def handle_encrypt(args: argparse.Namespace, workspace: Path) -> int:
     operation = "encrypt"
     with _open_workspace_stream(args.input, workspace, args.max_file_bytes) as (input_path, source):
@@ -808,6 +974,149 @@ def handle_inspect_file(args: argparse.Namespace, workspace: Path) -> int:
         x25519_ciphertext_bytes=metadata.x25519_ciphertext_bytes,
         encrypted_payload_bytes=metadata.encrypted_payload_bytes,
         total_bytes=metadata.total_bytes,
+    )
+
+
+def _directory_source_path(path_text: str, workspace: Path) -> Path:
+    relative = _reject_unsafe_path_text(path_text)
+    candidate = workspace / relative
+    try:
+        if candidate.is_symlink():
+            raise AgentCommandError("invalid_path", "Source directory must not be a symlink.", EXIT_INVALID_INPUT)
+        resolved = candidate.resolve(strict=True)
+        if not _is_relative_to(resolved, workspace):
+            raise AgentCommandError("path_outside_workspace", "Directory escapes the workspace.", EXIT_PATH_VIOLATION)
+        if not resolved.is_dir():
+            raise AgentCommandError("invalid_path", "Input must be a directory.", EXIT_INVALID_INPUT)
+        return resolved
+    except (OSError, RuntimeError) as exc:
+        raise AgentCommandError("invalid_path", "Could not open source directory.", EXIT_INVALID_INPUT) from exc
+
+
+def _new_directory_output(path_text: str, workspace: Path) -> Path:
+    relative = _reject_unsafe_path_text(path_text)
+    try:
+        parent = (workspace / relative).parent.resolve(strict=True)
+        if not _is_relative_to(parent, workspace):
+            raise AgentCommandError("path_outside_workspace", "Output escapes the workspace.", EXIT_PATH_VIOLATION)
+        destination = parent / relative.name
+        if os.path.lexists(destination):
+            raise AgentCommandError("output_exists", "Restore requires a new, absent directory.", EXIT_INVALID_INPUT)
+        return destination
+    except (OSError, RuntimeError) as exc:
+        raise AgentCommandError("invalid_path", "Could not inspect output directory.", EXIT_INVALID_INPUT) from exc
+
+
+def _archive_error(operation: str, exc: Exception) -> AgentCommandError:
+    if isinstance(exc, archives.ArchiveDurabilityError):
+        return AgentCommandError(
+            "output_durability_failed",
+            "Restored directory was published but durability was not confirmed. Verify it before retrying.",
+            EXIT_UNEXPECTED,
+            operation,
+        )
+    if isinstance(exc, archives.ArchiveCancelledError):
+        return AgentCommandError("cancelled", "Operation cancelled.", EXIT_CRYPTO_FAILURE, operation)
+    if isinstance(exc, FileExistsError):
+        return AgentCommandError(
+            "output_exists", "Restore requires a new, absent directory.", EXIT_INVALID_INPUT, operation
+        )
+    return AgentCommandError(
+        "invalid_archive" if operation == "restore-directory" else "invalid_directory",
+        "Directory backup could not be processed safely. Check entry types, names, limits, and destination.",
+        EXIT_INVALID_INPUT,
+        operation,
+    )
+
+
+def handle_backup_directory(args: argparse.Namespace, workspace: Path) -> int:
+    operation = "backup-directory"
+    input_path = _directory_source_path(args.input, workspace)
+    output_path = _resolve_output_path(args.output, workspace, args.overwrite)
+    if _inside_directory(output_path, input_path):
+        raise AgentCommandError(
+            "invalid_path", "Backup output must be outside the source directory.", EXIT_INVALID_INPUT, operation
+        )
+    public_path, public_pem = _read_workspace_text(args.public_key, workspace)
+    public_key, kem, key_type = core.load_key_pem(public_pem)
+    if public_key is None or kem != cfg.HYBRID_KEM_ALG or key_type != "public":
+        raise AgentCommandError(
+            "invalid_key", "A current hybrid public key is required.", EXIT_INVALID_INPUT, operation
+        )
+    try:
+        fingerprint = core.verify_recipient_fingerprint(public_key, kem, args.expected_recipient_fingerprint)
+        _resolve_backend(operation)
+        with _suppress_library_output(), tempfile.TemporaryFile(mode="w+b") as archive:
+            summary = archives.pack_directory(input_path, archive, max_archive_bytes=args.max_file_bytes)
+            archive.seek(0)
+
+            def encrypt(sink: BinaryIO) -> core.EncryptedFileMetadata:
+                return streaming.encrypt_stream(archive, sink, public_key, kem, max_file_bytes=args.max_file_bytes)
+
+            # Resolve again immediately before writing; output must never enter the source tree.
+            output_path = _resolve_output_path(args.output, workspace, args.overwrite)
+            if _inside_directory(output_path, input_path):
+                raise AgentCommandError(
+                    "invalid_path", "Backup output must be outside the source directory.", EXIT_INVALID_INPUT, operation
+                )
+            output_path, metadata = _write_workspace_stream(
+                args.output, workspace, encrypt, args.overwrite, operation, excluded_directory=input_path
+            )
+    except (archives.ArchiveError, OSError) as exc:
+        raise _archive_error(operation, exc) from exc
+    except _STREAM_ERRORS + (core.InvalidRecipientFingerprintError, core.RecipientFingerprintMismatchError) as exc:
+        raise _agent_error_from_core(operation, exc) from exc
+    return _success(
+        operation,
+        input=_relative_to_workspace(input_path, workspace),
+        output=_relative_to_workspace(output_path, workspace),
+        public_key=_relative_to_workspace(public_path, workspace),
+        kem=metadata.kem_alg,
+        public_key_fingerprint=fingerprint,
+        archive_format="zip-stored",
+        files=summary.files,
+        directories=summary.directories,
+        source_bytes=summary.bytes,
+        bytes_written=metadata.total_bytes,
+    )
+
+
+def handle_restore_directory(args: argparse.Namespace, workspace: Path) -> int:
+    operation = "restore-directory"
+    output_path = _new_directory_output(args.output, workspace)
+    with _open_workspace_stream(args.input, workspace, streaming.encrypted_size_limit(args.max_file_bytes)) as (
+        input_path,
+        source,
+    ):
+        private_path, private_key, kem = _load_required_private_key(
+            args.private_key, args.password_env, workspace, operation
+        )
+        try:
+            _resolve_decryption_backends(operation, kem)
+            with _suppress_library_output(), tempfile.TemporaryFile(mode="w+b") as archive:
+                metadata = streaming.decrypt_stream(
+                    source, archive, private_key, expected_kem_alg=kem, max_file_bytes=args.max_file_bytes
+                )
+                archive.seek(0)
+                # Nothing is extracted until the complete PQC container has authenticated.
+                output_path = _new_directory_output(args.output, workspace)
+                summary = archives.extract_archive(archive, output_path, max_archive_bytes=args.max_file_bytes)
+        except (archives.ArchiveError, OSError) as exc:
+            raise _archive_error(operation, exc) from exc
+        except _STREAM_ERRORS as exc:
+            raise _agent_error_from_core(operation, exc) from exc
+        finally:
+            del private_key
+    return _success(
+        operation,
+        input=_relative_to_workspace(input_path, workspace),
+        output=_relative_to_workspace(output_path, workspace),
+        private_key=_relative_to_workspace(private_path, workspace),
+        kem=metadata.kem_alg,
+        archive_format="zip-stored",
+        files=summary.files,
+        directories=summary.directories,
+        restored_bytes=summary.bytes,
     )
 
 
@@ -976,6 +1285,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_stream_limit_argument(encrypt)
     encrypt.set_defaults(handler=handle_encrypt)
 
+    backup = subparsers.add_parser("backup-directory", help="Encrypt a directory tree as one authenticated backup.")
+    backup.add_argument("--input", required=True, help="Directory of regular files and subdirectories.")
+    backup.add_argument("--public-key", required=True)
+    backup.add_argument("--output", required=True, help="Encrypted backup path outside the source directory.")
+    backup.add_argument("--expected-recipient-fingerprint", default=None)
+    backup.add_argument("--overwrite", action="store_true")
+    _add_stream_limit_argument(backup)
+    backup.set_defaults(handler=handle_backup_directory)
+
+    restore = subparsers.add_parser("restore-directory", help="Authenticate and restore a backup to a new directory.")
+    restore.add_argument("--input", required=True)
+    restore.add_argument("--private-key", required=True)
+    restore.add_argument("--output", required=True, help="New directory; existing destinations are never replaced.")
+    _add_password_env_argument(restore)
+    _add_stream_limit_argument(restore)
+    restore.set_defaults(handler=handle_restore_directory)
+
     inspect_file = subparsers.add_parser("inspect-file", help="Inspect an encrypted workspace file.")
     inspect_file.add_argument("--input", required=True)
     _add_stream_limit_argument(inspect_file)
@@ -1004,6 +1330,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional environment variable used to unlock a private key and derive its public fingerprint.",
     )
     inspect_key.set_defaults(handler=handle_inspect_key)
+
+    recover = subparsers.add_parser("recover-public-key", help="Recover a public key from its encrypted private key.")
+    recover.add_argument("--private-key", required=True)
+    recover.add_argument("--output", required=True, help="Separate output path for the recovered public key.")
+    recover.add_argument("--compare-public-key", help="Optionally report whether this public key matches.")
+    _add_password_env_argument(recover)
+    recover.add_argument("--overwrite", action="store_true")
+    recover.set_defaults(handler=handle_recover_public_key)
+
+    change_password = subparsers.add_parser("change-key-password", help="Re-encrypt a private key with a new password.")
+    change_password.add_argument("--private-key", required=True)
+    change_password.add_argument("--output", required=True, help="Separate output path for the updated private key.")
+    _add_password_env_argument(change_password)
+    change_password.add_argument(
+        "--new-password-env", required=True, help="Environment variable containing the new password."
+    )
+    change_password.add_argument("--overwrite", action="store_true")
+    change_password.set_defaults(handler=handle_change_key_password)
 
     return parser
 

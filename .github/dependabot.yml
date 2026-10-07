@@ -62,13 +62,23 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      python-lint-family:
+        # Flake8 minor releases can require a major Pyflakes update.
+        patterns:
+          - "flake8"
+          - "pycodestyle"
+          - "pyflakes"
+          - "mccabe"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
       python-analysis:
         patterns:
           - "mypy"
           - "librt"
           - "ast-serialize"
           - "black"
-          - "flake8"
           - "bandit"
           - "pip-audit"
           - "cyclonedx-python-lib"

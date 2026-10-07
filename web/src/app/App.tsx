@@ -10,7 +10,9 @@ import { InspectKeyWorkflow } from "../features/inspect/InspectKeyWorkflow";
 import { ChangeKeyPasswordWorkflow } from "../features/keys/ChangeKeyPasswordWorkflow";
 import { RecoverPublicKeyWorkflow } from "../features/keys/RecoverPublicKeyWorkflow";
 import { VerifyFileWorkflow } from "../features/inspect/VerifyFileWorkflow";
+import { BatchVerifyWorkflow } from "../features/inspect/BatchVerifyWorkflow";
 import { LargeFilesWorkflow } from "../features/large-files/LargeFilesWorkflow";
+import { readLargeFileRecovery } from "../lib/largeFileRecovery";
 import { AppShell } from "./AppShell";
 import type { View } from "./navigation";
 
@@ -19,9 +21,10 @@ const BATCH_RESULT_CONFIRMATION = "Encrypted files are waiting to be downloaded.
 const PLAINTEXT_RESULT_CONFIRMATION = "Decrypted files are still available in this tab. Leave this workflow and clear them?";
 const UPDATED_KEY_CONFIRMATION = "The updated private key is still available. Leave this workflow and clear it?";
 const LARGE_FILE_CONFIRMATION = "A large-file operation or temporary result is still available. Leave and request cleanup? Interrupted cleanup will finish when the job expires.";
+const VERIFICATION_CONFIRMATION = "Batch verification is running or its report has not been downloaded. Leave and discard this batch?";
 
 export default function App() {
-  const [activeView, setActiveView] = useState<View>("encrypt");
+  const [activeView, setActiveView] = useState<View>(() => readLargeFileRecovery() ? "large-files" : "encrypt");
   const [health, setHealth] = useState<Health | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [hasGeneratedKeys, setHasGeneratedKeys] = useState(false);
@@ -29,6 +32,8 @@ export default function App() {
   const [hasPlaintextResults, setHasPlaintextResults] = useState(false);
   const [hasUpdatedKey, setHasUpdatedKey] = useState(false);
   const [hasLargeFileWork, setHasLargeFileWork] = useState(false);
+  const [hasBatchVerificationWork, setHasBatchVerificationWork] = useState(false);
+  const [canRecoverLargeFileWork, setCanRecoverLargeFileWork] = useState(false);
   const healthRequestId = useRef(0);
   const initialHealthRequest = useRef<Promise<Health> | null>(null);
 
@@ -59,7 +64,8 @@ export default function App() {
   }, [loadHealth]);
 
   useLayoutEffect(() => {
-    if (!hasGeneratedKeys && !hasBatchResults && !hasPlaintextResults && !hasUpdatedKey && !hasLargeFileWork) return;
+    if (!hasGeneratedKeys && !hasBatchResults && !hasPlaintextResults && !hasUpdatedKey && !hasBatchVerificationWork &&
+        !(hasLargeFileWork && !canRecoverLargeFileWork)) return;
 
     function warnBeforeUnload(event: BeforeUnloadEvent) {
       event.preventDefault();
@@ -68,7 +74,7 @@ export default function App() {
 
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
-  }, [hasGeneratedKeys, hasBatchResults, hasPlaintextResults, hasUpdatedKey, hasLargeFileWork]);
+  }, [hasGeneratedKeys, hasBatchResults, hasPlaintextResults, hasUpdatedKey, hasLargeFileWork, hasBatchVerificationWork, canRecoverLargeFileWork]);
 
   function navigate(nextView: View) {
     if (nextView === activeView) return;
@@ -89,8 +95,12 @@ export default function App() {
       setHasUpdatedKey(false);
     }
     if (activeView === "large-files" && hasLargeFileWork) {
-      if (!window.confirm(LARGE_FILE_CONFIRMATION)) return;
+      if (!canRecoverLargeFileWork && !window.confirm(LARGE_FILE_CONFIRMATION)) return;
       setHasLargeFileWork(false);
+    }
+    if (activeView === "batch-verify" && hasBatchVerificationWork) {
+      if (!window.confirm(VERIFICATION_CONFIRMATION)) return;
+      setHasBatchVerificationWork(false);
     }
     setActiveView(nextView);
   }
@@ -128,9 +138,13 @@ export default function App() {
       )}
       {activeView === "inspect" && <InspectKeyWorkflow health={health} />}
       {activeView === "verify-file" && <VerifyFileWorkflow health={health} />}
+      {activeView === "batch-verify" && (
+        <BatchVerifyWorkflow health={health} onPendingResultsChange={setHasBatchVerificationWork} />
+      )}
       {activeView === "recover-public" && <RecoverPublicKeyWorkflow health={health} />}
       {activeView === "large-files" && (
-        <LargeFilesWorkflow health={health} onSensitiveResultChange={setHasLargeFileWork} />
+        <LargeFilesWorkflow health={health} onSensitiveResultChange={setHasLargeFileWork}
+          onRecoveryChange={setCanRecoverLargeFileWork} />
       )}
       {activeView === "change-password" && (
         <ChangeKeyPasswordWorkflow health={health} onSensitiveResultChange={setHasUpdatedKey} />

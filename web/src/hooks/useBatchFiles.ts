@@ -4,14 +4,14 @@ import { isAbortError } from "../api/errors";
 
 export const MAX_BATCH_FILES = 25;
 export type BatchFileInput = { file: File; outputFilename: string };
-export type BatchFileItem = BatchFileInput & {
+export type BatchFileItem<Result = DownloadResult> = BatchFileInput & {
   id: number;
   status: "queued" | "processing" | "complete" | "failed" | "cancelled";
-  result?: DownloadResult;
+  result?: Result;
   error?: string;
 };
-type BatchOperation = (file: File, outputFilename: string, signal: AbortSignal) => Promise<DownloadResult>;
-type BatchRun = { controller: AbortController; cancelled: boolean; operation: BatchOperation | null };
+type BatchOperation<Result> = (file: File, outputFilename: string, signal: AbortSignal) => Promise<Result>;
+type BatchRun<Result> = { controller: AbortController; cancelled: boolean; operation: BatchOperation<Result> | null };
 
 export function validateBatchFiles(files: readonly File[], maxBytes: number, action = "encrypt"): string | null {
   if (files.length === 0) return `Choose files to ${action}.`;
@@ -49,17 +49,17 @@ export function uniqueBatchFilenames(filenames: readonly string[]): string[] {
   });
 }
 
-function cancelUnfinished(items: BatchFileItem[]): BatchFileItem[] {
+function cancelUnfinished<Result>(items: BatchFileItem<Result>[]): BatchFileItem<Result>[] {
   return items.map((item) =>
     item.status === "queued" || item.status === "processing" ? { ...item, status: "cancelled" } : item
   );
 }
 
-export function useBatchFiles(formatError: (error: unknown) => string) {
-  const [items, setItems] = useState<BatchFileItem[]>([]);
+export function useBatchFiles<Result = DownloadResult>(formatError: (error: unknown) => string) {
+  const [items, setItems] = useState<BatchFileItem<Result>[]>([]);
   const [busy, setBusy] = useState(false);
   const mountedRef = useRef(true);
-  const activeRef = useRef<BatchRun | null>(null);
+  const activeRef = useRef<BatchRun<Result> | null>(null);
   const nextIdRef = useRef(0);
 
   const cancel = useCallback(() => {
@@ -80,16 +80,16 @@ export function useBatchFiles(formatError: (error: unknown) => string) {
     };
   }, [cancel]);
 
-  const start = useCallback((inputs: readonly BatchFileInput[], operation: BatchOperation) => {
+  const start = useCallback((inputs: readonly BatchFileInput[], operation: BatchOperation<Result>) => {
     if (!mountedRef.current || activeRef.current || inputs.length === 0 || inputs.length > MAX_BATCH_FILES) return;
-    const batch: BatchFileItem[] = inputs.map((input) => ({ ...input, id: nextIdRef.current++, status: "queued" }));
-    const run: BatchRun = { controller: new AbortController(), cancelled: false, operation };
+    const batch: BatchFileItem<Result>[] = inputs.map((input) => ({ ...input, id: nextIdRef.current++, status: "queued" }));
+    const run: BatchRun<Result> = { controller: new AbortController(), cancelled: false, operation };
     activeRef.current = run;
     setItems(batch);
     setBusy(true);
 
     const isCurrent = () => mountedRef.current && activeRef.current === run && !run.cancelled;
-    const updateItem = (id: number, update: Partial<BatchFileItem>) => {
+    const updateItem = (id: number, update: Partial<BatchFileItem<Result>>) => {
       setItems((current) => current.map((item) => item.id === id ? { ...item, ...update } : item));
     };
 

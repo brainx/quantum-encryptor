@@ -112,7 +112,20 @@ export const largeFileOperations: LargeFileOperations = {
     const response = await fetch(jobUrl(id, "start"), { method: "POST", body: form, credentials: "same-origin", signal });
     return jobPayload(await parseResponse(response) as { job: LargeFileJob; ok: boolean });
   },
-  status: (id, signal) => postJob(id, "status", signal),
+  async status(id, signal) {
+    signal?.throwIfAborted();
+    try {
+      return await postJob(id, "status", signal);
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 403 || error.code !== "missing_api_token") throw error;
+      // Status is read-only. Renew a restarted service's session without replaying
+      // reservation, upload, start, cancellation, or cleanup requests.
+      signal?.throwIfAborted();
+      await fetchHealth();
+      signal?.throwIfAborted();
+      return postJob(id, "status", signal);
+    }
+  },
   cancel: (id, signal) => postJob(id, "cancel", signal),
   async clear(id, signal) {
     const response = await fetch(jobUrl(id, "clear"), { method: "POST", credentials: "same-origin", signal, keepalive: true });

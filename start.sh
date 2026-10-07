@@ -24,7 +24,7 @@ fi
 
 if [ "${SKIP_WEB_BUILD:-0}" != "1" ]; then
   if [ ! -x "node_modules/.bin/vite" ]; then
-    echo "Frontend dependencies are missing. Run npm install before ./start.sh." >&2
+    echo "Frontend dependencies are missing. Run npm ci before ./start.sh." >&2
     exit 127
   fi
   npm run build

@@ -2,8 +2,8 @@
 pytest>=9.1.1
 pytest-cov>=4.0.0
 black>=23.0.0
-mypy>=2.3.1
-flake8>=6.0.0
+mypy>=2.4.0
+flake8>=7.4.1
 bandit>=1.8.0
 pip-audit>=2.8.0
 # Require the patched installer and a compatible lock compiler.

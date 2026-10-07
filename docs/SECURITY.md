@@ -90,7 +90,10 @@ The application is designed to protect against the following threats:
 - Unencrypted private keys are rejected in the core, UI, and agent CLI.
 - The core module defines its own logger but leaves root logging configuration to application entry points.
 - The local agent CLI is not a network service, accepts only workspace-relative paths, rejects symlink escapes, creates non-overwrite outputs with exclusive file creation, stores private keys and decrypted plaintext with owner-only permissions on POSIX systems, and reads passwords from environment variables instead of command-line arguments.
+- CLI public-key recovery and password changes use the existing authenticated core helpers without native liboqs. They require separate output paths and stage publication atomically; changing a password preserves the key pair and does not revoke older copies. Current legacy passwords can be authenticated for migration, while new passwords must meet the current strength policy.
+- Batch verification returns no plaintext to the browser. Its explicit JSON download is an unsigned report containing filenames, sizes, statuses, and authenticated metadata for successful files. Treat filenames and recipient fingerprints as potentially sensitive; the report does not establish sender identity or authenticate a subsequently changed file.
 - CI runs static checks, tests without native `liboqs`, and a native `liboqs` integration test job.
+- Directory backups place a strict uncompressed ZIP inside the existing authenticated PQC container. Names and hierarchy are encrypted. Restore validates authentication, bounded ZIP metadata, every path, and every payload before staging a new private directory; atomic publication cannot replace an existing destination. It does not restore ownership, permissions, links, timestamps, or extended metadata. Temporary archive data may contain plaintext; cleanup is not secure erasure.
 
 ## Security Best Practices
 
@@ -147,6 +150,7 @@ The application has the following security limitations:
    - Existing web and bytes-based APIs process files in memory with a 100 MiB limit; CLI file commands use bounded buffers up to 1 GiB
    - CLI streaming decryption authenticates a private ciphertext snapshot before writing a staged plaintext result, and publishes only after final authentication. Temporary snapshots and staged outputs require disk capacity; abrupt termination can leave a staged output, and deleting it does not guarantee secure erasure
    - The separate Large files web workflow uses bounded buffers and private temporary disk storage up to 1 GiB. Jobs expire 15 minutes after reservation; plaintext results remain on disk until clear/expiry even after downloading. Upload, worker, and download ownership must finish before cleanup closes their files. The service retains only one large-file job and checks disk capacity before upload
+   - Large-file refresh recovery defaults off. Successful opt-in stores only a validated job ID in `sessionStorage` and retains server files across navigation until explicit cleanup, the original deadline, or shutdown. Storage-write failure preserves default cleanup. Recovered results require fresh authenticated status. IDs are not credentials, copied tabs are not separate owners, and closing/restoring a tab is neither reliable recovery nor erasure
    - Sensitive data may remain in Python-managed memory until garbage collection
    - Local reference deletion in the implementation must not be treated as secure memory zeroization
    - Explicitly clearing generated keys drops React's application references but does not guarantee JavaScript or Python memory zeroization; garbage collection and process-memory reuse are outside application control
