@@ -17,17 +17,23 @@ const screenshotDirectory = process.env.UI_SCREENSHOT_DIR
   : process.argv.includes("--screenshots")
     ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../docs/screenshots")
     : null;
+let checkStage = "browser setup";
 
 async function capture(page, filename) {
+  const previousStage = checkStage;
+  checkStage = `${filename}: viewport bounds`;
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true,
     "The workflow must fit its viewport without horizontal scrolling.");
+  checkStage = `${filename}: accessibility`;
   const accessibility = await new AxeBuilder({ page }).analyze();
   assert.deepEqual(accessibility.violations.map(({ id, impact }) => ({ id, impact })), [],
     "The native workflow must pass automated accessibility checks.");
   if (screenshotDirectory) {
+    checkStage = `${filename}: screenshot`;
     await mkdir(screenshotDirectory, { recursive: true });
     await page.screenshot({ path: path.join(screenshotDirectory, filename), fullPage: true });
   }
+  checkStage = previousStage;
 }
 
 async function selectExpectedRecipient(page, fingerprint, submitLabel) {
@@ -322,6 +328,7 @@ async function runFileVerification(page, temporaryDirectory, privateKeyPath, enc
 }
 
 async function runBatchVerification(page, temporaryDirectory, privateKeyPath, encryptedPath, fingerprint) {
+  checkStage = "batch verification: fixture preparation";
   const encrypted = await readFile(encryptedPath);
   const tampered = Buffer.from(encrypted);
   tampered[tampered.length - 1] ^= 1;
@@ -338,12 +345,14 @@ async function runBatchVerification(page, temporaryDirectory, privateKeyPath, en
   page.on("download", onDownload);
   page.on("request", onRequest);
   try {
+    checkStage = "batch verification: selection and submission";
     await page.getByRole("navigation", { name: "Workflows", exact: true }).getByRole("button", { name: "Batch verify", exact: true }).click();
     await page.getByRole("heading", { name: "Verify multiple files", exact: true }).waitFor();
     await page.getByLabel("Files to verify", { exact: true }).setInputFiles([encryptedPath, tamperedPath, finalPath]);
     await page.getByLabel("Private key", { exact: true }).setInputFiles(privateKeyPath);
     await page.getByLabel("Private key password", { exact: true }).fill(password);
     await page.getByRole("button", { name: "Verify batch", exact: true }).click();
+    checkStage = "batch verification: completed results";
     await page.getByText("3 of 3 files processed · 2 authenticated · 1 failed · 0 cancelled", { exact: true }).waitFor();
     assert.equal(await page.getByLabel("Private key password", { exact: true }).inputValue(), "");
     assert.equal(downloads.length, 0, "Batch verification must not automatically download a report or plaintext.");
@@ -354,8 +363,10 @@ async function runBatchVerification(page, temporaryDirectory, privateKeyPath, en
     await capture(page, "custom-web-mobile-batch-verification.png");
     await page.setViewportSize({ width: 1440, height: 900 });
 
+    checkStage = "batch verification: explicit report download";
     const reportPath = path.join(temporaryDirectory, "verification-report.json");
     await downloadFromButton(page, "Download verification report", reportPath);
+    checkStage = "batch verification: report contents";
     const reportText = await readFile(reportPath, "utf8");
     const report = JSON.parse(reportText);
     assert.equal(report.schemaVersion, 1);
@@ -372,6 +383,7 @@ async function runBatchVerification(page, temporaryDirectory, privateKeyPath, en
     assert.equal(reportText.includes(inputBytes.toString("utf8")), false);
     assert.equal(reportText.includes("PRIVATE KEY"), false);
     assert.equal(downloads.length, 1, "Only the requested metadata report may be downloaded.");
+    checkStage = "batch verification: clear results";
     await page.getByRole("button", { name: "Clear batch", exact: true }).click();
     assert.equal(await page.getByRole("region", { name: "Batch verification results", exact: true }).count(), 0);
   } finally {
@@ -619,13 +631,19 @@ async function run() {
     await decryptFromUi(page, encryptedPath, privateKeyPath, decryptedPath);
     assert.deepEqual(await readFile(decryptedPath), inputBytes, "The native browser round trip returned different bytes.");
 
+    checkStage = "batch encryption and decryption";
     await runBatchRoundTrips(page, temporaryDirectory, publicKeyPath, privateKeyPath, fingerprint);
+    checkStage = "private key password change";
     await runPasswordChange(page, temporaryDirectory, privateKeyPath, encryptedPath);
+    checkStage = "public key recovery";
     await runPublicKeyRecovery(page, temporaryDirectory, publicKeyPath, privateKeyPath);
+    checkStage = "single file verification";
     await runFileVerification(page, temporaryDirectory, privateKeyPath, encryptedPath);
     await runBatchVerification(page, temporaryDirectory, privateKeyPath, encryptedPath, fingerprint);
+    checkStage = "large-file jobs and refresh recovery";
     assert.equal(health.largeFiles?.available, true, "Large-file jobs must be available for the native browser checks.");
     await runLargeFileRoundTrip(page, temporaryDirectory, publicKeyPath, privateKeyPath, fingerprint);
+    checkStage = "recipient request assertions";
     assert.deepEqual(encryptionRequests.filter(({ pathname }) => pathname === "/api/files/encrypt")
       .map(({ expected }) => expected), [[fingerprint], [fingerprint], [fingerprint]],
       "Single-file and both batch requests must carry exactly one expected recipient.");
@@ -639,6 +657,7 @@ async function run() {
     await page.getByRole("main").getByText("Technical details", { exact: true }).click();
     await page.setViewportSize({ width: 390, height: 844 });
     await capture(page, "custom-web-mobile-inspect.png");
+    checkStage = "browser error assertions";
     assert.deepEqual(pageErrors, [], "Native workflows and reload recovery must not raise uncaught browser errors.");
     assert.deepEqual(consoleErrors, [], "The workflows must not log unexpected browser errors or warnings.");
     console.log("Native browser recipient verification, encryption/decryption, key password change, public-key recovery, single and batch verification, and large-file refresh recovery checks passed.");
@@ -653,7 +672,11 @@ async function run() {
 
 try {
   await run();
-} catch {
-  console.error("Native browser encryption, decryption, key recovery/password change, or file verification check failed.");
+} catch (error) {
+  // Assertion messages and Playwright call logs can contain input values. Report
+  // only our fixed stage labels and numeric source location, never the raw error.
+  const location = /ui_native_smoke\.mjs:(\d+):(\d+)/.exec(error instanceof Error ? error.stack ?? "" : "");
+  const source = location ? ` (ui_native_smoke.mjs:${location[1]}:${location[2]})` : "";
+  console.error(`Native browser check failed during ${checkStage}${source}.`);
   process.exitCode = 1;
 }
