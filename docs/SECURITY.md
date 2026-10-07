@@ -93,6 +93,7 @@ The application is designed to protect against the following threats:
 - CLI public-key recovery and password changes use the existing authenticated core helpers without native liboqs. They require separate output paths and stage publication atomically; changing a password preserves the key pair and does not revoke older copies. Current legacy passwords can be authenticated for migration, while new passwords must meet the current strength policy.
 - Batch verification returns no plaintext to the browser. Its explicit JSON download is an unsigned report containing filenames, sizes, statuses, and authenticated metadata for successful files. Treat filenames and recipient fingerprints as potentially sensitive; the report does not establish sender identity or authenticate a subsequently changed file.
 - CI runs static checks, tests without native `liboqs`, and a native `liboqs` integration test job.
+- Directory backups place a strict uncompressed ZIP inside the existing authenticated PQC container. Names and hierarchy are encrypted. Restore validates authentication, bounded ZIP metadata, every path, and every payload before staging a new private directory; atomic publication cannot replace an existing destination. It does not restore ownership, permissions, links, timestamps, or extended metadata. Temporary archive data may contain plaintext; cleanup is not secure erasure.
 
 ## Security Best Practices
 

@@ -137,6 +137,13 @@ After the batch settles, an explicit download exports `verification-report.json`
 
 ### Agent JSON Contract
 
+The macOS/Linux directory commands extend the same JSON-only CLI contract:
+
+- `backup-directory --input DIR --public-key PEM --output FILE.pqc` creates an encrypted directory archive. It accepts `--expected-recipient-fingerprint`, `--max-file-bytes`, and `--overwrite`. Output must be outside the input tree. Success includes `files`, `directories`, `source_bytes`, `bytes_written`, `archive_format: "zip-stored"`, the canonical recipient fingerprint, algorithm, and workspace-relative paths.
+- `restore-directory --input FILE.pqc --private-key PEM --output NEW_DIR` authenticates and validates before publishing a new directory. It accepts `--password-env` and `--max-file-bytes`; it has no overwrite option. Success includes `files`, `directories`, `restored_bytes`, archive format, algorithm, and workspace-relative paths. No plaintext, file-name inventory, PEM, or password is printed.
+
+The limit covers the complete plaintext ZIP, including directory metadata. The strict profile rejects compressed/encrypted ZIP members, ZIP64, comments, extra fields, data descriptors, links, ambiguous names, collisions, and path traversal. Central-directory allocation is bounded to 4 MiB before the ZIP reader is constructed. The profile is an application backup format, not a general ZIP extraction service. Wrong keys or corrupted containers report authentication failure before extraction. `output_exists` never authorizes replacement. `output_durability_failed` means a complete directory is already visible but its final directory sync failed; inspect it before retrying.
+
 Successful command output:
 
 ```json

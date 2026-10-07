@@ -35,6 +35,7 @@ A post-quantum cryptography tool for file encryption. New files combine ML-KEM-7
 - **File Verification**: Inspect encrypted-file metadata and authenticate an entire file without downloading its plaintext
 - **Batch Verification**: Authenticate up to 25 encrypted files with one key, retain individual results, and explicitly download an unsigned JSON report without plaintext
 - **CLI Key Maintenance**: Recover a public key or change a private-key password with environment-based passwords and atomic workspace output
+- **Encrypted Folder Backups**: Protect a directory tree in one authenticated backup and restore it into a new folder, preserving file contents, relative paths, and empty directories
 - **Large-file CLI**: Encrypt, decrypt, inspect, and verify files up to 1 GiB using bounded buffers and authenticated, atomic output
 - **Large-file Web Jobs**: Encrypt, decrypt, and verify up to 1 GiB with upload progress, cancellation, expiring temporary results, and explicit downloads
 - **PEM Key Format**: Keys stored in PEM-like format with quantum algorithm extensions
@@ -269,6 +270,27 @@ These endpoints follow the existing local API authentication, exact-origin, no-s
 Choose **Batch verify**, select up to 25 encrypted files within the displayed combined-size limit, then supply one encrypted private key and its password. **Verify batch** authenticates files sequentially without returning plaintext. Each file receives its own result; a damaged file or one encrypted for another key does not discard successful checks or automatically retry a request. The password field clears when the batch starts.
 
 **Cancel batch** stops queued files and aborts the active browser request; native work already running may still finish. Once requests settle, **Download verification report** exports the successful, failed, and cancelled results as JSON. The report includes filenames, sizes, and authenticated metadata for successful files. It contains no file contents, keys, or passwords, but filenames and recipient fingerprints may still be sensitive. Reports are unsigned local records, not portable proofs of authenticity or sender identity. There is no saved history: download the report or choose **Clear batch** before leaving.
+
+## Encrypted folder backups (macOS and Linux)
+
+The CLI can protect a whole directory tree as one `.pqc` file using the existing hybrid encryption format. File names and the directory structure are inside the encrypted payload. Recovery authenticates the entire container and validates the archive before creating a private staging directory; the finished tree becomes visible at the destination in one atomic operation.
+
+```bash
+python -m pqc_agent_tools backup-directory \
+  --input documents --public-key keys/recipient-public.pem \
+  --output backups/documents.pqc
+
+export PQC_PRIVATE_KEY_PASSWORD='<private-key-password>'
+python -m pqc_agent_tools restore-directory \
+  --input backups/documents.pqc --private-key keys/recipient-private.pem \
+  --output restored-documents
+```
+
+All paths are workspace-relative. Create the output's parent directory first. The backup must be outside its source directory; an existing backup requires `--overwrite`. Restoration always requires a new, absent destination: it never merges with or overwrites an existing folder. Add `--expected-recipient-fingerprint "$RECIPIENT_FINGERPRINT"` to require an independently verified recipient before backup work starts.
+
+Backups support regular files and directories, including empty ones, with at most 10,000 entries and a 1 GiB uncompressed ZIP archive including metadata. `--max-file-bytes` lowers that limit. Paths are normalized to NFC Unicode and must fit 1,024 UTF-8 bytes, 32 levels, and 255 bytes per component. Case/normalization collisions, traversal, symbolic links, special files, and unsupported ZIP features are rejected. Restored directories are owner-only (`0700`) and files are `0600`; original permissions, timestamps, ownership, ACLs, extended attributes, and hard-link relationships are not restored.
+
+The implementation uses a strict, uncompressed ZIP profile inside the unchanged PQC container. Existing `verify-file` can authenticate the encrypted backup; `restore-directory` additionally checks its archive structure. Keep source applications quiet while making a backup; this is not a filesystem snapshot. Packing and recovery use bounded buffers and private temporary files, which require additional disk space and may contain plaintext. Cleanup releases those files but does not securely erase storage. A failed authentication, invalid archive, cancellation, or pre-publication write failure leaves the destination absent. If publication succeeds but directory synchronization fails, the CLI reports `output_durability_failed`; verify the published folder before retrying. Atomic folder restoration is supported on macOS and Linux and fails closed on other platforms.
 
 ## Large files
 
