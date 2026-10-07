@@ -271,6 +271,24 @@ def test_rejects_unsupported_zip_profiles(tmp_path, profile):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("nul_offset", [0, 2])
+def test_rejects_nul_truncated_names_before_python310_is_dir(monkeypatch, nul_offset):
+    raw = bytearray(_zip([("file", b"data")]).getvalue())
+    central = raw.index(b"PK\x01\x02")
+    raw[30 + nul_offset] = 0
+    raw[central + 46 + nul_offset] = 0
+    inspected_names = []
+
+    def python310_is_dir(info):
+        inspected_names.append(info.filename)
+        return info.filename[-1] == "/"
+
+    monkeypatch.setattr(archive.zipfile.ZipInfo, "is_dir", python310_is_dir)
+    with pytest.raises(archive.ArchiveError):
+        archive.inspect_archive(io.BytesIO(raw))
+    assert inspected_names == []
+
+
 @pytest.mark.parametrize("kind", ["payload", "local_name", "local_size", "overlap", "central_signature", "truncated"])
 def test_rejects_corruption_before_staging(tmp_path, kind):
     raw = bytearray(_zip([("file", b"content")]).getvalue())

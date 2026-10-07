@@ -346,12 +346,13 @@ def _validated_archive(
             offset = total = files = 0
             for info in infos:
                 _checkpoint(cancelled)
+                if not info.filename or info.orig_filename != info.filename:
+                    raise ArchiveError("Archive contains an empty or truncated entry name.")
                 name = _portable_name(info.filename[:-1] if info.is_dir() else info.filename)
                 _register_path(paths, name, info.is_dir())
                 file_type = stat.S_IFMT(info.external_attr >> 16)
                 if (
-                    info.orig_filename != info.filename
-                    or info.compress_type != zipfile.ZIP_STORED
+                    info.compress_type != zipfile.ZIP_STORED
                     or info.compress_size != info.file_size
                     or info.flag_bits & ~0x800
                     or info.extra
