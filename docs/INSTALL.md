@@ -62,6 +62,8 @@ python scripts/check_dependency_locks.py
 
 The checker regenerates temporary copies and fails if any committed lock differs; it never rewrites repository files. The development lock uses `--allow-unsafe` so build tooling dependencies such as `pip` and `setuptools` are pinned when they are part of the resolved toolchain.
 
+Review Flake8, pycodestyle, Pyflakes, and mccabe updates together. Dependabot groups this family across major, minor, and patch releases because a Flake8 minor release can require a Pyflakes major release. Regenerate the development lock with the canonical toolchain and keep the lock consistency check passing before merging; grouping alone does not guarantee compatible versions.
+
 ## Native liboqs
 
 Install `liboqs` separately and make sure the shared library is visible to the dynamic linker. If it is not installed in a standard library path, set `OQS_INSTALL_PATH` to the install prefix:
