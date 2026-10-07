@@ -1196,12 +1196,74 @@ def test_app_document_preserves_origin_for_authenticated_download_forms(monkeypa
     assert _header(headers, b"x-frame-options") == "DENY"
 
 
+@pytest.mark.parametrize("path", ["/", "/index.html"])
+@pytest.mark.parametrize(
+    ("validator", "request_header"),
+    [(b"etag", b"if-none-match"), (b"last-modified", b"if-modified-since")],
+)
+def test_cached_app_document_preserves_origin_for_download_forms(
+    monkeypatch, tmp_path, path, validator, request_header
+):
+    (tmp_path / "index.html").write_text("<!doctype html><title>Test app</title>", encoding="utf-8")
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+    initial_status, initial_headers, _body = asyncio.run(_call_app_raw(path, method="GET"))
+    value = _header(initial_headers, validator)
+    assert initial_status == 200
+    assert value is not None
+
+    status, headers, body = asyncio.run(
+        _call_app_raw(path, method="GET", headers=[(request_header, value.encode("ascii"))])
+    )
+
+    assert status == 304
+    assert body == b""
+    assert _header(headers, b"content-type") is None
+    assert _header(headers, b"referrer-policy") == "same-origin"
+    assert _header(headers, b"x-frame-options") == "DENY"
+
+
 def test_non_document_static_response_keeps_no_referrer(monkeypatch, tmp_path):
     (tmp_path / "test.css").write_text("body {}", encoding="utf-8")
     monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
     status, headers, _body = asyncio.run(_call_app_raw("/test.css", method="GET"))
     assert status == 200
     assert _header(headers, b"referrer-policy") == "no-referrer"
+
+
+def test_cached_non_document_static_response_keeps_no_referrer(monkeypatch, tmp_path):
+    (tmp_path / "test.css").write_text("body {}", encoding="utf-8")
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+    _status, initial_headers, _body = asyncio.run(_call_app_raw("/test.css", method="GET"))
+    etag = _header(initial_headers, b"etag")
+    assert etag is not None
+
+    status, headers, _body = asyncio.run(
+        _call_app_raw("/test.css", method="GET", headers=[(b"if-none-match", etag.encode("ascii"))])
+    )
+
+    assert status == 304
+    assert _header(headers, b"referrer-policy") == "no-referrer"
+
+
+@pytest.mark.parametrize("path", ["/", "/index.html"])
+def test_missing_app_document_keeps_no_referrer(monkeypatch, tmp_path, path):
+    monkeypatch.setattr(api_app, "STATIC_APP_DIR", tmp_path)
+    status, headers, _body = asyncio.run(_call_app_raw(path, method="GET"))
+
+    assert status == 404
+    assert _header(headers, b"referrer-policy") == "no-referrer"
+
+
+def test_not_modified_api_response_keeps_no_referrer(monkeypatch):
+    async def not_modified_health(_request):
+        return api_app.Response(status_code=304)
+
+    monkeypatch.setattr(api_app, "health", not_modified_health)
+    status, headers, _body = asyncio.run(_call_app_raw("/api/health", method="GET"))
+
+    assert status == 304
+    assert _header(headers, b"referrer-policy") == "no-referrer"
+    _assert_api_no_store(headers)
 
 
 def test_api_cache_policy_replaces_weaker_handler_headers(monkeypatch):

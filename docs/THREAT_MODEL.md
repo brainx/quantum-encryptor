@@ -24,6 +24,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - The local filesystem is trusted only inside the current workspace for agent CLI operations.
 - Sensitive `/api/*` responses cross into browser, client, and intermediary HTTP-cache behavior; static assets remain a separate response class.
 - Generated PEMs cross from the local API into one tab's JavaScript state and then into browser/operating-system download handling, none of which provides application-controlled zeroization or file permissions.
+- Opt-in large-file recovery stores only an opaque job ID in tab-scoped `sessionStorage`. The reference is untrusted client state, not a credential or separate ownership boundary; all job access still requires the existing local session and Origin checks.
 - Public keys and fingerprints may arrive through different channels. The application can calculate and display a fingerprint but cannot establish whether the comparison channel authenticates the claimed key owner.
 
 ## Abuse Cases
@@ -61,6 +62,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - Streaming decryption authenticates an owned ciphertext snapshot before writing any plaintext to a private staging file, and authenticates again before publishing the requested destination. It never authenticates one pathname and then reopens a potentially replaced source for output.
 - Streaming CLI outputs are staged in the validated destination directory and published atomically, preserving existing destinations on pre-publication errors and exclusive non-overwrite behavior. A directory-sync failure after publication reports `output_durability_failed` without rolling back the published output.
 - Large-file web jobs reserve one worker slot before upload, enforce exact upload size, bound temporary disk demand, and use private anonymous temporary files. Plaintext downloads are available only after authentication completes, require the local browser session and exact Origin, and keep file ownership through response completion. Cancellation and expiry wait for actual file I/O and native work before releasing resources.
+- Large-file refresh recovery defaults off and preserves jobs only after successfully saving a canonical ID under a versioned storage key. It persists no job metadata, keys, passwords, fingerprints, or results. Recovery requires live status for the exact ID before offering a download, never replays reservation/upload/start, and cannot extend the server deadline.
 - Agent CLI paths stay workspace-relative and cannot escape through symlinks.
 - Agent CLI JSON output never includes secret material or absolute local paths.
 - CLI key maintenance authenticates the original encrypted PEM, preserves key identity, and publishes a separate output using the existing staged workspace writer. Private output remains owner-only; overwrites require explicit opt-in and cannot target the input key. Existing passwords can be upgraded without applying the new-password strength policy to the old password.
@@ -107,6 +109,7 @@ Quantum Encryptor protects local files with post-quantum key encapsulation and a
 - The leave-page prompt is best effort and browser controlled; crashes, forced termination, and some lifecycle paths may provide no warning.
 - Explicit clearing drops React's references but does not guarantee JavaScript or Python memory zeroization.
 - Browser back/forward cache may preserve and later restore a document's generated PEM state after navigation; leave, reload, and close must not be described as reliable clearing events.
+- Opt-in recovery retains temporary plaintext across navigation. Closing/restoring or duplicating a tab can lose or copy its reference; clearing a shared job affects all tabs referencing it. Recovery cannot resume uploads or survive service restart, and removing a reference does not erase server files.
 - Generated PEMs are returned directly to the tab; there is no server-side temporary key vault or recovery protocol.
 - Browser and operating-system settings determine downloaded file permissions; the web flow cannot guarantee the agent CLI's POSIX `0600` private-key mode.
 - Fingerprint comparison supplies no trust by itself. A match identifies the same validated algorithm label and canonical public bytes, but does not certify identity, ownership, private-key control, or a comparison channel that substituted both values.

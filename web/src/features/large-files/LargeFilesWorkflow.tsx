@@ -17,6 +17,7 @@ export type LargeFilesWorkflowProps = {
   inspect?: InspectKeyOperation;
   operations?: LargeFileOperations;
   onSensitiveResultChange?: (pending: boolean) => void;
+  onRecoveryChange?: (recoverable: boolean) => void;
 };
 
 function runningStatus(phase: string): string {
@@ -26,8 +27,8 @@ function runningStatus(phase: string): string {
   return "Preparing operation.";
 }
 
-export function LargeFilesWorkflow({ health, inspect, operations = largeFileOperations, onSensitiveResultChange }: LargeFilesWorkflowProps) {
-  const [mode, setMode] = useState<LargeFileMode>("encrypt");
+export function LargeFilesWorkflow({ health, inspect, operations = largeFileOperations, onSensitiveResultChange, onRecoveryChange }: LargeFilesWorkflowProps) {
+  const [selectedMode, setMode] = useState<LargeFileMode>("encrypt");
   const [file, setFile] = useState<File | null>(null);
   const [key, setKey] = useState<File | null>(null);
   const [expectedFingerprint, setExpectedFingerprint] = useState("");
@@ -35,6 +36,7 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
   const [downloadRequested, setDownloadRequested] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const job = useLargeFileJob(operations);
+  const mode = job.job?.mode ?? selectedMode;
   const limits = health.largeFiles;
   const available = limits?.available === true;
   const maxBytes = mode === "encrypt" ? limits?.maxPlaintextBytes : limits?.maxEncryptedBytes;
@@ -51,11 +53,11 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
   const fingerprintError = mode === "encrypt"
     ? recipientFingerprintError(expectedFingerprint, fingerprint, health.supportsRecipientFingerprint === true) : null;
   const snapshot = job.job;
-  const locked = Boolean(snapshot || job.stage || job.restoring);
-  const pending = Boolean(job.stage || job.restoring || (snapshot && (!terminalJob(snapshot) ||
+  const locked = Boolean(snapshot || job.stage || job.restoring || job.recoveryPending);
+  const pending = Boolean(job.stage || job.restoring || job.recoveryPending || (snapshot && (!terminalJob(snapshot) ||
     (snapshot.state === "complete" && snapshot.result && (snapshot.mode === "decrypt" || !downloadRequested)))));
   const capability = {
-    available,
+    available: available || Boolean(snapshot || job.recoveryPending || job.expired),
     reason: "Restart an updated local service to process large files."
   };
   const backendCapability = mode === "encrypt" ? health.capabilities.encrypt : health.capabilities.decrypt;
@@ -73,7 +75,9 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
     Number.isSafeInteger(snapshot.result.bytes) && snapshot.result.bytes >= 0;
 
   useLayoutEffect(() => { onSensitiveResultChange?.(pending); }, [onSensitiveResultChange, pending]);
+  useLayoutEffect(() => { onRecoveryChange?.(job.canRecover); }, [onRecoveryChange, job.canRecover]);
   useEffect(() => () => onSensitiveResultChange?.(false), [onSensitiveResultChange]);
+  useEffect(() => () => onRecoveryChange?.(false), [onRecoveryChange]);
 
   function selectMode(next: LargeFileMode) {
     if (locked) return;
@@ -90,12 +94,13 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
 
   async function clear() {
     if (await job.clear()) {
+      setMode(mode);
       setFile(null); setKey(null); setPassword(""); setExpectedFingerprint(""); setDownloadError(null); setDownloadRequested(false);
     }
   }
 
   function download() {
-    if (!snapshot || snapshot.state !== "complete" || !validResult || job.restoring) return;
+    if (!snapshot || snapshot.state !== "complete" || !validResult || job.restoring || job.recoveryPending) return;
     try {
       operations.download(snapshot.id);
       setDownloadRequested(true); setDownloadError(null);
@@ -106,9 +111,9 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
 
   return (
     <WorkflowLayout title="Large files" description="Upload one file to the local service for encryption, decryption, or verification. Temporary files are removed automatically."
-      capability={capability} busy={Boolean(job.stage || (snapshot && !terminal))}
-      phase={snapshot?.state === "complete" && !job.restoring ? "complete" : ready || snapshot ? "review" : "select"}>
-      {available && <>
+      capability={capability} busy={Boolean(job.stage || job.restoring || (snapshot && !terminal))}
+      phase={snapshot?.state === "complete" && !job.restoring && !job.recoveryPending ? "complete" : ready || snapshot ? "review" : "select"}>
+      {capability.available && <>
         <form className="large-file-form" onSubmit={submit}>
           <label htmlFor="large-file-mode">Operation</label>
           <select id="large-file-mode" value={mode} disabled={locked} onChange={(event) => selectMode(event.target.value as LargeFileMode)}>
@@ -136,13 +141,23 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
           {mode !== "encrypt" && <PasswordField id="large-file-password" label="Private key password" autoComplete="current-password"
             disabled={locked} value={password} onChange={(value) => { if (!locked) setPassword(value); }} />}
           {!backendCapability.available && <Notice kind="warning">{backendCapability.reason || "The post-quantum backend is not ready."}</Notice>}
+          <label className="recovery-choice">
+            <input type="checkbox" checked={job.recoveryEnabled} disabled={locked}
+              onChange={(event) => job.setRecoveryEnabled(event.target.checked)} />
+            Keep this job available after refresh
+          </label>
+          <p>This option keeps temporary files on this computer until you clear them or the job expires, including decrypted output. Only a job reference is saved in this tab. Interrupted uploads must be restarted.</p>
+          {job.recoveryError && <Notice kind="warning">{job.recoveryError}</Notice>}
           {!locked && <ActionButton type="submit" busyLabel="Starting operation" disabled={!ready}>{mode === "encrypt" ? "Encrypt large file" : mode === "decrypt" ? "Decrypt large file" : "Verify large file"}</ActionButton>}
         </form>
-        <p>Files are temporarily stored by the local service. Results expire after {Math.ceil((limits?.resultTtlSeconds ?? 0) / 60)} minutes. Closing this page requests cleanup; automatic expiry handles interrupted connections.</p>
+        <p>Files are temporarily stored by the local service. Jobs expire {Math.ceil((limits?.resultTtlSeconds ?? 0) / 60)} minutes after you start the job; recovery does not extend this deadline. {job.canRecover
+          ? "You can refresh or return to Large files in this tab to reconnect. Closing the tab may lose its job reference; temporary files remain until cleared or expired."
+          : "Leaving this page requests cleanup; automatic expiry handles interrupted connections."}</p>
         {mode === "decrypt" && <p>Decrypted output is stored temporarily on this computer until you clear it or it expires, including after a download is requested.</p>}
         {mode === "verify" && <p>Verification authenticates the complete encrypted file without returning a decrypted file. It does not identify the sender.</p>}
-        {(job.stage || snapshot) && <section className="large-file-status" aria-label="Large file job status">
-          <p role="status">{job.restoring ? "Checking the temporary job after returning to this page."
+        {(job.stage || snapshot || job.recoveryPending) && <section className="large-file-status" aria-label="Large file job status">
+          <p role="status">{job.restoring ? "Reconnecting to the temporary job."
+            : job.recoveryPending ? "Waiting to reconnect to the temporary job."
             : job.stage === "reserving" ? "Reserving local service capacity."
             : job.stage === "uploading" ? "Uploading file."
             : job.stage === "starting" ? "Starting operation."
@@ -153,12 +168,14 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
             : snapshot?.state === "failed" ? "Operation failed."
             : snapshot?.state === "complete" ? "Operation complete."
             : "Waiting for the next operation step."}</p>
-          {!terminal && <><progress aria-label={progressLabel} max={total || 1} value={Math.min(progress, total || 1)} />
+          {!terminal && !job.recoveryPending && <><progress aria-label={progressLabel} max={total || 1} value={Math.min(progress, total || 1)} />
             <p>{formatBytes(progress)} of {formatBytes(total)}</p></>}
           {snapshot && <p>Temporary job expires at <time dateTime={snapshot.expiresAt}>{new Date(snapshot.expiresAt).toLocaleTimeString()}</time>.</p>}
-          {!terminal && job.stage !== "clearing" && <button type="button" disabled={job.restoring || job.stage === "cancelling" || snapshot?.state === "cancelling"} onClick={() => void job.cancel()}>Cancel operation</button>}
+          {job.recovered && snapshot && !job.restoring && !job.recoveryPending && <Notice kind="info" title="Job reconnected">The local service confirmed this job’s current status. Your file was not uploaded or processed again.</Notice>}
+          {job.recovered && snapshot && ["awaiting_upload", "ready"].includes(snapshot.state) && <Notice kind="warning">Preparation was interrupted. Clear this job, then select the file and key again. Uploads and operation starts are never retried automatically.</Notice>}
+          {!terminal && !job.recoveryPending && job.stage !== "clearing" && <button type="button" disabled={job.restoring || job.stage === "cancelling" || snapshot?.state === "cancelling"} onClick={() => void job.cancel()}>Cancel operation</button>}
           {snapshot?.state === "failed" && <Notice kind="error">{snapshot.error?.message || "The local service could not process this file. Check the file and key, then try again."}</Notice>}
-          {snapshot?.state === "complete" && !job.restoring && (snapshot.mode === "verify" ? validVerification
+          {snapshot?.state === "complete" && !job.restoring && !job.recoveryPending && (snapshot.mode === "verify" ? validVerification
             ? <Notice kind="success" title="File authenticated">{verification?.bytesVerified.toLocaleString()} bytes authenticated.<p>{verification?.publicKeyFingerprint}</p></Notice>
             : <Notice kind="error">The local service did not return a complete authentication report.</Notice>
             : validResult ? <><p>{snapshot.result?.filename} · {formatBytes(snapshot.result?.bytes ?? 0)}</p>
@@ -168,9 +185,9 @@ export function LargeFilesWorkflow({ health, inspect, operations = largeFileOper
         </section>}
         {job.error && <Notice kind="error">{job.error}</Notice>}
         {downloadError && <Notice kind="error">{downloadError}</Notice>}
-        {snapshot && job.pollingPaused && <button type="button" onClick={() => void job.refresh()}>Retry status</button>}
+        {(snapshot || job.recoveryPending) && job.pollingPaused && <button type="button" onClick={() => void job.refresh()}>Retry status</button>}
         {(terminal || job.expired || (snapshot && (snapshot.state === "awaiting_upload" || snapshot.state === "ready") && !job.stage)) &&
-          <button type="button" disabled={job.restoring || job.stage === "clearing"} onClick={() => void clear()}>Clear temporary files</button>}
+          <button type="button" disabled={job.restoring || job.recoveryPending || job.stage === "clearing"} onClick={() => void clear()}>Clear temporary files</button>}
       </>}
     </WorkflowLayout>
   );
