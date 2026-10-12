@@ -239,9 +239,9 @@ liboqs-python==0.16.0.1 \
     --hash=sha256:4791212549d88094659580d9f89a31af8b2bab9adc40b0a44ccaf570279f1d18 \
     --hash=sha256:8e7f8c9a5fd3d3a65133238c07a0c465737a48591567ed175f1f75ee40508072
     # via -r requirements.txt
-pycparser==3.0 \
-    --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
-    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+pycparser==3.1 \
+    --hash=sha256:b3fc6dec06a8b2fefa0ed4ff92285306a5e3be9987bc5603c9edbdc4e492418f \
+    --hash=sha256:f09d358c840bd147b79e55f2bc494f18ea869dc897f5852a8f5766b74f787882
     # via cffi
 python-multipart==0.0.32 \
     --hash=sha256:be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e \
